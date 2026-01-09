@@ -12,6 +12,9 @@ use std::time::Duration;
 use tokio::process::Command;
 use url::Url;
 
+mod rolling_buffer;
+use rolling_buffer::RollingBuffer;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The URL to the streamer you want to AutoClip.
@@ -311,6 +314,18 @@ impl HlsClient {
         self.fetch_bytes(segment_url.as_str()).await
     }
 
+    /// Fetch an arbitrary segment (by URI) relative to a media playlist URL.
+    pub async fn fetch_segment_from_playlist(
+        &self,
+        playlist_url: &Url,
+        segment_uri: &str,
+    ) -> Result<Vec<u8>> {
+        let segment_url = playlist_url
+            .join(segment_uri)
+            .context("joining segment url")?;
+        self.fetch_bytes(segment_url.as_str()).await
+    }
+
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
         self.fetch_bytes_with_headers(url, None, None, None).await
     }
@@ -415,6 +430,15 @@ fn sanitize_m3u8_url(raw: &str) -> String {
         .to_string()
 }
 
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut out = s[..max.saturating_sub(3)].to_string();
+    out.push_str("...");
+    out
+}
+
 fn next_output_path(save_dir: &str, stub: &str) -> Result<PathBuf> {
     let dir = Path::new(save_dir);
     fs::create_dir_all(dir).with_context(|| format!("creating save dir {save_dir}"))?;
@@ -430,36 +454,81 @@ fn next_output_path(save_dir: &str, stub: &str) -> Result<PathBuf> {
 }
 
 async fn run_ffmpeg_30s(input_hls: &Url, out_path: &Path, out_w: u32, out_h: u32) -> Result<()> {
+    run_ffmpeg_internal(input_hls.as_str(), out_path, out_w, out_h, Some(30.0), false).await
+}
+
+async fn run_ffmpeg_from_file(
+    input_path: &Path,
+    out_path: &Path,
+    out_w: u32,
+    out_h: u32,
+    duration: Duration,
+) -> Result<()> {
+    run_ffmpeg_internal(
+        input_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-utf8 input path"))?,
+        out_path,
+        out_w,
+        out_h,
+        Some(duration.as_secs_f32()),
+        true,
+    )
+    .await
+}
+
+async fn run_ffmpeg_internal(
+    input: &str,
+    out_path: &Path,
+    out_w: u32,
+    out_h: u32,
+    duration_secs: Option<f32>,
+    regen_pts: bool,
+) -> Result<()> {
     let vf = format!(
         "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
         out_w, out_h, out_w, out_h
     );
 
-    let status = Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-i")
-        .arg(input_hls.as_str())
-        .arg("-map")
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y");
+    if regen_pts {
+        cmd.arg("-fflags").arg("+genpts");
+    }
+    cmd.arg("-i").arg(input);
+    if let Some(d) = duration_secs {
+        cmd.arg("-t").arg(format!("{d:.3}"));
+    }
+    cmd.arg("-map")
         .arg("0:v:0")
         .arg("-map")
         .arg("0:a:0?")
-        .arg("-t")
-        .arg("30")
         .arg("-vf")
         .arg(&vf)
+        .arg("-vsync")
+        .arg("vfr")
         .arg("-c:v")
         .arg("libx264")
         .arg("-preset")
         .arg("veryfast")
         .arg("-crf")
-        .arg("23")
-        .arg("-c:a")
-        .arg("copy") // keep source codec/bitrate to preserve highest audio quality
-        .arg("-shortest")
-        .arg(out_path.as_os_str())
-        .status()
-        .await
-        .context("failed to run ffmpeg")?;
+        .arg("23");
+
+    if regen_pts {
+        if let Some(d) = duration_secs {
+            cmd.arg("-af").arg(format!("atrim=end={d:.3},asetpts=N/SR/TB"));
+        }
+        cmd.arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg("160k");
+    } else {
+        cmd.arg("-c:a").arg("copy");
+    }
+
+    cmd.arg("-shortest").arg(out_path.as_os_str());
+
+    let status = cmd.status().await.context("failed to run ffmpeg")?;
 
     if !status.success() {
         anyhow::bail!("ffmpeg exited with status {status}");
@@ -473,18 +542,135 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let page_url_arg = args.get(1).map(|s| s.as_str());
 
+    if let Some(cmd) = page_url_arg {
+        if cmd.eq_ignore_ascii_case("demo-buffer") {
+            return run_buffer_demo().await;
+        }
+        if cmd.eq_ignore_ascii_case("demo-hls-buffer") {
+            let page = args
+                .get(2)
+                .cloned()
+                .or_else(|| std::env::var("CLIP_PAGE_URL").ok())
+                .unwrap_or_default();
+            if page.is_empty() {
+                eprintln!("usage: autoclip demo-hls-buffer <page_url>  (or set CLIP_PAGE_URL)");
+                return Ok(());
+            }
+            return run_hls_buffer_demo(&page).await;
+        }
+    }
+
     let mut config = Config::example();
     if let Some(url) = page_url_arg {
         config.kick_url = url.to_string();
     }
 
     if page_url_arg.is_none() && std::env::var("CLIP_PAGE_URL").is_err() {
-        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL)");
+        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url>");
         return Ok(());
     }
 
     let app = AutoClip::new(config);
     app.run_with_page(page_url_arg).await
+}
+
+/// Demonstrate the rolling buffer by pushing synthetic 400ms chunks and printing state.
+async fn run_buffer_demo() -> Result<()> {
+    use tokio::time::interval;
+
+    let mut buf = RollingBuffer::new(Duration::from_secs(3));
+    let mut ticker = interval(Duration::from_millis(400));
+
+    println!("demo: 3s rolling buffer; pushing 400ms chunks every 400ms");
+    for i in 0..12 {
+        ticker.tick().await;
+        let label = format!("f{i}");
+        buf.push(label.as_bytes().to_vec(), Duration::from_millis(400));
+
+        let secs = buf.total_duration().as_secs_f32();
+        println!(
+            "push {:<3} | chunks: {:2} | duration: {:4.1}s | bytes: {:3}",
+            label,
+            buf.chunk_count(),
+            secs,
+            buf.total_bytes()
+        );
+    }
+
+    let snapshot = buf.snapshot_bytes();
+    println!(
+        "snapshot ({} bytes): {}",
+        snapshot.len(),
+        String::from_utf8_lossy(&snapshot)
+    );
+
+    Ok(())
+}
+
+/// Demonstrate HLS ingestion into the rolling buffer: fetch page -> master -> best variant,
+/// pull a handful of segments, push into a duration-capped buffer, and log eviction behavior.
+async fn run_hls_buffer_demo(page_url: &str) -> Result<()> {
+    let config = Config::example();
+    let mut buffer = RollingBuffer::new(Duration::from_secs(config.before_buffer_length as u64));
+
+    let hls = HlsClient::new()?;
+    println!("discovering m3u8 via headless for {}", page_url);
+    let (master_url, master) = hls.fetch_master_from_page(page_url).await?;
+    let media_url = hls.highest_variant_url(&master_url, &master)?;
+    let media_url = media_url; // keep owned Url
+
+    println!("best variant: {}", media_url);
+    let playlist = hls.fetch_media(media_url.as_str()).await?;
+    println!("loaded media playlist with {} segments", playlist.segments.len());
+
+    // Limit to a handful of segments to keep the demo quick.
+    let take_n = usize::min(8, playlist.segments.len());
+    for (idx, seg) in playlist.segments.iter().take(take_n).enumerate() {
+        let seg_dur = Duration::from_secs_f32(seg.duration as f32);
+        let bytes = hls.fetch_segment_from_playlist(&media_url, &seg.uri).await?;
+        buffer.push(bytes, seg_dur);
+
+        println!(
+            "seg {:02} | uri: {:30} | dur: {:4.2}s | chunks: {:2} | buffered: {:4.2}s | bytes: {}",
+            idx,
+            truncate_str(&seg.uri, 30),
+            seg_dur.as_secs_f32(),
+            buffer.chunk_count(),
+            buffer.total_duration().as_secs_f32(),
+            buffer.total_bytes()
+        );
+    }
+
+    println!(
+        "demo complete: retained {} chunks covering {:4.2}s ({} bytes)",
+        buffer.chunk_count(),
+        buffer.total_duration().as_secs_f32(),
+        buffer.total_bytes()
+    );
+
+    // Persist snapshot to a TS file and transcode to vertical MP4 via FFmpeg to mirror the main flow.
+    let snapshot = buffer.snapshot_bytes();
+    let save_dir = Path::new(&config.save_path);
+    fs::create_dir_all(save_dir).context("creating save dir for buffer snapshot")?;
+
+    let ts_path = save_dir.join("buffer_snapshot.ts");
+    fs::write(&ts_path, &snapshot).context("writing buffer snapshot to TS file")?;
+
+    let output_path = next_output_path(&config.save_path, &config.file_name_stub)?;
+    let (out_w, out_h) = parse_resolution(&config.resolution).unwrap_or((1080, 1920));
+    let clip_len = buffer.total_duration();
+
+    println!(
+        "ffmpeg: encoding {}s from {} -> {}",
+        clip_len.as_secs_f32(),
+        ts_path.display(),
+        output_path.display()
+    );
+
+    run_ffmpeg_from_file(&ts_path, &output_path, out_w, out_h, clip_len).await?;
+    println!("wrote clipped video to {}", output_path.display());
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -534,5 +720,12 @@ mod tests {
         let segment_bytes = client.fetch_first_segment(media_url.as_str()).await?;
         assert!(!segment_bytes.is_empty(), "segment should contain data");
         Ok(())
+    }
+
+    #[test]
+    fn truncate_str_adds_ellipsis() {
+        assert_eq!(truncate_str("short", 10), "short");
+        assert_eq!(truncate_str("0123456789", 10), "0123456789");
+        assert_eq!(truncate_str("0123456789A", 10), "0123456...");
     }
 }

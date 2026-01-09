@@ -1,0 +1,112 @@
+use std::collections::VecDeque;
+use std::time::Duration;
+
+/// Rolling buffer that keeps the most recent chunks up to a wall-clock duration budget.
+/// Intended for small demo/testing; no cross-thread safety and no zero-copy slices.
+#[derive(Debug, Default)]
+pub struct RollingBuffer {
+    capacity: Duration,
+    chunks: VecDeque<Chunk>,
+    total_duration: Duration,
+    total_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Chunk {
+    data: Vec<u8>,
+    duration: Duration,
+}
+
+impl RollingBuffer {
+    pub fn new(capacity: Duration) -> Self {
+        Self {
+            capacity,
+            chunks: VecDeque::new(),
+            total_duration: Duration::ZERO,
+            total_bytes: 0,
+        }
+    }
+
+    /// Push a chunk with its playback duration; evict oldest chunks until within capacity.
+    pub fn push(&mut self, data: Vec<u8>, duration: Duration) {
+        let bytes = data.len();
+        self.total_duration += duration;
+        self.total_bytes += bytes;
+        self.chunks.push_back(Chunk { data, duration });
+        self.evict();
+    }
+
+    /// Concatenate buffered chunks (oldest to newest) into a single Vec.
+    pub fn snapshot_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.total_bytes);
+        for chunk in &self.chunks {
+            out.extend_from_slice(&chunk.data);
+        }
+        out
+    }
+
+    /// Number of chunks currently retained.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Total duration of buffered chunks.
+    pub fn total_duration(&self) -> Duration {
+        self.total_duration
+    }
+
+    /// Total byte size of buffered chunks.
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    fn evict(&mut self) {
+        while self.total_duration > self.capacity {
+            if let Some(oldest) = self.chunks.pop_front() {
+                self.total_duration = self.total_duration.saturating_sub(oldest.duration);
+                self.total_bytes = self.total_bytes.saturating_sub(oldest.data.len());
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retains_within_capacity() {
+        let mut buf = RollingBuffer::new(Duration::from_secs(1));
+        buf.push(b"a".to_vec(), Duration::from_millis(400));
+        buf.push(b"b".to_vec(), Duration::from_millis(400));
+        assert_eq!(buf.chunk_count(), 2);
+        assert_eq!(buf.total_duration(), Duration::from_millis(800));
+        assert_eq!(buf.snapshot_bytes(), b"ab");
+    }
+
+    #[test]
+    fn evicts_oldest_when_over_budget() {
+        let mut buf = RollingBuffer::new(Duration::from_millis(1000));
+        buf.push(b"a".to_vec(), Duration::from_millis(400));
+        buf.push(b"b".to_vec(), Duration::from_millis(400));
+        buf.push(b"c".to_vec(), Duration::from_millis(400));
+        // Total would be 1200ms; should evict "a" and keep b+c (800ms).
+        assert_eq!(buf.chunk_count(), 2);
+        assert_eq!(buf.total_duration(), Duration::from_millis(800));
+        assert_eq!(buf.snapshot_bytes(), b"bc");
+    }
+
+    #[test]
+    fn evicts_multiple_chunks_if_needed() {
+        let mut buf = RollingBuffer::new(Duration::from_millis(500));
+        buf.push(b"a".to_vec(), Duration::from_millis(300));
+        buf.push(b"b".to_vec(), Duration::from_millis(300));
+        buf.push(b"c".to_vec(), Duration::from_millis(300));
+        // Total would be 900ms; should evict a and b to fit c (300ms <= 500ms).
+        assert_eq!(buf.chunk_count(), 1);
+        assert_eq!(buf.total_duration(), Duration::from_millis(300));
+        assert_eq!(buf.snapshot_bytes(), b"c");
+    }
+}
