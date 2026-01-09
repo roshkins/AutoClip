@@ -1,0 +1,12 @@
+{
+  "name": "autoclip-headless",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless helpers for AutoClip (Playwright m3u8 capture)",
+  "scripts": {
+    "capture-m3u8": "node scripts/capture_m3u8.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.45.0"
+  }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "autoclip"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["AutoClip Contributors"]
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+m3u8-rs = "5.0.4"
+reqwest = { version = "0.11.14", features = ["json", "stream", "rustls-tls"], default-features = false }
+url = { version = "2.2.2", default-features = false }
+
+[dev-dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }

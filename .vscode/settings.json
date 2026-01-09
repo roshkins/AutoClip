@@ -1,0 +1,6 @@
+{
+    "git.enabled": false,
+    "chat.tools.terminal.autoApprove": {
+        "cargo run": true
+    }
+}
