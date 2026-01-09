@@ -34,6 +34,7 @@ These notes help AI agents work effectively in this repository. They summarize t
 - Keep changes small and incremental; prefer a series of tiny edits over large batches.
 - After each change, run the fastest applicable checks (unit/linters once added); fix issues immediately.
 - Run the integration test suite after every code change to verify no regressions; if commands are not defined yet, ask for or add a canonical `cargo test` (or project-specific) integration target and document it.
+- Keep comments in sync with behavior. When code paths change (e.g., swapping HTML scraping for headless m3u8 capture), update inline docs and module headers in the same PR.
 
 ## If Something Is Missing
 - This repo currently only contains the design doc ([DESIGN_DOC.md](../DESIGN_DOC.md)). Ask for details on build/run/test commands, directory layout, and target platforms before proceeding.

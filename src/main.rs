@@ -1,7 +1,7 @@
 //! AutoClip MVP stub.
-//! Focus: minimal structure to validate the flow. Production pieces (m3u8 ingest,
-//! whisper wake-word detection, FFmpeg processing) are stubbed but named to
-//! mirror the design doc. Keep functions small and readable.
+//! Current behavior: headless-grab an m3u8 from a page (Kick-style), pick the
+//! top variant, and save a 30s vertical clip via FFmpeg. Everything else (rolling
+//! buffering, wake-word detection, VRAM budgeting) is logged-only scaffolding.
 
 use anyhow::{Context, Result};
 use m3u8_rs::{MasterPlaylist, MediaPlaylist, VariantStream};
@@ -62,11 +62,10 @@ impl AutoClip {
         self.run_with_page(None).await
     }
 
-    /// Orchestrates the high-level flow. Real implementations would:
-    /// - pull the m3u8 playlist and start buffering video at highest resolution
-    /// - run wake-word detection on audio via Whisper (CPU)
-    /// - on trigger, copy buffer, enqueue post-process (FFmpeg vertical format)
-    /// - save with incrementing filename under `save_path`
+    /// Orchestrates the current flow:
+    /// - When given a page URL (arg or CLIP_PAGE_URL), grab its m3u8 via headless
+    ///   script and save a 30s vertical clip with FFmpeg using the best variant.
+    /// - Otherwise, run stubbed logging for buffering / wake-word / post-process.
     pub async fn run_with_page(&self, page_url_override: Option<&str>) -> Result<()> {
         // Take an explicit page URL if provided; otherwise fall back to CLIP_PAGE_URL env if set.
         if let Some(page_url) = page_url_override
@@ -109,7 +108,8 @@ impl AutoClip {
         Ok(())
     }
 
-    /// Fetch master from page, pick best variant, and run ffmpeg to save a 30s vertical clip.
+    /// Fetch master from a page (headless Playwright), pick best variant, and run
+    /// ffmpeg to save a 30s vertical clip.
     pub async fn clip_30s_from_page(&self, page_url: &str) -> Result<PathBuf> {
         let hls = HlsClient::new()?;
         let (master_url, master) = hls.fetch_master_from_page(page_url).await?;
@@ -171,10 +171,10 @@ impl HlsClient {
         Ok(parsed)
     }
 
-    /// Fetch a webpage, extract the first m3u8 URL, and parse it as a master playlist.
-    /// Adds Referer/Origin headers tied to the page URL to satisfy hosts that require them (e.g., Kick).
-    /// If COOKIE_HEADER or KICK_COOKIE env vars are set, they are forwarded to both page and playlist fetches.
-    /// If M3U8_URL_OVERRIDE is set, we skip scraping and use that master URL directly.
+    /// Fetch a page via headless Playwright, extract the first m3u8 URL, and parse
+    /// it as a master playlist. Adds Referer/Origin tied to the page URL. Forwards
+    /// COOKIE_HEADER or KICK_COOKIE if present. If M3U8_URL_OVERRIDE is set, use
+    /// that master URL directly instead of headless extraction.
     pub async fn fetch_master_from_page(&self, page_url: &str) -> Result<(String, MasterPlaylist)> {
         let env_cookie = std::env::var("COOKIE_HEADER")
             .ok()
@@ -194,7 +194,7 @@ impl HlsClient {
             .await
     }
 
-    /// Use a headless browser (Node + Playwright script) to capture an m3u8 URL when HTML scraping fails.
+    /// Use a headless browser (Node + Playwright script) to capture an m3u8 URL.
     async fn fetch_master_with_headless(
         &self,
         page_url: &str,
