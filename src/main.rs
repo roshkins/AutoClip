@@ -11,9 +11,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 use url::Url;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod rolling_buffer;
 use rolling_buffer::RollingBuffer;
+mod stream_listener;
+use stream_listener::start_stream_listener;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -558,6 +562,10 @@ async fn main() -> Result<()> {
             }
             return run_hls_buffer_demo(&page).await;
         }
+        if cmd.eq_ignore_ascii_case("demo-wakeword-mic") {
+            let opts = parse_mic_args(&args[2..])?;
+            return run_wakeword_mic_demo(opts).await;
+        }
     }
 
     let mut config = Config::example();
@@ -566,7 +574,7 @@ async fn main() -> Result<()> {
     }
 
     if page_url_arg.is_none() && std::env::var("CLIP_PAGE_URL").is_err() {
-        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url>");
+        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-wakeword-mic <page_url> [--phrase NAME]");
         return Ok(());
     }
 
@@ -672,6 +680,76 @@ async fn run_hls_buffer_demo(page_url: &str) -> Result<()> {
 
     Ok(())
 }
+
+/// Listen on the microphone via SAPI; when the phrase is recognized, clip 30s from the streamer page.
+async fn run_wakeword_mic_demo(opts: MicOpts) -> Result<()> {
+    let phrases = opts
+        .phrase
+        .as_ref()
+        .map(|p| vec![p.clone()])
+        .unwrap_or_else(|| vec!["clip that".to_string()]);
+
+    let model_path = std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "models/ggml-tiny.en.bin".to_string());
+    let stream_path = std::env::var("WHISPER_STREAM_EXE").unwrap_or_else(|_| "tools/whisper-bin-x64/Release/whisper-stream.exe".to_string());
+
+    let fired = Arc::new(AtomicBool::new(false));
+    start_stream_listener(
+        std::path::Path::new(&stream_path),
+        std::path::Path::new(&model_path),
+        phrases.clone(),
+        fired.clone(),
+    )?;
+    println!(
+        "listening via whisper.cpp stream for wake phrases: {} (model: {}, exe: {})",
+        phrases.join(", "),
+        model_path,
+        stream_path
+    );
+
+    while !fired.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    println!("wake phrase detected; capturing clip from {}", opts.page_url);
+    let mut cfg = Config::example();
+    cfg.kick_url = opts.page_url.clone();
+    let app = AutoClip::new(cfg);
+    let path = app.clip_30s_from_page(&opts.page_url).await?;
+    println!("saved clip to {}", path.display());
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct MicOpts {
+    page_url: String,
+    phrase: Option<String>,
+}
+
+fn parse_mic_args(args: &[String]) -> Result<MicOpts> {
+    if args.is_empty() {
+        anyhow::bail!("usage: autoclip demo-wakeword-mic <page_url> [--phrase NAME]");
+    }
+
+    let page_url = args[0].clone();
+    let mut phrase = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--phrase" => {
+                i += 1;
+                phrase = args.get(i).cloned();
+            }
+            other => {
+                anyhow::bail!("unknown flag {other}");
+            }
+        }
+        i += 1;
+    }
+
+    Ok(MicOpts { page_url, phrase })
+}
+
 
 #[cfg(test)]
 mod tests {

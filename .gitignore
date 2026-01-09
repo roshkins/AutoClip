@@ -3,3 +3,6 @@ node_modules/
 playwright-report/
 test-results/
 clips/
+models/*.bin
+tools/whisper-bin-x64/Release/
+tools/*.zip
