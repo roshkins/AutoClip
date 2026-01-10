@@ -6,18 +6,20 @@
 use anyhow::{Context, Result};
 use m3u8_rs::{MasterPlaylist, MediaPlaylist, VariantStream};
 use reqwest::{header, Client};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::time::sleep;
 use url::Url;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod rolling_buffer;
 use rolling_buffer::RollingBuffer;
-mod stream_listener;
-use stream_listener::start_stream_listener;
+mod stream_audio_wake;
+use stream_audio_wake::start_stream_wake_from_hls;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -37,19 +39,22 @@ pub struct Config {
     pub save_path: String,
     /// Filename prefix to prepend to the incrementing counter.
     pub file_name_stub: String,
+    /// Whether to print raw/normalized transcripts from the stream listener.
+    pub log_raw_wake: bool,
 }
 
 impl Config {
     pub fn example() -> Self {
         Self {
             kick_url: "https://example.com/stream".to_string(),
-            activation_phrase: "clip that".to_string(),
-            before_buffer_length: 5,
+            activation_phrase: "orange".to_string(),
+            before_buffer_length: 50,
             after_buffer_length: 10,
             resolution: "1080x1920".to_string(),
             vram_allocation: 512,
             save_path: "./clips".to_string(),
             file_name_stub: "clip".to_string(),
+            log_raw_wake: false,
         }
     }
 }
@@ -80,8 +85,8 @@ impl AutoClip {
             .or_else(|| std::env::var("CLIP_PAGE_URL").ok())
             .filter(|s| !s.is_empty())
         {
-            let output = self.clip_30s_from_page(&page_url).await?;
-            println!("saved 30s clip to {}", output.display());
+            let output = self.run_until_wake_and_clip(&page_url).await?;
+            println!("saved wakeword-triggered clip to {}", output.display());
             return Ok(());
         }
 
@@ -126,6 +131,117 @@ impl AutoClip {
         let (out_w, out_h) = parse_resolution(&self.config.resolution).unwrap_or((1080, 1920));
 
         run_ffmpeg_30s(&media_url, &output_path, out_w, out_h).await?;
+        Ok(output_path)
+    }
+
+    /// Continuously buffer the HLS stream, wait for the wake phrase, then save the
+    /// previous `before_buffer_length` seconds plus `after_buffer_length` seconds to a vertical MP4.
+    pub async fn run_until_wake_and_clip(&self, page_url: &str) -> Result<PathBuf> {
+        let before = Duration::from_secs(self.config.before_buffer_length as u64);
+        let after = Duration::from_secs(self.config.after_buffer_length as u64);
+        let mut buffer = RollingBuffer::new(before + after);
+
+        let fired = Arc::new(AtomicBool::new(false));
+
+        let hls = HlsClient::new()?;
+        let (master_url, master) = hls.fetch_master_from_page(page_url).await?;
+        let media_url = hls.highest_variant_url(&master_url, &master)?;
+        println!("tracking variant: {}", media_url);
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut after_remaining: Option<Duration> = None;
+
+        // Start listening to the stream audio for the wake phrase via whisper-stream.
+        let model_path = std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "models/ggml-tiny.en.bin".to_string());
+        start_stream_wake_from_hls(
+            &media_url,
+            Path::new(&model_path),
+            &self.config.activation_phrase,
+            self.config.log_raw_wake,
+            fired.clone(),
+        )?;
+        println!(
+            "listening to stream audio for wake phrase '{}' (model: {})",
+            self.config.activation_phrase,
+            model_path
+        );
+
+        let poll_interval = Duration::from_millis(500);
+
+        loop {
+            let playlist = match hls.fetch_media(media_url.as_str()).await {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("failed to fetch media playlist: {err:#}; retrying");
+                    sleep(Duration::from_millis(800)).await;
+                    continue;
+                }
+            };
+
+            let mut made_progress = false;
+
+            for seg in &playlist.segments {
+                let uri = seg.uri.clone();
+                if !seen.insert(uri.clone()) {
+                    continue;
+                }
+
+                let seg_dur = Duration::from_secs_f32(seg.duration as f32);
+                match hls.fetch_segment_from_playlist(&media_url, &uri).await {
+                    Ok(bytes) => {
+                        buffer.push(bytes, seg_dur);
+                        made_progress = true;
+                    }
+                    Err(err) => {
+                        eprintln!("failed to fetch segment {}: {err:#}", uri);
+                        continue;
+                    }
+                }
+
+                if fired.load(Ordering::Relaxed) && after_remaining.is_none() {
+                    after_remaining = Some(after);
+                    println!("wake detected; capturing next {}s of stream", after.as_secs());
+                }
+
+                if let Some(rem) = after_remaining.as_mut() {
+                    *rem = rem.saturating_sub(seg_dur);
+                }
+            }
+
+            if let Some(rem_mut) = after_remaining.as_mut() {
+                if *rem_mut <= Duration::ZERO {
+                    break;
+                }
+                if !made_progress {
+                    // If the playlist is stale, still count down so we don't spin forever.
+                    *rem_mut = rem_mut.saturating_sub(poll_interval);
+                }
+            }
+
+            if fired.load(Ordering::Relaxed) && after_remaining.is_none() {
+                // Wake fired but we have not yet started counting; ensure we do.
+                after_remaining = Some(after);
+            }
+
+            sleep(poll_interval).await;
+        }
+
+        let save_dir = Path::new(&self.config.save_path);
+        fs::create_dir_all(save_dir).context("creating save dir for wakeword clip")?;
+
+        let output_path = next_output_path(&self.config.save_path, &self.config.file_name_stub)?;
+        let ts_path = output_path.with_extension("ts");
+        let snapshot = buffer.snapshot_bytes();
+        fs::write(&ts_path, &snapshot).context("writing buffered TS snapshot")?;
+
+        let (out_w, out_h) = parse_resolution(&self.config.resolution).unwrap_or((1080, 1920));
+        run_ffmpeg_from_file(&ts_path, &output_path, out_w, out_h, buffer.total_duration()).await?;
+        println!(
+            "wrote wakeword clip: {} (duration ~{:.1}s)",
+            output_path.display(),
+            buffer.total_duration().as_secs_f32()
+        );
+
         Ok(output_path)
     }
 }
@@ -545,6 +661,26 @@ async fn run_ffmpeg_internal(
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let page_url_arg = args.get(1).map(|s| s.as_str());
+    let mut override_phrase: Option<String> = None;
+    let mut log_raw_wake = false;
+
+    // Parse optional flags for wakeword control.
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--phrase" => {
+                if let Some(val) = args.get(i + 1) {
+                    override_phrase = Some(val.clone());
+                }
+                i += 2;
+            }
+            "--log-raw-wake" => {
+                log_raw_wake = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
 
     if let Some(cmd) = page_url_arg {
         if cmd.eq_ignore_ascii_case("demo-buffer") {
@@ -572,6 +708,10 @@ async fn main() -> Result<()> {
     if let Some(url) = page_url_arg {
         config.kick_url = url.to_string();
     }
+    if let Some(p) = override_phrase {
+        config.activation_phrase = p;
+    }
+    config.log_raw_wake = log_raw_wake;
 
     if page_url_arg.is_none() && std::env::var("CLIP_PAGE_URL").is_err() {
         eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-wakeword-mic <page_url> [--phrase NAME]");
@@ -683,39 +823,14 @@ async fn run_hls_buffer_demo(page_url: &str) -> Result<()> {
 
 /// Listen on the microphone via SAPI; when the phrase is recognized, clip 30s from the streamer page.
 async fn run_wakeword_mic_demo(opts: MicOpts) -> Result<()> {
-    let phrases = opts
-        .phrase
-        .as_ref()
-        .map(|p| vec![p.clone()])
-        .unwrap_or_else(|| vec!["clip that".to_string()]);
-
-    let model_path = std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "models/ggml-tiny.en.bin".to_string());
-    let stream_path = std::env::var("WHISPER_STREAM_EXE").unwrap_or_else(|_| "tools/whisper-bin-x64/Release/whisper-stream.exe".to_string());
-
-    let fired = Arc::new(AtomicBool::new(false));
-    start_stream_listener(
-        std::path::Path::new(&stream_path),
-        std::path::Path::new(&model_path),
-        phrases.clone(),
-        fired.clone(),
-    )?;
-    println!(
-        "listening via whisper.cpp stream for wake phrases: {} (model: {}, exe: {})",
-        phrases.join(", "),
-        model_path,
-        stream_path
-    );
-
-    while !fired.load(Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    println!("wake phrase detected; capturing clip from {}", opts.page_url);
     let mut cfg = Config::example();
     cfg.kick_url = opts.page_url.clone();
+    if let Some(p) = opts.phrase.clone() {
+        cfg.activation_phrase = p;
+    }
     let app = AutoClip::new(cfg);
-    let path = app.clip_30s_from_page(&opts.page_url).await?;
-    println!("saved clip to {}", path.display());
+    let path = app.run_until_wake_and_clip(&opts.page_url).await?;
+    println!("saved wakeword clip to {}", path.display());
     Ok(())
 }
 

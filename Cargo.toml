@@ -11,6 +11,7 @@ tokio = { version = "1", features = ["full"] }
 m3u8-rs = "5.0.4"
 reqwest = { version = "0.11.14", features = ["json", "stream", "rustls-tls"], default-features = false }
 url = { version = "2.2.2", default-features = false }
+whisper-rs = "0.10"
 
 [dev-dependencies]
 anyhow = "1"
