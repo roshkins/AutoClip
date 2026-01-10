@@ -6,11 +6,12 @@
 use anyhow::{Context, Result};
 use m3u8_rs::{MasterPlaylist, MediaPlaylist, VariantStream};
 use reqwest::{header, Client};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::sleep;
 use url::Url;
@@ -145,10 +146,19 @@ impl AutoClip {
     pub async fn run_until_wake_and_clip(&self, page_url: &str) -> Result<()> {
         let before = Duration::from_secs(self.config.before_buffer_length as u64);
         let after = Duration::from_secs(self.config.after_buffer_length as u64);
-        let mut buffer = RollingBuffer::new(before + after);
+        let anchor_tail = Duration::from_secs(10); // target distance from wake word to clip end
+        let anchor_slack = Duration::from_secs(2); // absorb wake latency jitter
+        let effective_after = std::cmp::max(after, anchor_tail + anchor_slack);
+        let mut buffer = RollingBuffer::new(before + effective_after);
         let stop = Arc::new(AtomicBool::new(false));
+        let skip_clip_save = std::env::var("SKIP_CLIP_SAVE")
+            .ok()
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
         let save_dir = Path::new(&self.config.save_path);
-        fs::create_dir_all(save_dir).context("creating save dir for wakeword clip")?;
+        if !skip_clip_save {
+            fs::create_dir_all(save_dir).context("creating save dir for wakeword clip")?;
+        }
 
         let save_root = self.config.save_path.clone();
         let file_stub = self.config.file_name_stub.clone();
@@ -164,9 +174,15 @@ impl AutoClip {
 
         let mut seen: HashSet<String> = HashSet::new();
         let mut after_remaining: Option<Duration> = None;
+        let refractory = std::env::var("WAKE_REFRACTORY_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(12));
+        let mut refractory_until: Option<Instant> = None;
 
         // Start listening for the wake phrase, either from microphone or stream audio.
-        let model_path = std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "models/ggml-tiny.en.bin".to_string());
+        let model_path = stream_audio_wake::select_best_model_path();
         if self.config.use_mic_for_wake {
             let mic_device = self
                 .config
@@ -184,7 +200,7 @@ impl AutoClip {
             println!(
                 "listening to microphone for wake phrase '{}' (model: {})",
                 self.config.activation_phrase,
-                model_path,
+                model_path.display(),
             );
         } else {
             start_stream_wake_from_hls(
@@ -198,7 +214,7 @@ impl AutoClip {
             println!(
                 "listening to stream audio for wake phrase '{}' (model: {})",
                 self.config.activation_phrase,
-                model_path
+                model_path.display()
             );
         }
 
@@ -247,8 +263,17 @@ impl AutoClip {
                 }
 
                 if fired.load(Ordering::Relaxed) && after_remaining.is_none() {
-                    after_remaining = Some(after);
-                    println!("wake detected; capturing next {}s of stream", after.as_secs());
+                    if refractory_until.map(|t| Instant::now() < t).unwrap_or(false) {
+                        // Ignore rapid re-triggers until cooldown expires.
+                        continue;
+                    }
+                    after_remaining = Some(effective_after);
+                    refractory_until = Some(Instant::now() + refractory);
+                    println!(
+                        "wake detected; capturing next {}s of stream (cooldown {:?})",
+                        effective_after.as_secs(),
+                        refractory
+                    );
                 }
 
                 if let Some(rem) = after_remaining.as_mut() {
@@ -263,26 +288,33 @@ impl AutoClip {
                     }
                     let output_path = next_output_path(&save_root, &file_stub)?;
                     let ts_path = output_path.with_extension("ts");
-                    let snapshot = buffer.snapshot_bytes();
+                    let (snapshot, snap_len) = buffer.snapshot_tail(before + anchor_tail);
                     let (out_w, out_h) = parse_resolution(&resolution).unwrap_or((1080, 1920));
-                    let clip_len = buffer.total_duration();
+                    let clip_len = snap_len;
 
-                    let save_future = async move {
-                        fs::write(&ts_path, &snapshot).context("writing buffered TS snapshot")?;
-                        run_ffmpeg_from_file(&ts_path, &output_path, out_w, out_h, clip_len).await?;
+                    if skip_clip_save {
                         println!(
-                            "wrote wakeword clip: {} (duration ~{:.1}s)",
-                            output_path.display(),
+                            "wake detected; skipping clip save (SKIP_CLIP_SAVE=1) duration ~{:.1}s",
                             clip_len.as_secs_f32()
                         );
-                        Ok::<(), anyhow::Error>(())
-                    };
+                    } else {
+                        let save_future = async move {
+                            fs::write(&ts_path, &snapshot).context("writing buffered TS snapshot")?;
+                            run_ffmpeg_from_file(&ts_path, &output_path, out_w, out_h, clip_len).await?;
+                            println!(
+                                "wrote wakeword clip: {} (duration ~{:.1}s)",
+                                output_path.display(),
+                                clip_len.as_secs_f32()
+                            );
+                            Ok::<(), anyhow::Error>(())
+                        };
 
-                    tokio::spawn(async move {
-                        if let Err(err) = save_future.await {
-                            eprintln!("failed to persist wakeword clip: {err:#}");
-                        }
-                    });
+                        tokio::spawn(async move {
+                            if let Err(err) = save_future.await {
+                                eprintln!("failed to persist wakeword clip: {err:#}");
+                            }
+                        });
+                    }
 
                     after_remaining = None;
                     fired.store(false, Ordering::Relaxed);
@@ -335,9 +367,7 @@ impl HlsClient {
     /// Fetch and parse a master playlist from the provided URL.
     pub async fn fetch_master(&self, url: &str) -> Result<MasterPlaylist> {
         let body = self.fetch_bytes(url).await?;
-        let parsed = m3u8_rs::parse_master_playlist_res(&body)
-            .map_err(|e| anyhow::anyhow!("failed to parse master playlist: {e}"))?;
-        Ok(parsed)
+        self.parse_master_or_media(url, &body)
     }
 
     pub async fn fetch_master_with_headers(
@@ -350,9 +380,7 @@ impl HlsClient {
         let body = self
             .fetch_bytes_with_headers(url, referer, origin, cookie)
             .await?;
-        let parsed = m3u8_rs::parse_master_playlist_res(&body)
-            .map_err(|e| anyhow::anyhow!("failed to parse master playlist: {e}"))?;
-        Ok(parsed)
+        self.parse_master_or_media(url, &body)
     }
 
     /// Fetch a page via headless Playwright, extract the first m3u8 URL, and parse
@@ -360,18 +388,46 @@ impl HlsClient {
     /// COOKIE_HEADER or KICK_COOKIE if present. If M3U8_URL_OVERRIDE is set, use
     /// that master URL directly instead of headless extraction.
     pub async fn fetch_master_from_page(&self, page_url: &str) -> Result<(String, MasterPlaylist)> {
-        let env_cookie = std::env::var("COOKIE_HEADER")
-            .ok()
-            .or_else(|| std::env::var("KICK_COOKIE").ok());
+        let mut cookie_parts: Vec<String> = Vec::new();
+        for key in ["COOKIE_HEADER", "KICK_COOKIE", "TIKTOK_COOKIE"] {
+            if let Ok(val) = std::env::var(key) {
+                if !val.trim().is_empty() {
+                    cookie_parts.push(val);
+                }
+            }
+        }
+        let env_cookie = if cookie_parts.is_empty() {
+            None
+        } else {
+            Some(cookie_parts.join("; "))
+        };
 
-        let headless_script = std::env::var("HEADLESS_M3U8_SCRIPT")
-            .unwrap_or_else(|_| "scripts/capture_m3u8.js".to_string());
+        let origin = origin_for_page(page_url).unwrap_or_else(|| "https://kick.com".to_string());
+
+        let is_tiktok = page_url.contains("tiktok.com");
+        let headless_script = if is_tiktok {
+            std::env::var("HEADLESS_M3U8_SCRIPT_TIKTOK")
+                .unwrap_or_else(|_| "scripts/capture_m3u8_tiktok.js".to_string())
+        } else {
+            std::env::var("HEADLESS_M3U8_SCRIPT")
+                .unwrap_or_else(|_| "scripts/capture_m3u8.js".to_string())
+        };
 
         if let Ok(override_url) = std::env::var("M3U8_URL_OVERRIDE") {
             let master = self
-                .fetch_master_with_headers(&override_url, Some(page_url), Some("https://kick.com"), env_cookie.as_deref())
+                .fetch_master_with_headers(&override_url, Some(page_url), Some(&origin), env_cookie.as_deref())
                 .await?;
             return Ok((override_url, master));
+        }
+
+        if is_tiktok {
+            if let Some(res) = self
+                .try_fetch_tiktok_master(page_url, env_cookie.as_deref())
+                .await?
+            {
+                return Ok(res);
+            }
+            eprintln!("TikTok HTTP discovery failed or stream offline; falling back to headless");
         }
 
         self.fetch_master_with_headless(page_url, env_cookie.as_deref(), &headless_script)
@@ -431,28 +487,196 @@ impl HlsClient {
             (None, None) => None,
         };
 
+        let origin = origin_for_page(page_url);
+
         let body = self
             .fetch_bytes_with_headers(
                 &m3u8_url,
                 Some(page_url),
-                Some("https://kick.com"),
+                origin.as_deref(),
                 combined_cookie.as_deref(),
             )
             .await?;
 
-        let parsed = m3u8_rs::parse_master_playlist_res(&body).map_err(|e| {
-            let preview: String = String::from_utf8_lossy(&body)
-                .chars()
-                .take(500)
-                .collect();
-            eprintln!(
-                "failed to parse master playlist at {} (headless): {}; body preview: {}",
-                m3u8_url, e, preview
-            );
-            anyhow::anyhow!("failed to parse master playlist at {m3u8_url}: {e}")
-        })?;
-
+        let parsed = self.parse_master_or_media(&m3u8_url, &body)?;
         Ok((m3u8_url, parsed))
+    }
+
+    async fn try_fetch_tiktok_master(
+        &self,
+        page_url: &str,
+        cookie_env: Option<&str>,
+    ) -> Result<Option<(String, MasterPlaylist)>> {
+        let origin = origin_for_page(page_url).unwrap_or_else(|| "https://www.tiktok.com".to_string());
+        let cookie_header = cookie_env
+            .filter(|c| !c.trim().is_empty())
+            .map(|c| c.to_string());
+
+        let html = match self
+            .fetch_text_with_headers(page_url, Some(page_url), Some(&origin), cookie_header.as_deref())
+            .await
+        {
+            Ok(h) => h,
+            Err(err) => {
+                eprintln!("TikTok: failed to fetch page HTML: {err:#}");
+                return Ok(None);
+            }
+        };
+
+        let room_id = match extract_tiktok_room_id(&html) {
+            Some(id) => id,
+            None => {
+                eprintln!("TikTok: no room_id found; stream may be offline");
+                return Ok(None);
+            }
+        };
+
+        let mut live_info: Option<Value> = None;
+        let mut attempts = 0;
+        while attempts < 3 {
+            match self
+                .fetch_tiktok_room_info(&room_id, page_url, Some(&origin), cookie_header.as_deref())
+                .await
+            {
+                Ok(v) => {
+                    live_info = Some(v);
+                    break;
+                }
+                Err(err) => {
+                    attempts += 1;
+                    if attempts >= 3 {
+                        eprintln!("TikTok: room info fetch failed: {err:#}");
+                        return Ok(None);
+                    }
+                    sleep(Duration::from_millis(300)).await;
+                }
+            }
+        }
+
+        let live_info = live_info.unwrap_or(Value::Null);
+        let mut candidates = collect_tiktok_hls_candidates(&live_info);
+
+        if candidates.is_empty() {
+            if let Some(fallback_url) = self
+                .fetch_tiktok_live_detail_url(&room_id, page_url, Some(&origin), cookie_header.as_deref())
+                .await?
+            {
+                candidates.push(("live_detail".to_string(), fallback_url));
+            }
+        }
+
+        if candidates.is_empty() {
+            eprintln!("TikTok: no HLS candidates from room info or detail API");
+            return Ok(None);
+        }
+
+        let selected = pick_best_tiktok_hls(&candidates).unwrap_or_else(|| candidates[0].1.clone());
+        let master = self
+            .fetch_master_with_headers(&selected, Some(page_url), Some(&origin), cookie_header.as_deref())
+            .await?;
+        Ok(Some((selected, master)))
+    }
+
+    async fn fetch_text_with_headers(
+        &self,
+        url: &str,
+        referer: Option<&str>,
+        origin: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<String> {
+        let mut req = self.client.get(url);
+        if let Some(r) = referer {
+            req = req.header("Referer", r);
+        }
+        if let Some(o) = origin {
+            req = req.header("Origin", o);
+        }
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("request failed for {url}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .with_context(|| format!("reading body for {url}"))?;
+        if !status.is_success() {
+            eprintln!("fetch {} -> status {} body preview: {}", url, status, truncate_str(&text, 500));
+            anyhow::bail!("non-success status {} for {}", status, url);
+        }
+        Ok(text)
+    }
+
+    async fn fetch_tiktok_room_info(
+        &self,
+        room_id: &str,
+        referer: &str,
+        origin: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<Value> {
+        let url = "https://webcast.tiktok.com/webcast/room/info";
+        let mut req = self.client.get(url).query(&[
+            ("room_id", room_id),
+            ("aid", "1988"),
+            ("device_platform", "web"),
+            ("app_name", "tiktok_web"),
+            ("language", "en"),
+        ]);
+        req = req.header("Referer", referer);
+        if let Some(o) = origin {
+            req = req.header("Origin", o);
+        }
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| "requesting TikTok room info")?;
+        let status = resp.status();
+        let body = resp.text().await.context("reading TikTok room info body")?;
+        if !status.is_success() {
+            eprintln!("TikTok room info status {} body: {}", status, truncate_str(&body, 500));
+            anyhow::bail!("TikTok room info returned status {status}");
+        }
+        let json: Value = serde_json::from_str(&body).context("parsing TikTok room info JSON")?;
+        let data = json.get("data").cloned().unwrap_or(Value::Null);
+        Ok(data)
+    }
+
+    async fn fetch_tiktok_live_detail_url(
+        &self,
+        room_id: &str,
+        referer: &str,
+        origin: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<Option<String>> {
+        let url = format!("https://www.tiktok.com/api/live/detail/?roomID={room_id}");
+        let mut req = self.client.get(&url);
+        req = req.header("Referer", referer);
+        if let Some(o) = origin {
+            req = req.header("Origin", o);
+        }
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| "requesting TikTok live detail")?;
+        let status = resp.status();
+        let body = resp.text().await.context("reading TikTok live detail body")?;
+        if !status.is_success() {
+            return Ok(None);
+        }
+        let json: Value = serde_json::from_str(&body).context("parsing TikTok live detail JSON")?;
+        Ok(json
+            .get("liveUrl")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()))
     }
 
     /// Pick the highest-quality variant from a master playlist and return its joined URL.
@@ -564,6 +788,211 @@ impl HlsClient {
 
 }
 
+impl HlsClient {
+    fn parse_master_or_media(&self, m3u8_url: &str, body: &[u8]) -> Result<MasterPlaylist> {
+        match m3u8_rs::parse_master_playlist_res(body) {
+            Ok(master) if !master.variants.is_empty() => return Ok(master),
+            Ok(_master) => {
+                // Empty variants; try media parse and wrap as single-variant master.
+                if let Ok(_media) = m3u8_rs::parse_media_playlist_res(body) {
+                    let variant = VariantStream {
+                        uri: m3u8_url.to_string(),
+                        ..Default::default()
+                    };
+                    let mut out = MasterPlaylist::default();
+                    out.variants.push(variant);
+                    return Ok(out);
+                }
+                // Fall through to error below if media parse fails.
+            }
+            Err(e) => {
+                // Try media parse before bailing.
+                if let Ok(_media) = m3u8_rs::parse_media_playlist_res(body) {
+                    let variant = VariantStream {
+                        uri: m3u8_url.to_string(),
+                        ..Default::default()
+                    };
+                    let mut out = MasterPlaylist::default();
+                    out.variants.push(variant);
+                    return Ok(out);
+                }
+                return Err(anyhow::anyhow!("failed to parse master playlist: {e}"));
+            }
+        }
+
+        Err(anyhow::anyhow!("failed to parse playlist at {m3u8_url}"))
+    }
+}
+
+fn extract_tiktok_room_id(html: &str) -> Option<String> {
+    for marker in ["id=\"SIGI_STATE\"", "id=\"sigi-persisted-data\"", "id=\"__UNIVERSAL_DATA_FOR_REHYDRATION__\""] {
+        if let Some(block) = extract_json_script_block(html, marker) {
+            if let Ok(json) = serde_json::from_str::<Value>(&block) {
+                if let Some(id) = find_room_id_value(&json) {
+                    return Some(id);
+                }
+                // Some pages nest under __DEFAULT_SCOPE__ for the universal data script.
+                if let Some(default_scope) = json.get("__DEFAULT_SCOPE__") {
+                    if let Some(id) = find_room_id_value(default_scope) {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: scan for roomId in the HTML.
+    if let Some(idx) = html.find("roomId\":\"") {
+        let start = idx + "roomId\":\"".len();
+        let rest = &html[start..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        let candidate = &rest[..end];
+        if !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_digit()) {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+fn extract_json_script_block(html: &str, marker: &str) -> Option<String> {
+    let tag_start = html.find(marker)?;
+    let after_tag = html[tag_start..].find('>')?;
+    let script_start = tag_start + after_tag + 1;
+    let script_end_rel = html[script_start..].find("</script>")?;
+    let script_end = script_start + script_end_rel;
+    Some(html[script_start..script_end].to_string())
+}
+
+fn find_room_id_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                if k.eq_ignore_ascii_case("roomid") || k.eq_ignore_ascii_case("room_id") {
+                    if let Some(s) = v.as_str() {
+                        if !s.is_empty() {
+                            return Some(s.to_string());
+                        }
+                    } else if let Some(n) = v.as_i64() {
+                        return Some(n.to_string());
+                    }
+                }
+                if let Some(found) = find_room_id_value(v) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                if let Some(found) = find_room_id_value(v) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn collect_tiktok_hls_candidates(live_info: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+
+    if let Some(stream_data) = live_info
+        .get("stream_url")
+        .and_then(|v| v.get("live_core_sdk_data"))
+        .and_then(|v| v.get("pull_data"))
+        .and_then(|v| v.get("stream_data"))
+    {
+        if let Some(map) = stream_data.as_object() {
+            for (quality, entry) in map {
+                let parsed = if let Some(s) = entry.as_str() {
+                    serde_json::from_str::<Value>(s).ok()
+                } else {
+                    Some(entry.clone())
+                };
+
+                if let Some(val) = parsed {
+                    if let Some(hls) = extract_hls_from_stream_entry(&val) {
+                        out.push((quality.clone(), hls));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(map) = live_info
+        .get("stream_url")
+        .and_then(|v| v.get("hls_pull_url_map"))
+        .and_then(|v| v.as_object())
+    {
+        for (quality, url) in map {
+            if let Some(u) = url.as_str() {
+                out.push((quality.clone(), u.to_string()));
+            }
+        }
+    }
+
+    if let Some(url) = live_info
+        .get("stream_url")
+        .and_then(|v| v.get("hls_pull_url"))
+        .and_then(|v| v.as_str())
+    {
+        out.push(("hls_pull".to_string(), url.to_string()));
+    }
+
+    out
+}
+
+fn extract_hls_from_stream_entry(entry: &Value) -> Option<String> {
+    let main = entry.get("main");
+    let candidates = [
+        main.and_then(|v| v.get("https_hls")),
+        main.and_then(|v| v.get("hls")),
+        main.and_then(|v| v.get("hls_pull_url")),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if let Some(url) = candidate.as_str() {
+            if url.to_ascii_lowercase().contains("m3u8") {
+                return Some(url.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn pick_best_tiktok_hls(candidates: &[(String, String)]) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let preferred = [
+        "origion",
+        "origin",
+        "full_hd1",
+        "uhd",
+        "hd1",
+        "hd",
+        "sd2",
+        "sd1",
+        "sd",
+        "ld",
+    ];
+
+    for pref in preferred {
+        if let Some((_, url)) = candidates
+            .iter()
+            .find(|(q, _)| q.to_ascii_lowercase() == pref)
+        {
+            return Some(url.clone());
+        }
+    }
+
+    candidates.first().map(|(_, url)| url.clone())
+}
+
 /// Compare variants by average bandwidth, then bandwidth, then resolution pixels, then fallback to order.
 fn compare_variant_quality(a: &VariantStream, b: &VariantStream) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -611,6 +1040,15 @@ fn sanitize_m3u8_url(raw: &str) -> String {
         .to_string()
 }
 
+fn origin_for_page(page_url: &str) -> Option<String> {
+    if let Ok(u) = Url::parse(page_url) {
+        if let Some(host) = u.host_str() {
+            return Some(format!("{}://{}", u.scheme(), host));
+        }
+    }
+    None
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -618,6 +1056,84 @@ fn truncate_str(s: &str, max: usize) -> String {
     let mut out = s[..max.saturating_sub(3)].to_string();
     out.push_str("...");
     out
+}
+
+fn auto_assign_gpus_for_tools() {
+    let gpus = detect_nvidia_gpus();
+    if !gpus.is_empty() {
+        // Sort by memory already done in detect; pick biggest for whisper, second for ffmpeg if present.
+        let whisper_gpu = gpus[0].0;
+        let ffmpeg_gpu = if gpus.len() > 1 { gpus[1].0 } else { whisper_gpu };
+
+        std::env::set_var("WHISPER_GPU", whisper_gpu.to_string());
+        std::env::set_var("FFMPEG_HWACCEL", "cuda");
+        std::env::set_var("FFMPEG_HWACCEL_DEVICE", ffmpeg_gpu.to_string());
+        eprintln!("auto GPU assign for whisper: {}", whisper_gpu);
+        eprintln!("auto GPU assign for ffmpeg: {}", ffmpeg_gpu);
+        return;
+    }
+
+    // Non-NVIDIA: prefer D3D11VA (works on AMD/Intel on Windows) and let ffmpeg pick the device.
+    std::env::set_var("FFMPEG_HWACCEL", "d3d11va");
+    std::env::remove_var("FFMPEG_HWACCEL_DEVICE");
+    eprintln!("auto GPU assign: using d3d11va (no NVIDIA detected)");
+}
+
+fn detect_nvidia_gpus() -> Vec<(u32, u64)> {
+    let output = std::process::Command::new("nvidia-smi")
+        .arg("--query-gpu=index,memory.total")
+        .arg("--format=csv,noheader,nounits")
+        .output();
+
+    let Ok(out) = output else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut gpus = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 2 {
+            if let (Ok(idx), Ok(mem)) = (parts[0].parse::<u32>(), parts[1].parse::<u64>()) {
+                gpus.push((idx, mem));
+            }
+        }
+    }
+    gpus.sort_by(|a, b| b.1.cmp(&a.1));
+    gpus
+}
+
+fn ffmpeg_hwaccel_flags() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(hw) = std::env::var("FFMPEG_HWACCEL") {
+        if !hw.trim().is_empty() {
+            out.push("-hwaccel".to_string());
+            out.push(hw);
+        }
+    }
+    if let Ok(dev) = std::env::var("FFMPEG_HWACCEL_DEVICE") {
+        if !dev.trim().is_empty() {
+            out.push("-hwaccel_device".to_string());
+            out.push(dev);
+        }
+    }
+    out
+}
+
+fn ffmpeg_video_encoder() -> (String, bool, bool) {
+    if let Ok(enc) = std::env::var("FFMPEG_ENCODER") {
+        if !enc.trim().is_empty() {
+            let is_nvenc = enc.to_ascii_lowercase().contains("nvenc");
+            return (enc, is_nvenc, true);
+        }
+    }
+
+    let hw = std::env::var("FFMPEG_HWACCEL").unwrap_or_default();
+    if hw.eq_ignore_ascii_case("cuda") {
+        return ("h264_nvenc".to_string(), true, false);
+    }
+
+    ("libx264".to_string(), false, false)
 }
 
 fn next_output_path(save_dir: &str, stub: &str) -> Result<PathBuf> {
@@ -635,7 +1151,7 @@ fn next_output_path(save_dir: &str, stub: &str) -> Result<PathBuf> {
 }
 
 async fn run_ffmpeg_30s(input_hls: &Url, out_path: &Path, out_w: u32, out_h: u32) -> Result<()> {
-    run_ffmpeg_internal(input_hls.as_str(), out_path, out_w, out_h, Some(30.0), false).await
+    run_ffmpeg_internal(input_hls.as_str(), out_path, out_w, out_h, Some(30.0), false, false).await
 }
 
 async fn run_ffmpeg_from_file(
@@ -654,6 +1170,7 @@ async fn run_ffmpeg_from_file(
         out_h,
         Some(duration.as_secs_f32()),
         true,
+        true,
     )
     .await
 }
@@ -665,54 +1182,111 @@ async fn run_ffmpeg_internal(
     out_h: u32,
     duration_secs: Option<f32>,
     regen_pts: bool,
+    force_ts_input: bool,
 ) -> Result<()> {
     let vf = format!(
         "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
         out_w, out_h, out_w, out_h
     );
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y");
-    if regen_pts {
-        cmd.arg("-fflags").arg("+genpts");
-    }
-    cmd.arg("-i").arg(input);
-    if let Some(d) = duration_secs {
-        cmd.arg("-t").arg(format!("{d:.3}"));
-    }
-    cmd.arg("-map")
-        .arg("0:v:0")
-        .arg("-map")
-        .arg("0:a:0?")
-        .arg("-vf")
-        .arg(&vf)
-        .arg("-vsync")
-        .arg("vfr")
-        .arg("-c:v")
-        .arg("libx264")
-        .arg("-preset")
-        .arg("veryfast")
-        .arg("-crf")
-        .arg("23");
+    let (video_encoder, is_nvenc, encoder_forced) = ffmpeg_video_encoder();
 
-    if regen_pts {
-        if let Some(d) = duration_secs {
-            cmd.arg("-af").arg(format!("atrim=end={d:.3},asetpts=N/SR/TB"));
+    let input_owned = input.to_string();
+    let out_owned = out_path.to_path_buf();
+    let vf_owned = vf.clone();
+    let regen_flag = regen_pts;
+    let force_ts_flag = force_ts_input;
+    let duration_flag = duration_secs;
+
+    let run_encode = move |encoder: &str, use_nvenc: bool| {
+        let input = input_owned.clone();
+        let out_path = out_owned.clone();
+        let vf = vf_owned.clone();
+        let regen_pts = regen_flag;
+        let force_ts_input = force_ts_flag;
+        let duration_secs = duration_flag;
+        let encoder_owned = encoder.to_string();
+        async move {
+            let mut cmd = Command::new("ffmpeg");
+            cmd.arg("-y");
+            cmd.arg("-loglevel").arg("warning");
+            if regen_pts {
+                cmd.arg("-fflags").arg("+genpts");
+            }
+            for arg in ffmpeg_hwaccel_flags() {
+                cmd.arg(arg);
+            }
+            if force_ts_input {
+                cmd.arg("-f").arg("mpegts");
+            }
+            cmd.arg("-i").arg(&input);
+            if let Some(d) = duration_secs {
+                cmd.arg("-t").arg(format!("{d:.3}"));
+            }
+            cmd.arg("-map")
+                .arg("0:v:0")
+                .arg("-map")
+                .arg("0:a:0?")
+                .arg("-vf")
+                .arg(&vf)
+                .arg("-vsync")
+                .arg("vfr")
+                .arg("-c:v")
+                .arg(&encoder_owned);
+
+            if use_nvenc {
+                cmd.arg("-preset").arg("p4");
+                cmd.arg("-tune").arg("hq");
+                cmd.arg("-b:v").arg("0");
+                cmd.arg("-cq").arg("23");
+            } else {
+                cmd.arg("-preset").arg("veryfast");
+                cmd.arg("-crf").arg("23");
+            }
+
+            if regen_pts {
+                if let Some(d) = duration_secs {
+                    cmd.arg("-af").arg(format!("atrim=end={d:.3},asetpts=N/SR/TB"));
+                }
+                cmd.arg("-c:a")
+                    .arg("aac")
+                    .arg("-b:a")
+                    .arg("160k");
+            } else {
+                cmd.arg("-c:a").arg("copy");
+            }
+
+            cmd.arg("-shortest").arg(out_path.as_os_str());
+            cmd.output().await.context("failed to run ffmpeg")
         }
-        cmd.arg("-c:a")
-            .arg("aac")
-            .arg("-b:a")
-            .arg("160k");
-    } else {
-        cmd.arg("-c:a").arg("copy");
-    }
+    };
 
-    cmd.arg("-shortest").arg(out_path.as_os_str());
+    let mut output = run_encode(&video_encoder, is_nvenc).await?;
 
-    let status = cmd.status().await.context("failed to run ffmpeg")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _stdout = String::from_utf8_lossy(&output.stdout);
 
-    if !status.success() {
-        anyhow::bail!("ffmpeg exited with status {status}");
+        let nvenc_missing = is_nvenc
+            && !encoder_forced
+            && (stderr.contains("Unknown encoder 'h264_nvenc'")
+                || stderr.to_ascii_lowercase().contains("nvenc capable"));
+
+        if nvenc_missing {
+            eprintln!("ffmpeg nvenc not available; retrying with libx264");
+            output = run_encode("libx264", false).await?;
+        }
+
+        if !output.status.success() {
+            let stderr2 = String::from_utf8_lossy(&output.stderr);
+            let stdout2 = String::from_utf8_lossy(&output.stdout);
+            anyhow::bail!(
+                "ffmpeg exited with status {}\nstdout: {}\nstderr: {}",
+                output.status,
+                stdout2.trim(),
+                stderr2.trim()
+            );
+        }
     }
 
     Ok(())
@@ -721,9 +1295,16 @@ async fn run_ffmpeg_internal(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help(args.get(0).map(String::as_str).unwrap_or("autoclip"));
+        return Ok(());
+    }
+
+    auto_assign_gpus_for_tools();
     let page_url_arg = args.get(1).map(|s| s.as_str());
     let mut override_phrase: Option<String> = None;
-    let mut log_raw_wake = false;
+    let mut log_raw_wake = true; // default on; can be suppressed
 
     // Parse optional flags for wakeword control.
     let mut i = 2;
@@ -737,6 +1318,10 @@ async fn main() -> Result<()> {
             }
             "--log-raw-wake" => {
                 log_raw_wake = true;
+                i += 1;
+            }
+            "--no-log-raw-wake" => {
+                log_raw_wake = false;
                 i += 1;
             }
             _ => i += 1,
@@ -775,7 +1360,7 @@ async fn main() -> Result<()> {
     config.log_raw_wake = log_raw_wake;
 
     if page_url_arg.is_none() && std::env::var("CLIP_PAGE_URL").is_err() {
-        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-wakeword-mic <page_url> [--phrase NAME]");
+        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-wakeword-mic <page_url> [--phrase NAME] [--no-log-raw-wake]");
         return Ok(());
     }
 
@@ -1027,6 +1612,36 @@ fn prompt_for_mic_device() -> Option<String> {
         }
     }
     None
+}
+
+fn print_help(bin: &str) {
+    println!("Usage:");
+    println!("  {bin} <page_url> [options]");
+    println!("  {bin} demo-buffer");
+    println!("  {bin} demo-hls-buffer <page_url>");
+    println!("  {bin} demo-wakeword-mic <page_url> [--phrase WORD] [--log-raw-wake] [--mic-device NAME]");
+    println!("");
+    println!("Options:");
+    println!("  --phrase WORD           Override wake phrase (default: 'orange')");
+    println!("  --log-raw-wake         Log raw/normalized transcripts (default on)");
+    println!("  --no-log-raw-wake      Disable transcript logging");
+    println!("  --mic-device NAME      Microphone device for mic wake mode");
+    println!("  -h, --help             Show this help");
+    println!("");
+    println!("Environment (selected):");
+    println!("  CLIP_PAGE_URL            Default page when none is passed");
+    println!("  M3U8_URL_OVERRIDE        Skip discovery; use this master URL directly");
+    println!("  COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE   Cookies to send on discovery");
+    println!("  HEADLESS_M3U8_SCRIPT / HEADLESS_M3U8_SCRIPT_TIKTOK   Override Playwright scripts");
+    println!("  WAKE_REFRACTORY_SECS     Cooldown between wake detections (default 12)");
+    println!("  SKIP_CLIP_SAVE           If set to 1/true, skip writing clips");
+    println!("  WHISPER_MODEL            Path to whisper model (default auto)");
+    println!("  FFMPEG_ENCODER / FFMPEG_HWACCEL / FFMPEG_HWACCEL_DEVICE   Encoder/accel knobs");
+    println!("  LOG_M3U8_HEADERS         Log request headers when fetching playlists");
+    println!("");
+    println!("Notes:");
+    println!("  - Main path: page URL -> HLS discovery (TikTok HTTP first, headless fallback) -> wake detection -> clip.");
+    println!("  - Demo modes: buffer-only, HLS buffer demo, or mic wake demo for quick sanity checks.");
 }
 
 

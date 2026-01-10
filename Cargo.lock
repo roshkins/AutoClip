@@ -30,6 +30,7 @@ dependencies = [
  "anyhow",
  "m3u8-rs",
  "reqwest",
+ "serde_json",
  "tokio",
  "url",
  "whisper-rs",

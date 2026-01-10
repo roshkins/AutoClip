@@ -1,5 +1,6 @@
+use std::env;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,8 +12,9 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 const SAMPLE_RATE: usize = 16_000;
 const CHUNK_MS: usize = 500; // read cadence for responsiveness
-const WINDOW_MS: usize = 8_000; // transcription window length
+const WINDOW_MS: usize = 6_000; // transcription window length (shorter to cut through noise)
 const STEP_MS: usize = 1_000; // inference cadence
+const DEFAULT_RT_TARGET: f32 = 0.9;
 
 /// Common wake loop; caller provides how to spawn an ffmpeg PCM source (stream or mic).
 fn run_wake_loop_with_spawn<Spawn>(
@@ -26,11 +28,14 @@ fn run_wake_loop_with_spawn<Spawn>(
 where
     Spawn: FnMut() -> Result<(Child, Box<dyn Read + Send>)> + Send + 'static,
 {
+    let mut wparams = WhisperContextParameters::default();
+    wparams.use_gpu = true; // prefer GPU-backed inference when built with CUDA/Metal
+
     let ctx = WhisperContext::new_with_params(
         model_path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?,
-        WhisperContextParameters::default(),
+        wparams,
     )
     .context("loading whisper model")?;
     let mut state = ctx.create_state().context("creating whisper state")?;
@@ -116,6 +121,109 @@ where
     Ok(())
 }
 
+/// Select the largest Whisper model that meets the realtime target.
+/// Honors WHISPER_MODEL as a hard override. Candidates may be provided via
+/// WHISPER_MODEL_CANDIDATES (comma-separated filenames); otherwise defaults
+/// to medium/small/base/tiny English ggml models under ./models.
+pub fn select_best_model_path() -> PathBuf {
+    if let Ok(explicit) = env::var("WHISPER_MODEL") {
+        let p = PathBuf::from(explicit);
+        eprintln!("using WHISPER_MODEL override: {}", p.display());
+        return p;
+    }
+
+    let target: f32 = env::var("WHISPER_RT_TARGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RT_TARGET);
+
+    let candidates = env::var("WHISPER_MODEL_CANDIDATES")
+        .ok()
+        .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+        .unwrap_or_else(|| {
+            vec![
+                "ggml-medium.en.bin".to_string(),
+                "ggml-small.en.bin".to_string(),
+                "ggml-base.en.bin".to_string(),
+                "ggml-tiny.en.bin".to_string(),
+            ]
+        });
+
+    let mut tested = Vec::new();
+    for name in candidates {
+        let path = if Path::new(&name).is_absolute() {
+            PathBuf::from(&name)
+        } else {
+            Path::new("models").join(&name)
+        };
+
+        if !path.exists() {
+            tested.push((path.clone(), None));
+            continue;
+        }
+
+        let rt_factor = benchmark_model_rt(&path);
+        tested.push((path.clone(), rt_factor));
+    }
+
+    // Pick the first candidate that meets target; fall back to first existing.
+    let mut chosen: Option<PathBuf> = None;
+    for (p, rt) in &tested {
+        if let Some(rt) = rt {
+            eprintln!("model {:?}: rt_factor={:.3}", p.file_name().unwrap_or_default(), rt);
+            if *rt <= target {
+                chosen = Some(p.clone());
+                break;
+            }
+        } else {
+            eprintln!("model {:?}: unavailable or failed to benchmark", p.file_name().unwrap_or_default());
+        }
+    }
+
+    if chosen.is_none() {
+        chosen = tested.iter().find(|(p, rt)| p.exists() && rt.is_some()).map(|(p, _)| p.clone());
+    }
+
+    chosen.unwrap_or_else(|| {
+        let fallback = PathBuf::from("models/ggml-tiny.en.bin");
+        eprintln!("no candidate models benchmarked; falling back to {}", fallback.display());
+        fallback
+    })
+}
+
+fn benchmark_model_rt(path: &Path) -> Option<f32> {
+    // 8s of silence to match WINDOW_MS.
+    let samples = SAMPLE_RATE * WINDOW_MS / 1000;
+    let audio: Vec<f32> = vec![0.0; samples];
+
+    let mut wparams = WhisperContextParameters::default();
+    wparams.use_gpu = true;
+
+    let ctx = WhisperContext::new_with_params(
+        path.to_str()?,
+        wparams,
+    ).ok()?;
+    let mut state = ctx.create_state().ok()?;
+
+    let mut params = FullParams::new(SamplingStrategy::default());
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_special(false);
+    params.set_translate(false);
+    params.set_no_timestamps(true);
+    params.set_single_segment(true);
+    params.set_language(Some("en"));
+    params.set_no_speech_thold(0.45);
+
+    let start = Instant::now();
+    if state.full(params, &audio).is_err() {
+        return None;
+    }
+    let elapsed = start.elapsed().as_secs_f32();
+    let rt = elapsed / (WINDOW_MS as f32 / 1000.0);
+    Some(rt)
+}
+
 /// Listen to stream audio (HLS) via ffmpeg, run Whisper locally, and fire when the wake phrase is detected.
 pub fn start_stream_wake_from_hls(
     media_url: &Url,
@@ -195,9 +303,15 @@ fn transcribe_window(state: &mut whisper_rs::WhisperState, audio: &[f32]) -> Res
 
 fn spawn_ffmpeg_pcm(media_url: &Url) -> Result<(Child, Box<dyn Read + Send>)> {
     let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-nostdin")
-        .arg("-i")
+    cmd.arg("-nostdin");
+
+    for arg in ffmpeg_hwaccel_flags() {
+        cmd.arg(arg);
+    }
+
+    cmd.arg("-i")
         .arg(media_url.as_str())
+        .args(wake_af_flags())
         .arg("-vn")
         .arg("-f")
         .arg("s16le")
@@ -236,16 +350,35 @@ fn spawn_ffmpeg_pcm_mic(device: Option<&str>) -> Result<(Child, Box<dyn Read + S
 
         #[cfg(target_os = "windows")]
         {
-            cmd.arg("-f").arg("dshow").arg("-rtbufsize").arg("10M").arg("-i").arg(&input);
+            cmd.arg("-f").arg("dshow").arg("-rtbufsize").arg("10M");
         }
         #[cfg(target_os = "macos")]
         {
-            cmd.arg("-f").arg("avfoundation").arg("-i").arg(&input);
+            cmd.arg("-f").arg("avfoundation");
         }
         #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
         {
-            cmd.arg("-f").arg("pulse").arg("-i").arg(&input);
+            cmd.arg("-f").arg("pulse");
         }
+
+        for arg in ffmpeg_hwaccel_flags() {
+            cmd.arg(arg);
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            cmd.arg("-i").arg(&input);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            cmd.arg("-i").arg(&input);
+        }
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            cmd.arg("-i").arg(&input);
+        }
+
+        cmd.args(wake_af_flags());
 
         cmd.arg("-vn")
             .arg("-f")
@@ -275,6 +408,32 @@ fn spawn_ffmpeg_pcm_mic(device: Option<&str>) -> Result<(Child, Box<dyn Read + S
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no mic candidates succeeded; set MIC_DEVICE to a valid input")))
+}
+
+fn ffmpeg_hwaccel_flags() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(hw) = env::var("FFMPEG_HWACCEL") {
+        if !hw.trim().is_empty() {
+            out.push("-hwaccel".to_string());
+            out.push(hw);
+        }
+    }
+    if let Ok(dev) = env::var("FFMPEG_HWACCEL_DEVICE") {
+        if !dev.trim().is_empty() {
+            out.push("-hwaccel_device".to_string());
+            out.push(dev);
+        }
+    }
+    out
+}
+
+fn wake_af_flags() -> Vec<String> {
+    if let Ok(af) = env::var("WAKE_FF_AF") {
+        if !af.trim().is_empty() {
+            return vec!["-af".to_string(), af];
+        }
+    }
+    Vec::new()
 }
 
 fn default_mic_candidates() -> Vec<String> {
