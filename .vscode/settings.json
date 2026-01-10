@@ -1,6 +1,7 @@
 {
     "git.enabled": false,
     "chat.tools.terminal.autoApprove": {
-        "cargo run": true
+        "cargo run": true,
+        "cargo test": true
     }
 }

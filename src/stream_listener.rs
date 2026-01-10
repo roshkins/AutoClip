@@ -11,6 +11,8 @@ pub fn start_stream_listener(
     stream_exe: &Path,
     model_path: &Path,
     phrases: Vec<String>,
+    log_raw: bool,
+    stop: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
 ) -> Result<()> {
     if phrases.is_empty() {
@@ -21,7 +23,7 @@ pub fn start_stream_listener(
     let model_path = model_path.to_path_buf();
 
     std::thread::spawn(move || {
-        if let Err(err) = run_stream_listener(&stream_exe, &model_path, &phrases, fired) {
+        if let Err(err) = run_stream_listener(&stream_exe, &model_path, &phrases, log_raw, stop, fired) {
             eprintln!("stream listener error: {err:#}");
         }
     });
@@ -29,7 +31,14 @@ pub fn start_stream_listener(
     Ok(())
 }
 
-fn run_stream_listener(stream_exe: &Path, model_path: &Path, phrases: &[String], fired: Arc<AtomicBool>) -> Result<()> {
+fn run_stream_listener(
+    stream_exe: &Path,
+    model_path: &Path,
+    phrases: &[String],
+    log_raw: bool,
+    stop: Arc<AtomicBool>,
+    fired: Arc<AtomicBool>,
+) -> Result<()> {
     if !stream_exe.exists() {
         anyhow::bail!("stream executable not found at {} (set WHISPER_STREAM_EXE)", stream_exe.display());
     }
@@ -51,21 +60,27 @@ fn run_stream_listener(stream_exe: &Path, model_path: &Path, phrases: &[String],
     let mut line = String::new();
 
     while !fired.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         line.clear();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
             break; // process ended
         }
         let norm = normalize(&line);
-        println!("stream raw: {}", line.trim());
-        println!("stream norm: {norm}");
+        if log_raw && !norm.is_empty() {
+            println!("stream raw: {}", line.trim());
+            println!("stream norm: {norm}");
+        }
         if norm.is_empty() {
             continue;
         }
         if matches_phrase(&norm, phrases) {
-            fired.store(true, Ordering::Relaxed);
-            eprintln!("wake phrase detected via stream: {norm}");
-            break;
+            let already = fired.swap(true, Ordering::Relaxed);
+            if !already {
+                eprintln!("wake phrase detected via stream: {norm}");
+            }
         }
     }
 

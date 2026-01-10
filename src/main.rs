@@ -8,6 +8,7 @@ use m3u8_rs::{MasterPlaylist, MediaPlaylist, VariantStream};
 use reqwest::{header, Client};
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -19,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod rolling_buffer;
 use rolling_buffer::RollingBuffer;
 mod stream_audio_wake;
-use stream_audio_wake::start_stream_wake_from_hls;
+use stream_audio_wake::{start_mic_wake_with_ffmpeg, start_stream_wake_from_hls};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -41,6 +42,10 @@ pub struct Config {
     pub file_name_stub: String,
     /// Whether to print raw/normalized transcripts from the stream listener.
     pub log_raw_wake: bool,
+    /// When true, listen to microphone for wakeword instead of stream audio.
+    pub use_mic_for_wake: bool,
+    /// Optional explicit microphone device for ffmpeg capture (e.g., audio="Microphone (XYZ)").
+    pub mic_device: Option<String>,
 }
 
 impl Config {
@@ -55,6 +60,8 @@ impl Config {
             save_path: "./clips".to_string(),
             file_name_stub: "clip".to_string(),
             log_raw_wake: false,
+            use_mic_for_wake: false,
+            mic_device: None,
         }
     }
 }
@@ -85,8 +92,7 @@ impl AutoClip {
             .or_else(|| std::env::var("CLIP_PAGE_URL").ok())
             .filter(|s| !s.is_empty())
         {
-            let output = self.run_until_wake_and_clip(&page_url).await?;
-            println!("saved wakeword-triggered clip to {}", output.display());
+            self.run_until_wake_and_clip(&page_url).await?;
             return Ok(());
         }
 
@@ -136,10 +142,18 @@ impl AutoClip {
 
     /// Continuously buffer the HLS stream, wait for the wake phrase, then save the
     /// previous `before_buffer_length` seconds plus `after_buffer_length` seconds to a vertical MP4.
-    pub async fn run_until_wake_and_clip(&self, page_url: &str) -> Result<PathBuf> {
+    pub async fn run_until_wake_and_clip(&self, page_url: &str) -> Result<()> {
         let before = Duration::from_secs(self.config.before_buffer_length as u64);
         let after = Duration::from_secs(self.config.after_buffer_length as u64);
         let mut buffer = RollingBuffer::new(before + after);
+        let stop = Arc::new(AtomicBool::new(false));
+        let save_dir = Path::new(&self.config.save_path);
+        fs::create_dir_all(save_dir).context("creating save dir for wakeword clip")?;
+
+        let save_root = self.config.save_path.clone();
+        let file_stub = self.config.file_name_stub.clone();
+        let resolution = self.config.resolution.clone();
+        let stop_for_audio = stop.clone();
 
         let fired = Arc::new(AtomicBool::new(false));
 
@@ -151,24 +165,58 @@ impl AutoClip {
         let mut seen: HashSet<String> = HashSet::new();
         let mut after_remaining: Option<Duration> = None;
 
-        // Start listening to the stream audio for the wake phrase via whisper-stream.
+        // Start listening for the wake phrase, either from microphone or stream audio.
         let model_path = std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "models/ggml-tiny.en.bin".to_string());
-        start_stream_wake_from_hls(
-            &media_url,
-            Path::new(&model_path),
-            &self.config.activation_phrase,
-            self.config.log_raw_wake,
-            fired.clone(),
-        )?;
-        println!(
-            "listening to stream audio for wake phrase '{}' (model: {})",
-            self.config.activation_phrase,
-            model_path
-        );
+        if self.config.use_mic_for_wake {
+            let mic_device = self
+                .config
+                .mic_device
+                .clone()
+                .or_else(|| std::env::var("MIC_DEVICE").ok());
+            start_mic_wake_with_ffmpeg(
+                mic_device.as_deref(),
+                Path::new(&model_path),
+                &self.config.activation_phrase,
+                self.config.log_raw_wake,
+                stop_for_audio,
+                fired.clone(),
+            )?;
+            println!(
+                "listening to microphone for wake phrase '{}' (model: {})",
+                self.config.activation_phrase,
+                model_path,
+            );
+        } else {
+            start_stream_wake_from_hls(
+                &media_url,
+                Path::new(&model_path),
+                &self.config.activation_phrase,
+                self.config.log_raw_wake,
+                stop_for_audio,
+                fired.clone(),
+            )?;
+            println!(
+                "listening to stream audio for wake phrase '{}' (model: {})",
+                self.config.activation_phrase,
+                model_path
+            );
+        }
+
+        let stop_signal = stop.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("Ctrl+C received, shutting down...");
+                stop_signal.store(true, Ordering::Relaxed);
+            }
+        });
 
         let poll_interval = Duration::from_millis(500);
 
         loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
             let playlist = match hls.fetch_media(media_url.as_str()).await {
                 Ok(p) => p,
                 Err(err) => {
@@ -210,7 +258,35 @@ impl AutoClip {
 
             if let Some(rem_mut) = after_remaining.as_mut() {
                 if *rem_mut <= Duration::ZERO {
-                    break;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let output_path = next_output_path(&save_root, &file_stub)?;
+                    let ts_path = output_path.with_extension("ts");
+                    let snapshot = buffer.snapshot_bytes();
+                    let (out_w, out_h) = parse_resolution(&resolution).unwrap_or((1080, 1920));
+                    let clip_len = buffer.total_duration();
+
+                    let save_future = async move {
+                        fs::write(&ts_path, &snapshot).context("writing buffered TS snapshot")?;
+                        run_ffmpeg_from_file(&ts_path, &output_path, out_w, out_h, clip_len).await?;
+                        println!(
+                            "wrote wakeword clip: {} (duration ~{:.1}s)",
+                            output_path.display(),
+                            clip_len.as_secs_f32()
+                        );
+                        Ok::<(), anyhow::Error>(())
+                    };
+
+                    tokio::spawn(async move {
+                        if let Err(err) = save_future.await {
+                            eprintln!("failed to persist wakeword clip: {err:#}");
+                        }
+                    });
+
+                    after_remaining = None;
+                    fired.store(false, Ordering::Relaxed);
+                    continue;
                 }
                 if !made_progress {
                     // If the playlist is stale, still count down so we don't spin forever.
@@ -226,23 +302,8 @@ impl AutoClip {
             sleep(poll_interval).await;
         }
 
-        let save_dir = Path::new(&self.config.save_path);
-        fs::create_dir_all(save_dir).context("creating save dir for wakeword clip")?;
-
-        let output_path = next_output_path(&self.config.save_path, &self.config.file_name_stub)?;
-        let ts_path = output_path.with_extension("ts");
-        let snapshot = buffer.snapshot_bytes();
-        fs::write(&ts_path, &snapshot).context("writing buffered TS snapshot")?;
-
-        let (out_w, out_h) = parse_resolution(&self.config.resolution).unwrap_or((1080, 1920));
-        run_ffmpeg_from_file(&ts_path, &output_path, out_w, out_h, buffer.total_duration()).await?;
-        println!(
-            "wrote wakeword clip: {} (duration ~{:.1}s)",
-            output_path.display(),
-            buffer.total_duration().as_secs_f32()
-        );
-
-        Ok(output_path)
+        // continuous loop
+        Ok(())
     }
 }
 /// Minimal client to fetch and parse HLS playlists.
@@ -828,25 +889,30 @@ async fn run_wakeword_mic_demo(opts: MicOpts) -> Result<()> {
     if let Some(p) = opts.phrase.clone() {
         cfg.activation_phrase = p;
     }
+    cfg.use_mic_for_wake = true;
+    cfg.log_raw_wake = opts.log_raw_wake;
+    cfg.mic_device = opts.mic_device.clone();
     let app = AutoClip::new(cfg);
-    let path = app.run_until_wake_and_clip(&opts.page_url).await?;
-    println!("saved wakeword clip to {}", path.display());
-    Ok(())
+    app.run_until_wake_and_clip(&opts.page_url).await
 }
 
 #[derive(Debug, Clone)]
 struct MicOpts {
     page_url: String,
     phrase: Option<String>,
+    log_raw_wake: bool,
+    mic_device: Option<String>,
 }
 
 fn parse_mic_args(args: &[String]) -> Result<MicOpts> {
     if args.is_empty() {
-        anyhow::bail!("usage: autoclip demo-wakeword-mic <page_url> [--phrase NAME]");
+        anyhow::bail!("usage: autoclip demo-wakeword-mic <page_url> [--phrase NAME] [--log-raw-wake] [--mic-device DEVICE]");
     }
 
     let page_url = args[0].clone();
     let mut phrase = None;
+    let mut log_raw_wake = false;
+    let mut mic_device: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -855,6 +921,13 @@ fn parse_mic_args(args: &[String]) -> Result<MicOpts> {
                 i += 1;
                 phrase = args.get(i).cloned();
             }
+            "--log-raw-wake" => {
+                log_raw_wake = true;
+            }
+            "--mic-device" => {
+                i += 1;
+                mic_device = args.get(i).cloned();
+            }
             other => {
                 anyhow::bail!("unknown flag {other}");
             }
@@ -862,7 +935,98 @@ fn parse_mic_args(args: &[String]) -> Result<MicOpts> {
         i += 1;
     }
 
-    Ok(MicOpts { page_url, phrase })
+    if mic_device.is_none() {
+        if let Ok(env_dev) = std::env::var("MIC_DEVICE") {
+            if !env_dev.trim().is_empty() {
+                mic_device = Some(env_dev);
+            }
+        }
+    }
+
+    if mic_device.is_none() {
+        mic_device = prompt_for_mic_device();
+    }
+
+    Ok(MicOpts { page_url, phrase, log_raw_wake, mic_device })
+}
+
+fn prompt_for_mic_device() -> Option<String> {
+    println!("No mic device provided. Attempting to list inputs.");
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("ffmpeg")
+            .arg("-list_devices")
+            .arg("true")
+            .arg("-f")
+            .arg("dshow")
+            .arg("-i")
+            .arg("dummy")
+            .status();
+        println!("Format example: audio=\"Microphone (Realtek(R) Audio)\"");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("ffmpeg")
+            .arg("-f")
+            .arg("avfoundation")
+            .arg("-list_devices")
+            .arg("true")
+            .arg("-i")
+            .arg("")
+            .status();
+        println!("Format example: :0");
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let _ = Command::new("pactl").arg("list").arg("short").arg("sources").status();
+        println!("Format example: default or hw:0");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let devices = crate::stream_audio_wake::list_system_mics();
+        if !devices.is_empty() {
+            if !io::stdin().is_terminal() {
+                println!("Non-interactive shell detected; using first device: {}", devices[0]);
+                return Some(devices[0].clone());
+            }
+            println!("Detected devices:");
+            for (idx, d) in devices.iter().enumerate() {
+                println!("  [{}] {}", idx + 1, d);
+            }
+            print!("Enter mic device (or press Enter to use [{}]): ", devices[0]);
+            let _ = io::stdout().flush();
+            let mut line = String::new();
+            if io::stdin().read_line(&mut line).is_ok() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return Some(devices[0].clone());
+                }
+                if let Ok(num) = trimmed.parse::<usize>() {
+                    if num > 0 && num <= devices.len() {
+                        return Some(devices[num - 1].clone());
+                    }
+                }
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if !io::stdin().is_terminal() {
+        return None;
+    }
+
+    print!("Enter mic device (or press Enter to try defaults): ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_ok() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
 }
 
 
