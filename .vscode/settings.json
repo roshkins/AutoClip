@@ -2,6 +2,7 @@
     "git.enabled": false,
     "chat.tools.terminal.autoApprove": {
         "cargo run": true,
-        "cargo test": true
+        "cargo test": true,
+        "jj": true
     }
 }
