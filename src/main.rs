@@ -144,13 +144,15 @@ impl AutoClip {
     /// Continuously buffer the HLS stream, wait for the wake phrase, then save the
     /// previous `before_buffer_length` seconds plus `after_buffer_length` seconds to a vertical MP4.
     pub async fn run_until_wake_and_clip(&self, page_url: &str) -> Result<()> {
-        let before = Duration::from_secs(self.config.before_buffer_length as u64);
-        let after = Duration::from_secs(self.config.after_buffer_length as u64);
-        let anchor_tail = Duration::from_secs(10); // target distance from wake word to clip end
-        let anchor_slack = Duration::from_secs(2); // absorb wake latency jitter
-        let effective_after = std::cmp::max(after, anchor_tail + anchor_slack);
-        let mut buffer = RollingBuffer::new(before + effective_after);
+        // Requirement: wake phrase appears 50s into the clip and 10s from the end.
+        let before = Duration::from_secs(50);
+        let after_tail = Duration::from_secs(10);
+        let capture_window = before + after_tail; // 60s total clip length
+        let mut buffer = RollingBuffer::new(capture_window);
         let stop = Arc::new(AtomicBool::new(false));
+        let mut last_detect_instant: Option<Instant> = None;
+        let start_instant = Instant::now();
+        let detect_ns = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let skip_clip_save = std::env::var("SKIP_CLIP_SAVE")
             .ok()
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -196,6 +198,8 @@ impl AutoClip {
                 self.config.log_raw_wake,
                 stop_for_audio,
                 fired.clone(),
+                start_instant,
+                detect_ns.clone(),
             )?;
             println!(
                 "listening to microphone for wake phrase '{}' (model: {})",
@@ -210,6 +214,8 @@ impl AutoClip {
                 self.config.log_raw_wake,
                 stop_for_audio,
                 fired.clone(),
+                start_instant,
+                detect_ns.clone(),
             )?;
             println!(
                 "listening to stream audio for wake phrase '{}' (model: {})",
@@ -267,11 +273,17 @@ impl AutoClip {
                         // Ignore rapid re-triggers until cooldown expires.
                         continue;
                     }
-                    after_remaining = Some(effective_after);
+                    // Wait exactly 10s of post-wake audio to place wake at 50s and end at +10s.
+                    after_remaining = Some(after_tail);
                     refractory_until = Some(Instant::now() + refractory);
+                    let ns = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
+                    if ns != u64::MAX {
+                        last_detect_instant = Some(start_instant + Duration::from_nanos(ns));
+                    } else {
+                        last_detect_instant = Some(Instant::now());
+                    }
                     println!(
-                        "wake detected; capturing next {}s of stream (cooldown {:?})",
-                        effective_after.as_secs(),
+                        "wake detected; capturing 10s tail to place wake at 50s into a 60s clip (cooldown {:?})",
                         refractory
                     );
                 }
@@ -288,7 +300,7 @@ impl AutoClip {
                     }
                     let output_path = next_output_path(&save_root, &file_stub)?;
                     let ts_path = output_path.with_extension("ts");
-                    let (snapshot, snap_len) = buffer.snapshot_tail(before + anchor_tail);
+                    let (snapshot, snap_len) = buffer.snapshot_tail(capture_window);
                     let (out_w, out_h) = parse_resolution(&resolution).unwrap_or((1080, 1920));
                     let clip_len = snap_len;
 
@@ -301,10 +313,12 @@ impl AutoClip {
                         let save_future = async move {
                             fs::write(&ts_path, &snapshot).context("writing buffered TS snapshot")?;
                             run_ffmpeg_from_file(&ts_path, &output_path, out_w, out_h, clip_len).await?;
+                            let detected_at = last_detect_instant.map(|t| t.elapsed().as_secs_f32());
                             println!(
-                                "wrote wakeword clip: {} (duration ~{:.1}s)",
+                                "wrote wakeword clip: {} (duration ~{:.1}s) | wake at ~50.0s into clip | detect_elapsed_since_save_start={:?}",
                                 output_path.display(),
-                                clip_len.as_secs_f32()
+                                clip_len.as_secs_f32(),
+                                detected_at
                             );
                             Ok::<(), anyhow::Error>(())
                         };
@@ -328,7 +342,7 @@ impl AutoClip {
 
             if fired.load(Ordering::Relaxed) && after_remaining.is_none() {
                 // Wake fired but we have not yet started counting; ensure we do.
-                after_remaining = Some(after);
+                after_remaining = Some(after_tail);
             }
 
             sleep(poll_interval).await;
@@ -1184,8 +1198,13 @@ async fn run_ffmpeg_internal(
     regen_pts: bool,
     force_ts_input: bool,
 ) -> Result<()> {
-    let vf = format!(
+    let vf_cpu = format!(
         "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+        out_w, out_h, out_w, out_h
+    );
+
+    let vf_gpu = format!(
+        "hwupload_cuda,scale_cuda={}:{}:force_original_aspect_ratio=decrease,hwdownload,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
         out_w, out_h, out_w, out_h
     );
 
@@ -1193,7 +1212,8 @@ async fn run_ffmpeg_internal(
 
     let input_owned = input.to_string();
     let out_owned = out_path.to_path_buf();
-    let vf_owned = vf.clone();
+    let vf_cpu_owned = vf_cpu.clone();
+    let vf_gpu_owned = vf_gpu.clone();
     let regen_flag = regen_pts;
     let force_ts_flag = force_ts_input;
     let duration_flag = duration_secs;
@@ -1201,7 +1221,8 @@ async fn run_ffmpeg_internal(
     let run_encode = move |encoder: &str, use_nvenc: bool| {
         let input = input_owned.clone();
         let out_path = out_owned.clone();
-        let vf = vf_owned.clone();
+        let vf_cpu = vf_cpu_owned.clone();
+        let vf_gpu = vf_gpu_owned.clone();
         let regen_pts = regen_flag;
         let force_ts_input = force_ts_flag;
         let duration_secs = duration_flag;
@@ -1216,6 +1237,9 @@ async fn run_ffmpeg_internal(
             for arg in ffmpeg_hwaccel_flags() {
                 cmd.arg(arg);
             }
+            if use_nvenc {
+                cmd.arg("-hwaccel_output_format").arg("cuda");
+            }
             if force_ts_input {
                 cmd.arg("-f").arg("mpegts");
             }
@@ -1228,7 +1252,7 @@ async fn run_ffmpeg_internal(
                 .arg("-map")
                 .arg("0:a:0?")
                 .arg("-vf")
-                .arg(&vf)
+                .arg(if use_nvenc { vf_gpu } else { vf_cpu })
                 .arg("-vsync")
                 .arg("vfr")
                 .arg("-c:v")

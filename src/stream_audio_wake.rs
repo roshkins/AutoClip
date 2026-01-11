@@ -1,9 +1,9 @@
 use std::env;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -16,6 +16,8 @@ const WINDOW_MS: usize = 6_000; // transcription window length (shorter to cut t
 const STEP_MS: usize = 1_000; // inference cadence
 const DEFAULT_RT_TARGET: f32 = 0.9;
 
+const NO_DETECT: u64 = u64::MAX;
+
 /// Common wake loop; caller provides how to spawn an ffmpeg PCM source (stream or mic).
 fn run_wake_loop_with_spawn<Spawn>(
     mut spawn_pcm: Spawn,
@@ -24,6 +26,8 @@ fn run_wake_loop_with_spawn<Spawn>(
     log_raw: bool,
     stop: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
+    _start_instant: Instant,
+    detect_ns: Arc<AtomicU64>,
 ) -> Result<()>
 where
     Spawn: FnMut() -> Result<(Child, Box<dyn Read + Send>)> + Send + 'static,
@@ -38,6 +42,7 @@ where
         wparams,
     )
     .context("loading whisper model")?;
+    log_whisper_backend();
     let mut state = ctx.create_state().context("creating whisper state")?;
 
     let chunk_samples = SAMPLE_RATE * CHUNK_MS / 1000;
@@ -47,6 +52,7 @@ where
 
     let mut buf = vec![0i16; chunk_samples];
     let mut pcm: Vec<f32> = Vec::with_capacity(window_samples);
+    let mut total_samples: u64 = 0;
 
     let mut failures = 0usize;
 
@@ -84,6 +90,7 @@ where
             for s in &buf {
                 pcm.push(*s as f32 / 32768.0);
             }
+            total_samples = total_samples.saturating_add(chunk_samples as u64);
             if pcm.len() > window_samples {
                 let drop = pcm.len() - window_samples;
                 pcm.drain(0..drop);
@@ -94,13 +101,23 @@ where
             }
             last_run = Instant::now();
 
-            if let Some(text) = transcribe_window(&mut state, &pcm)? {
+            if let Some((text, seg_t0_secs, seg_t1_secs)) = transcribe_window(&mut state, &pcm)? {
+                let window_start_secs = (total_samples.saturating_sub(pcm.len() as u64) as f32) / SAMPLE_RATE as f32;
                 let norm = normalize(&text);
                 if log_raw && !norm.is_empty() {
                     println!("stream raw: {}", text.trim());
-                    println!("stream norm: {norm}");
                 }
                 if norm.contains(wake_norm) {
+                    let match_pos = norm.find(wake_norm).unwrap_or(0);
+                    let seg_span = (seg_t1_secs - seg_t0_secs).max(0.0);
+                    let frac = if !norm.is_empty() { (match_pos as f32 / norm.len() as f32).clamp(0.0, 1.0) } else { 0.0 };
+                    let phrase_start_secs = (seg_t0_secs + frac * seg_span).max(0.0);
+                    let abs_t0_secs = (window_start_secs + phrase_start_secs).max(0.0);
+                    let nanos_f = (abs_t0_secs as f64 * 1_000_000_000.0).round();
+                    let nanos = nanos_f
+                        .max(0.0)
+                        .min((NO_DETECT - 1) as f64) as u64;
+                    let _ = detect_ns.compare_exchange(NO_DETECT, nanos, Ordering::Relaxed, Ordering::Relaxed);
                     let already = fired.swap(true, Ordering::Relaxed);
                     if !already {
                         eprintln!("wake phrase detected via stream audio: {norm}");
@@ -232,6 +249,8 @@ pub fn start_stream_wake_from_hls(
     log_raw: bool,
     stop: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
+    start_instant: Instant,
+    detect_ns: Arc<AtomicU64>,
 ) -> Result<()> {
     let media_url = media_url.clone();
     let model_path = model_path.to_path_buf();
@@ -244,6 +263,8 @@ pub fn start_stream_wake_from_hls(
             log_raw,
             stop,
             fired,
+            start_instant,
+            detect_ns,
         ) {
             eprintln!("stream wake loop error: {err:#}");
         }
@@ -259,6 +280,8 @@ pub fn start_mic_wake_with_ffmpeg(
     log_raw: bool,
     stop: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
+    start_instant: Instant,
+    detect_ns: Arc<AtomicU64>,
 ) -> Result<()> {
     let mic = mic_device.map(|s| s.to_string());
     let model_path = model_path.to_path_buf();
@@ -271,6 +294,8 @@ pub fn start_mic_wake_with_ffmpeg(
             log_raw,
             stop,
             fired,
+            start_instant,
+            detect_ns,
         ) {
             eprintln!("mic wake loop error: {err:#}");
         }
@@ -278,7 +303,7 @@ pub fn start_mic_wake_with_ffmpeg(
     Ok(())
 }
 
-fn transcribe_window(state: &mut whisper_rs::WhisperState, audio: &[f32]) -> Result<Option<String>> {
+fn transcribe_window(state: &mut whisper_rs::WhisperState, audio: &[f32]) -> Result<Option<(String, f32, f32)>> {
     let mut params = FullParams::new(SamplingStrategy::default());
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -293,16 +318,20 @@ fn transcribe_window(state: &mut whisper_rs::WhisperState, audio: &[f32]) -> Res
     let num_segments = state.full_n_segments().context("segment count")?;
     for i in 0..num_segments {
         let text = state.full_get_segment_text(i).context("segment text")?;
+        let t0 = state.full_get_segment_t0(i).context("segment t0")?;
+        let t1 = state.full_get_segment_t1(i).context("segment t1")?;
+        let t0_secs = t0 as f32 * 0.01;
+        let t1_secs = t1 as f32 * 0.01;
         let trimmed = text.trim();
         if !trimmed.is_empty() {
-            return Ok(Some(trimmed.to_string()));
+            return Ok(Some((trimmed.to_string(), t0_secs, t1_secs)));
         }
     }
     Ok(None)
 }
 
 fn spawn_ffmpeg_pcm(media_url: &Url) -> Result<(Child, Box<dyn Read + Send>)> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_bin());
     cmd.arg("-nostdin");
 
     for arg in ffmpeg_hwaccel_flags() {
@@ -324,7 +353,10 @@ fn spawn_ffmpeg_pcm(media_url: &Url) -> Result<(Child, Box<dyn Read + Send>)> {
         .stderr(Stdio::null())
         .stdin(Stdio::null());
 
-    let mut child = cmd.spawn().context("spawning ffmpeg for stream audio")?;
+    let mut child = cmd
+        .spawn()
+        .map_err(ffmpeg_spawn_err)
+        .context("spawning ffmpeg for stream audio")?;
     let stdout = child
         .stdout
         .take()
@@ -343,7 +375,7 @@ fn spawn_ffmpeg_pcm_mic(device: Option<&str>) -> Result<(Child, Box<dyn Read + S
 
     let mut last_err: Option<anyhow::Error> = None;
     for input in candidates {
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = Command::new(ffmpeg_bin());
         cmd.arg("-nostdin");
         cmd.arg("-loglevel").arg("warning");
         cmd.arg("-thread_queue_size").arg("4096");
@@ -392,7 +424,10 @@ fn spawn_ffmpeg_pcm_mic(device: Option<&str>) -> Result<(Child, Box<dyn Read + S
             .stderr(Stdio::inherit())
             .stdin(Stdio::null());
 
-        match cmd.spawn().with_context(|| format!("spawning ffmpeg for mic audio using input='{input}' (set MIC_DEVICE to override)")) {
+        match cmd
+            .spawn()
+            .map_err(ffmpeg_spawn_err)
+            .with_context(|| format!("spawning ffmpeg for mic audio using input='{input}' (set MIC_DEVICE to override)")) {
             Ok(mut child) => {
                 if let Some(stdout) = child.stdout.take() {
                     return Ok((child, Box::new(stdout)));
@@ -408,6 +443,20 @@ fn spawn_ffmpeg_pcm_mic(device: Option<&str>) -> Result<(Child, Box<dyn Read + S
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no mic candidates succeeded; set MIC_DEVICE to a valid input")))
+}
+
+fn ffmpeg_bin() -> String {
+    std::env::var("FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string())
+}
+
+fn ffmpeg_spawn_err(err: std::io::Error) -> anyhow::Error {
+    if err.kind() == ErrorKind::NotFound {
+        anyhow::anyhow!(
+            "ffmpeg executable not found. Install FFmpeg and ensure it's on PATH, or set FFMPEG_BIN to the full path (e.g., C:\\ffmpeg\\bin\\ffmpeg.exe)."
+        )
+    } else {
+        err.into()
+    }
 }
 
 fn ffmpeg_hwaccel_flags() -> Vec<String> {
@@ -507,6 +556,31 @@ fn normalize(s: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+fn log_whisper_backend() {
+    let cublas = env::var("WHISPER_CUBLAS").unwrap_or_else(|_| "(unset)".to_string());
+    let ggml_log = env::var("GGML_LOG_LEVEL").unwrap_or_else(|_| "(unset)".to_string());
+    let whisper_gpu_env = env::var("WHISPER_GPU").unwrap_or_else(|_| "(unset)".to_string());
+    let nvidia_present = detect_nvidia_gpus_present();
+    eprintln!(
+        "whisper backend: use_gpu=true (requested); WHISPER_CUBLAS={cublas}; WHISPER_GPU={whisper_gpu_env}; GGML_LOG_LEVEL={ggml_log}; nvidia_detected={nvidia_present}"
+    );
+    if cublas == "(unset)" {
+        eprintln!("whisper backend warning: WHISPER_CUBLAS not set; if the binary wasn't built with CUDA, inference will fall back to CPU");
+    }
+}
+
+fn detect_nvidia_gpus_present() -> bool {
+    let output = Command::new("nvidia-smi")
+        .arg("--query-gpu=index")
+        .arg("--format=csv,noheader")
+        .output();
+    if let Ok(out) = output {
+        out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
