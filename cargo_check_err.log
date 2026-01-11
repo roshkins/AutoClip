@@ -1,0 +1,273 @@
+   Compiling whisper-rs-sys v0.8.0
+error: failed to run custom build command for `whisper-rs-sys v0.8.0`
+
+Caused by:
+  process didn't exit successfully: `C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-6c02e16df85352ca\build-script-build` (exit code: 101)
+  --- stdout
+  cargo:rustc-link-lib=cublas
+  cargo:rustc-link-lib=cudart
+  cargo:rustc-link-lib=cublasLt
+  cargo:rustc-link-search=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\lib/x64
+  cargo:rerun-if-changed=wrapper.h
+  cargo:rerun-if-env-changed=TARGET
+  cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS_x86_64-pc-windows-msvc
+  cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_msvc
+  cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS
+  cargo:rerun-if-changed=wrapper.h
+  cargo:rerun-if-changed=./whisper.cpp\whisper.h
+  cargo:rerun-if-changed=./whisper.cpp\ggml.h
+  cargo:rerun-if-changed=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\stdint.h
+  cargo:rerun-if-changed=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\vcruntime.h
+  cargo:rerun-if-changed=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\sal.h
+  cargo:rerun-if-changed=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\concurrencysal.h
+  cargo:rerun-if-changed=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\vadefs.h
+  cargo:rerun-if-changed=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt\stddef.h
+  cargo:rerun-if-changed=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt\corecrt.h
+  cargo:rerun-if-changed=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\vcruntime.h
+  cargo:rerun-if-changed=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\stdbool.h
+  cargo:rerun-if-changed=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt\stddef.h
+  cargo:rerun-if-changed=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\stdint.h
+  cargo:rerun-if-changed=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\stdbool.h
+  cargo:rerun-if-changed=./whisper.cpp\ggml.h
+  CMAKE_TOOLCHAIN_FILE_x86_64-pc-windows-msvc = None
+  CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc = None
+  HOST_CMAKE_TOOLCHAIN_FILE = None
+  CMAKE_TOOLCHAIN_FILE = None
+  CMAKE_GENERATOR_x86_64-pc-windows-msvc = None
+  CMAKE_GENERATOR_x86_64_pc_windows_msvc = None
+  HOST_CMAKE_GENERATOR = None
+  CMAKE_GENERATOR = Some("Visual Studio 17 2022")
+  CMAKE_PREFIX_PATH_x86_64-pc-windows-msvc = None
+  CMAKE_PREFIX_PATH_x86_64_pc_windows_msvc = None
+  HOST_CMAKE_PREFIX_PATH = None
+  CMAKE_PREFIX_PATH = None
+  CMAKE_x86_64-pc-windows-msvc = None
+  CMAKE_x86_64_pc_windows_msvc = None
+  HOST_CMAKE = None
+  CMAKE = None
+  Running with debug output on.
+  -- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.26200.
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  -- cuBLAS found
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  -- CMAKE_SYSTEM_PROCESSOR: AMD64
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  -- x86 detected
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  -- GGML CUDA sources found, configuring CUDA architecture
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  -- Configuring done (4.3s)
+  -- Generating C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/build
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  -- Generating C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/build/bindings
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/bindings/CMakeLists.txt
+  -- Generating done (0.1s)
+  -- Build files have been written to: C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/build
+  Change Dir: 'C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/build'
+
+  Run Build Command(s): "C:/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" install.vcxproj /p:Configuration=Release /p:Platform=x64 /p:VisualStudioVersion=17.0 /m:16 /v:n
+  MSBuild version 17.14.23+b0019275e for .NET Framework
+  Build started 1/11/2026 9:03:26 AM.
+
+       1>Project "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\install.vcxproj" on node 1 (default targets).
+       1>Project "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\install.vcxproj" (1) is building "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\ZERO_CHECK.vcxproj" (2) on node 1 (default targets).
+       2>PrepareForBuild:
+           Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+         InitializeBuildStatus:
+           Creating "x64\Release\ZERO_CHECK\ZERO_CHECK.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+           Touching "x64\Release\ZERO_CHECK\ZERO_CHECK.tlog\unsuccessfulbuild".
+         CustomBuild:
+           All outputs are up-to-date.
+         FinalizeBuildStatus:
+           Deleting file "x64\Release\ZERO_CHECK\ZERO_CHECK.tlog\unsuccessfulbuild".
+           Touching "x64\Release\ZERO_CHECK\ZERO_CHECK.tlog\ZERO_CHECK.lastbuildstate".
+       2>Done Building Project "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\ZERO_CHECK.vcxproj" (default targets).
+       1>Project "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\install.vcxproj" (1) is building "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\ALL_BUILD.vcxproj" (3) on node 2 (default targets).
+       3>Project "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\ALL_BUILD.vcxproj" (3) is building "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj" (4) on node 2 (default targets).
+       4>PrepareForBuild:
+           Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+         InitializeBuildStatus:
+           Touching "whisper.dir\Release\whisper.tlog\unsuccessfulbuild".
+         CustomBuild:
+           All outputs are up-to-date.
+         AddCudaCompileDeps:
+         Skipping target "AddCudaCompileDeps" because all output files are up-to-date with respect to the input files.
+         AddCudaCompilePropsDeps:
+         Skipping target "AddCudaCompilePropsDeps" because all output files are up-to-date with respect to the input files.
+         WriteCudaCompileTlogs:
+         Skipping target "WriteCudaCompileTlogs" because all output files are up-to-date with respect to the input files.
+       4>Project "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj" (4) is building "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj" (4:2) on node 1 (CudaBuildCore target(s)).
+       4>CudaBuildCore:
+           Compiling CUDA source file ..\whisper.cpp\ggml-cuda.cu...
+           cmd.exe /C "C:\Users\Rashi\AppData\Local\Temp\tmp26c0f19e11e6419a892afd3284d3b26f.cmd"
+           "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe"  --use-local-env -ccbin "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64" -x cu   -I"C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\whisper.cpp\." -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\include"     --keep-dir whisper\x64\Release  -maxrregcount=0    --machine 64 --compile -cudart static -std=c++14 -Xcompiler="/EHsc -Ob2"   -D_WINDOWS -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DGGML_USE_CUBLAS -D_XOPEN_SOURCE=600 -D"CMAKE_INTDIR=\"Release\"" -D_MBCS -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DGGML_USE_CUBLAS -D_XOPEN_SOURCE=600 -D"CMAKE_INTDIR=\"Release\"" -Xcompiler "/EHsc /W0 /nologo /O2 /FS   /MD /GR" -Xcompiler "/FdC:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\Release\whisper.pdb" -o whisper.dir\Release\ggml-cuda.obj "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\whisper.cpp\ggml-cuda.cu"
+           
+           C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build>"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe"  --use-local-env -ccbin "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64" -x cu   -I"C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\whisper.cpp\." -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\include"     --keep-dir whisper\x64\Release  -maxrregcount=0    --machine 64 --compile -cudart static -std=c++14 -Xcompiler="/EHsc -Ob2"   -D_WINDOWS -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DGGML_USE_CUBLAS -D_XOPEN_SOURCE=600 -D"CMAKE_INTDIR=\"Release\"" -D_MBCS -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DGGML_USE_CUBLAS -D_XOPEN_SOURCE=600 -D"CMAKE_INTDIR=\"Release\"" -Xcompiler "/EHsc /W0 /nologo /O2 /FS   /MD /GR" -Xcompiler "/FdC:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\Release\whisper.pdb" -o whisper.dir\Release\ggml-cuda.obj "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\whisper.cpp\ggml-cuda.cu" 
+       4>C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include\crt/host_config.h(153): fatal error C1189: #error:  -- unsupported Microsoft Visual Studio version! Only the versions between 2017 and 2022 (inclusive) are supported! The nvcc flag '-allow-unsupported-compiler' can be used to override this version check; however, using an unsupported host compiler may cause compilation failure or incorrect run time execution. Use at your own risk. [C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj]
+           ggml-cuda.cu
+       4>C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VC\v170\BuildCustomizations\CUDA 13.1.targets(803,9): error MSB3721: The command ""C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe"  --use-local-env -ccbin "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64" -x cu   -I"C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\whisper.cpp\." -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\include"     --keep-dir whisper\x64\Release  -maxrregcount=0    --machine 64 --compile -cudart static -std=c++14 -Xcompiler="/EHsc -Ob2"   -D_WINDOWS -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DGGML_USE_CUBLAS -D_XOPEN_SOURCE=600 -D"CMAKE_INTDIR=\"Release\"" -D_MBCS -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DGGML_USE_CUBLAS -D_XOPEN_SOURCE=600 -D"CMAKE_INTDIR=\"Release\"" -Xcompiler "/EHsc /W0 /nologo /O2 /FS   /MD /GR" -Xcompiler "/FdC:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\Release\whisper.pdb" -o whisper.dir\Release\ggml-cuda.obj "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\whisper.cpp\ggml-cuda.cu"" exited with code 2. [C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj]
+       4>Done Building Project "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj" (CudaBuildCore target(s)) -- FAILED.
+       4>Done Building Project "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj" (default targets) -- FAILED.
+       3>Done Building Project "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\ALL_BUILD.vcxproj" (default targets) -- FAILED.
+       1>Done Building Project "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\install.vcxproj" (default targets) -- FAILED.
+
+  Build FAILED.
+
+         "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\install.vcxproj" (default target) (1) ->
+         "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\ALL_BUILD.vcxproj" (default target) (3) ->
+         "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj" (default target) (4) ->
+         "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj" (CudaBuildCore target) (4:2) ->
+         (CudaBuildCore target) -> 
+           C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include\crt/host_config.h(153): fatal error C1189: #error:  -- unsupported Microsoft Visual Studio version! Only the versions between 2017 and 2022 (inclusive) are supported! The nvcc flag '-allow-unsupported-compiler' can be used to override this version check; however, using an unsupported host compiler may cause compilation failure or incorrect run time execution. Use at your own risk. [C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj]
+           C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VC\v170\BuildCustomizations\CUDA 13.1.targets(803,9): error MSB3721: The command ""C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe"  --use-local-env -ccbin "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64" -x cu   -I"C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\whisper.cpp\." -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\include"     --keep-dir whisper\x64\Release  -maxrregcount=0    --machine 64 --compile -cudart static -std=c++14 -Xcompiler="/EHsc -Ob2"   -D_WINDOWS -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DGGML_USE_CUBLAS -D_XOPEN_SOURCE=600 -D"CMAKE_INTDIR=\"Release\"" -D_MBCS -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DGGML_USE_CUBLAS -D_XOPEN_SOURCE=600 -D"CMAKE_INTDIR=\"Release\"" -Xcompiler "/EHsc /W0 /nologo /O2 /FS   /MD /GR" -Xcompiler "/FdC:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\Release\whisper.pdb" -o whisper.dir\Release\ggml-cuda.obj "C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\whisper.cpp\ggml-cuda.cu"" exited with code 2. [C:\Users\Rashi\Projects\AutoClip\target\debug\build\whisper-rs-sys-2f23ec3cb4009b6f\out\build\whisper.vcxproj]
+
+      0 Warning(s)
+      2 Error(s)
+
+  Time Elapsed 00:00:02.04
+
+
+  --- stderr
+  running: "cmake" "-Wdev" "--debug-output" "C:\\Users\\Rashi\\Projects\\AutoClip\\target\\debug\\build\\whisper-rs-sys-2f23ec3cb4009b6f\\out\\whisper.cpp/" "-B" "C:\\Users\\Rashi\\Projects\\AutoClip\\target\\debug\\build\\whisper-rs-sys-2f23ec3cb4009b6f\\out\\build" "-Thost=x64" "-Ax64" "-G" "Visual Studio 17 2022" "-DBUILD_SHARED_LIBS=OFF" "-DWHISPER_ALL_WARNINGS=OFF" "-DWHISPER_ALL_WARNINGS_3RD_PARTY=OFF" "-DWHISPER_BUILD_TESTS=OFF" "-DWHISPER_BUILD_EXAMPLES=OFF" "-DWHISPER_CUBLAS=ON" "-DWHISPER_METAL=OFF" "-DCMAKE_INSTALL_PREFIX=C:\\Users\\Rashi\\Projects\\AutoClip\\target\\debug\\build\\whisper-rs-sys-2f23ec3cb4009b6f\\out" "-DCMAKE_C_FLAGS= -nologo -MD -Brepro -W0" "-DCMAKE_CXX_FLAGS= -nologo -MD -Brepro -m64 -W0" "-DCMAKE_ASM_FLAGS= -nologo -MD -Brepro -W0" "-DCMAKE_BUILD_TYPE=Release" "-DCMAKE_VERBOSE_MAKEFILE:BOOL=ON"
+  CMake Deprecation Warning at CMakeLists.txt:1 (cmake_minimum_required):
+    Compatibility with CMake < 3.10 will be removed from a future version of
+    CMake.
+
+    Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+    to tell CMake that the project requires at least <min> but has been updated
+    to work with policies introduced by <max> or earlier.
+
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+     Entering             C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/bindings
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+     Returning to         C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) in CMakeLists.txt:
+    Policy CMP0128 is not set: Selection of language standard and extension
+    flags improved.  Run "cmake --help-policy CMP0128" for policy details.  Use
+    the cmake_policy command to set the policy and suppress this warning.
+
+    For compatibility with older versions of CMake, compiler extensions won't
+    be enabled.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) in CMakeLists.txt:
+    Policy CMP0128 is not set: Selection of language standard and extension
+    flags improved.  Run "cmake --help-policy CMP0128" for policy details.  Use
+    the cmake_policy command to set the policy and suppress this warning.
+
+    For compatibility with older versions of CMake, compiler extensions won't
+    be enabled.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) in CMakeLists.txt:
+    Policy CMP0128 is not set: Selection of language standard and extension
+    flags improved.  Run "cmake --help-policy CMP0128" for policy details.  Use
+    the cmake_policy command to set the policy and suppress this warning.
+
+    For compatibility with older versions of CMake, compiler extensions won't
+    be enabled.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) in CMakeLists.txt:
+    Policy CMP0128 is not set: Selection of language standard and extension
+    flags improved.  Run "cmake --help-policy CMP0128" for policy details.  Use
+    the cmake_policy command to set the policy and suppress this warning.
+
+    For compatibility with older versions of CMake, compiler extensions won't
+    be enabled.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) in CMakeLists.txt:
+    Policy CMP0128 is not set: Selection of language standard and extension
+    flags improved.  Run "cmake --help-policy CMP0128" for policy details.  Use
+    the cmake_policy command to set the policy and suppress this warning.
+
+    For compatibility with older versions of CMake, compiler extensions won't
+    be enabled.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) in CMakeLists.txt:
+    Policy CMP0128 is not set: Selection of language standard and extension
+    flags improved.  Run "cmake --help-policy CMP0128" for policy details.  Use
+    the cmake_policy command to set the policy and suppress this warning.
+
+    For compatibility with older versions of CMake, compiler extensions won't
+    be enabled.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) in CMakeLists.txt:
+    Policy CMP0128 is not set: Selection of language standard and extension
+    flags improved.  Run "cmake --help-policy CMP0128" for policy details.  Use
+    the cmake_policy command to set the policy and suppress this warning.
+
+    For compatibility with older versions of CMake, compiler extensions won't
+    be enabled.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) in CMakeLists.txt:
+    Policy CMP0128 is not set: Selection of language standard and extension
+    flags improved.  Run "cmake --help-policy CMP0128" for policy details.  Use
+    the cmake_policy command to set the policy and suppress this warning.
+
+    For compatibility with older versions of CMake, compiler extensions won't
+    be enabled.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) at CMakeLists.txt:462 (add_library):
+    Policy CMP0156 is not set: De-duplicate libraries on link lines based on
+    linker capabilities.  Run "cmake --help-policy CMP0156" for policy details.
+    Use the cmake_policy command to set the policy and suppress this warning.
+
+    Since the policy is not set, legacy libraries de-duplication strategy will
+    be applied.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) at CMakeLists.txt:462 (add_library):
+    Policy CMP0156 is not set: De-duplicate libraries on link lines based on
+    linker capabilities.  Run "cmake --help-policy CMP0156" for policy details.
+    Use the cmake_policy command to set the policy and suppress this warning.
+
+    Since the policy is not set, legacy libraries de-duplication strategy will
+    be applied.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) at CMakeLists.txt:462 (add_library):
+    Policy CMP0156 is not set: De-duplicate libraries on link lines based on
+    linker capabilities.  Run "cmake --help-policy CMP0156" for policy details.
+    Use the cmake_policy command to set the policy and suppress this warning.
+
+    Since the policy is not set, legacy libraries de-duplication strategy will
+    be applied.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  CMake Warning (dev) at CMakeLists.txt:462 (add_library):
+    Policy CMP0156 is not set: De-duplicate libraries on link lines based on
+    linker capabilities.  Run "cmake --help-policy CMP0156" for policy details.
+    Use the cmake_policy command to set the policy and suppress this warning.
+
+    Since the policy is not set, legacy libraries de-duplication strategy will
+    be applied.
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+     Called from: [1]	C:/Users/Rashi/Projects/AutoClip/target/debug/build/whisper-rs-sys-2f23ec3cb4009b6f/out/whisper.cpp/CMakeLists.txt
+  running: "cmake" "--build" "C:\\Users\\Rashi\\Projects\\AutoClip\\target\\debug\\build\\whisper-rs-sys-2f23ec3cb4009b6f\\out\\build" "--target" "install" "--config" "Release" "--parallel" "16"
+
+  thread 'main' (46696) panicked at C:\Users\Rashi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\cmake-0.1.57\src\lib.rs:1132:5:
+
+  command did not execute successfully, got: exit code: 1
+
+  build script failed, must exit now
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
