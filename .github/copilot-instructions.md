@@ -37,5 +37,13 @@ These notes help AI agents work effectively in this repository. They summarize t
 - Keep comments in sync with behavior. When code paths change (e.g., swapping HTML scraping for headless m3u8 capture), update inline docs and module headers in the same PR.
 - When adding or changing flags/flows, update the CLI help output (`-h/--help`) in `src/main.rs` in the same change.
 
+## Jujutsu (jj) Workflow
+- Working copy is always a commit; each change has a stable change ID and a rewritable commit hash—prefer change IDs in commands.
+- Common commands: `jj status` (or `jj st`), `jj log` (revsets like `@`, `root()`, `bookmarks()`, `@::trunk()`), `jj diff`, `jj describe -m`, `jj new` to start a fresh change, `jj squash`/`jj squash -i` to move edits into parents, `jj rebase -s <rev> -o <dest>` to move a stack.
+- No `git add`: edits auto-amend the working-copy commit; use `.gitignore` plus `jj file untrack <path>` to stop tracking.
+- Conflicts: rebases complete even with conflicts; resolve on a child commit, then `jj squash` into the conflicted one. `jj resolve` or manual markers both work.
+- Operation log: `jj op log` shows history of operations; `jj undo` reverts the last operation (including rebases/squashes) and updates the working copy.
+- Git interop: clone with `jj git clone`; bookmarks map to Git branches. Use `git status`/`git push` as usual; keep `jj` and Git views aligned.
+
 ## If Something Is Missing
 - This repo currently only contains the design doc ([DESIGN_DOC.md](../DESIGN_DOC.md)). Ask for details on build/run/test commands, directory layout, and target platforms before proceeding.
