@@ -16,6 +16,8 @@ use tokio::process::Command;
 use tokio::time::sleep;
 use url::Url;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod rolling_buffer;
@@ -1073,6 +1075,13 @@ fn truncate_str(s: &str, max: usize) -> String {
 }
 
 fn auto_assign_gpus_for_tools() {
+    let user_hwaccel = std::env::var("FFMPEG_HWACCEL")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let user_encoder = std::env::var("FFMPEG_ENCODER")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+
     let gpus = detect_nvidia_gpus();
     if !gpus.is_empty() {
         // Sort by memory already done in detect; pick biggest for whisper, second for ffmpeg if present.
@@ -1080,17 +1089,129 @@ fn auto_assign_gpus_for_tools() {
         let ffmpeg_gpu = if gpus.len() > 1 { gpus[1].0 } else { whisper_gpu };
 
         std::env::set_var("WHISPER_GPU", whisper_gpu.to_string());
-        std::env::set_var("FFMPEG_HWACCEL", "cuda");
-        std::env::set_var("FFMPEG_HWACCEL_DEVICE", ffmpeg_gpu.to_string());
+        if user_hwaccel.is_none() {
+            std::env::set_var("FFMPEG_HWACCEL", "cuda");
+            std::env::set_var("FFMPEG_HWACCEL_DEVICE", ffmpeg_gpu.to_string());
+        }
+        if user_encoder.is_none() && ffmpeg_has_encoder("h264_nvenc") {
+            std::env::set_var("FFMPEG_ENCODER", "h264_nvenc");
+        }
         eprintln!("auto GPU assign for whisper: {}", whisper_gpu);
-        eprintln!("auto GPU assign for ffmpeg: {}", ffmpeg_gpu);
+        if user_hwaccel.is_none() {
+            eprintln!("auto GPU assign for ffmpeg: {}", ffmpeg_gpu);
+        }
         return;
     }
 
-    // Non-NVIDIA: prefer D3D11VA (works on AMD/Intel on Windows) and let ffmpeg pick the device.
-    std::env::set_var("FFMPEG_HWACCEL", "d3d11va");
-    std::env::remove_var("FFMPEG_HWACCEL_DEVICE");
-    eprintln!("auto GPU assign: using d3d11va (no NVIDIA detected)");
+    if user_hwaccel.is_none() {
+        if let Some(hw) = detect_best_hwaccel() {
+            std::env::set_var("FFMPEG_HWACCEL", &hw);
+            std::env::remove_var("FFMPEG_HWACCEL_DEVICE");
+            eprintln!("auto GPU assign: using {hw} (no NVIDIA detected)");
+        }
+    }
+
+    if user_encoder.is_none() {
+        if let Some(enc) = detect_best_encoder() {
+            std::env::set_var("FFMPEG_ENCODER", &enc);
+            eprintln!("auto GPU assign: using ffmpeg encoder {enc}");
+        }
+    }
+}
+
+fn ffmpeg_bin() -> String {
+    std::env::var("FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string())
+}
+
+fn ffmpeg_has_encoder(name: &str) -> bool {
+    let encoders = detect_ffmpeg_encoders();
+    let needle = name.to_ascii_lowercase();
+    encoders.iter().any(|enc| enc == &needle)
+}
+
+fn detect_ffmpeg_encoders() -> Vec<String> {
+    let output = std::process::Command::new(ffmpeg_bin())
+        .arg("-hide_banner")
+        .arg("-encoders")
+        .output();
+
+    let Ok(out) = output else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut encoders = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('V') {
+            let mut parts = trimmed.split_whitespace();
+            let _flags = parts.next();
+            if let Some(name) = parts.next() {
+                encoders.push(name.to_ascii_lowercase());
+            }
+        }
+    }
+    encoders
+}
+
+fn detect_ffmpeg_hwaccels() -> Vec<String> {
+    let output = std::process::Command::new(ffmpeg_bin())
+        .arg("-hide_banner")
+        .arg("-hwaccels")
+        .output();
+
+    let Ok(out) = output else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut hwaccels = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.ends_with(':') {
+            continue;
+        }
+        hwaccels.push(trimmed.to_ascii_lowercase());
+    }
+    hwaccels
+}
+
+fn detect_best_hwaccel() -> Option<String> {
+    let hwaccels = detect_ffmpeg_hwaccels();
+    if hwaccels.is_empty() {
+        return None;
+    }
+
+    #[cfg(target_os = "windows")]
+    let preferred = ["d3d11va", "qsv", "dxva2"];
+    #[cfg(target_os = "macos")]
+    let preferred = ["videotoolbox"];
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let preferred = ["qsv", "vaapi"];
+
+    for hw in preferred {
+        if hwaccels.iter().any(|v| v == hw) {
+            return Some(hw.to_string());
+        }
+    }
+    None
+}
+
+fn detect_best_encoder() -> Option<String> {
+    let encoders = detect_ffmpeg_encoders();
+    if encoders.is_empty() {
+        return None;
+    }
+
+    let preferred = ["h264_qsv", "h264_amf", "h264_videotoolbox"];
+    for enc in preferred {
+        if encoders.iter().any(|v| v == enc) {
+            return Some(enc.to_string());
+        }
+    }
+    None
 }
 
 fn detect_nvidia_gpus() -> Vec<(u32, u64)> {
@@ -1117,37 +1238,110 @@ fn detect_nvidia_gpus() -> Vec<(u32, u64)> {
     gpus
 }
 
-fn ffmpeg_hwaccel_flags() -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(hw) = std::env::var("FFMPEG_HWACCEL") {
-        if !hw.trim().is_empty() {
-            out.push("-hwaccel".to_string());
-            out.push(hw);
-        }
+fn build_hwaccel_flags(hw: &str, device: Option<&str>) -> Vec<String> {
+    let hw = hw.trim();
+    if hw.is_empty() {
+        return Vec::new();
     }
-    if let Ok(dev) = std::env::var("FFMPEG_HWACCEL_DEVICE") {
-        if !dev.trim().is_empty() {
-            out.push("-hwaccel_device".to_string());
-            out.push(dev);
-        }
+    let mut out = vec!["-hwaccel".to_string(), hw.to_string()];
+    if let Some(dev) = device.map(str::trim).filter(|d| !d.is_empty()) {
+        out.push("-hwaccel_device".to_string());
+        out.push(dev.to_string());
     }
     out
 }
 
-fn ffmpeg_video_encoder() -> (String, bool, bool) {
+fn ffmpeg_hwaccel_flags() -> Vec<String> {
+    let hw = std::env::var("FFMPEG_HWACCEL").unwrap_or_default();
+    let dev = std::env::var("FFMPEG_HWACCEL_DEVICE").ok();
+    build_hwaccel_flags(&hw, dev.as_deref())
+}
+
+fn ffmpeg_hwaccel_flags_for_encode(use_hw_encode: bool) -> Vec<String> {
+    if use_hw_encode {
+        return ffmpeg_hwaccel_flags();
+    }
+    if let Ok(fallback) = std::env::var("FFMPEG_HWACCEL_FALLBACK") {
+        let trimmed = fallback.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+            return Vec::new();
+        }
+        let dev = if trimmed.eq_ignore_ascii_case("cuda") {
+            std::env::var("FFMPEG_HWACCEL_DEVICE").ok()
+        } else {
+            None
+        };
+        return build_hwaccel_flags(trimmed, dev.as_deref());
+    }
+    Vec::new()
+}
+
+fn ffmpeg_scale_cuda_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let output = std::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-filters")
+            .output();
+        let Ok(out) = output else { return false; };
+        if !out.status.success() {
+            return false;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+        stdout.lines().any(|line| line.contains("scale_cuda"))
+    })
+}
+
+fn unstable_streams() -> &'static Mutex<HashSet<String>> {
+    static UNSTABLE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    UNSTABLE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mark_stream_unstable(input: &str) {
+    if let Ok(mut set) = unstable_streams().lock() {
+        set.insert(input.to_string());
+    }
+}
+
+fn is_stream_unstable(input: &str) -> bool {
+    unstable_streams()
+        .lock()
+        .map(|set| set.contains(input))
+        .unwrap_or(false)
+}
+
+fn stderr_indicates_filter_issue(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("error reinitializing filters")
+        || s.contains("failed to inject frame into filter network")
+        || s.contains("impossible to convert between the formats supported")
+        || s.contains("error while processing the decoded data for stream")
+}
+
+fn ffmpeg_video_encoder() -> (String, bool, bool, bool) {
     if let Ok(enc) = std::env::var("FFMPEG_ENCODER") {
         if !enc.trim().is_empty() {
             let is_nvenc = enc.to_ascii_lowercase().contains("nvenc");
-            return (enc, is_nvenc, true);
+            let is_hw = is_hw_encoder(&enc);
+            return (enc, is_nvenc, is_hw, true);
         }
     }
 
     let hw = std::env::var("FFMPEG_HWACCEL").unwrap_or_default();
     if hw.eq_ignore_ascii_case("cuda") {
-        return ("h264_nvenc".to_string(), true, false);
+        return ("h264_nvenc".to_string(), true, true, false);
     }
 
-    ("libx264".to_string(), false, false)
+    ("libx264".to_string(), false, false, false)
+}
+
+fn is_hw_encoder(encoder: &str) -> bool {
+    let enc = encoder.to_ascii_lowercase();
+    enc.contains("nvenc")
+        || enc.contains("qsv")
+        || enc.contains("amf")
+        || enc.contains("videotoolbox")
+        || enc.contains("vaapi")
 }
 
 fn next_output_path(save_dir: &str, stub: &str) -> Result<PathBuf> {
@@ -1189,6 +1383,114 @@ async fn run_ffmpeg_from_file(
     .await
 }
 
+fn build_ffmpeg_filters(out_w: u32, out_h: u32) -> (String, String, String) {
+    let vf_cpu = format!(
+        "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+        out_w, out_h, out_w, out_h
+    );
+
+    // GPU path when decoding in software: normalize -> upload -> scale on CUDA -> download -> pad in software.
+    // The explicit format right after hwdownload avoids auto-inserted scale/format filters
+    // that can error with "Impossible to convert between the formats supported by ... auto_scale".
+    let vf_gpu_sw = format!(
+        "format=yuv420p,hwupload_cuda,scale_cuda=w={}:h={}:force_original_aspect_ratio=decrease:format=nv12:interp_algo=lanczos,hwdownload,format=yuv420p,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+        out_w, out_h, out_w, out_h
+    );
+    // GPU path when decoding to CUDA frames: scale directly on GPU, then download for padding.
+    let vf_gpu_hw = format!(
+        "scale_cuda=w={}:h={}:force_original_aspect_ratio=decrease:format=nv12:interp_algo=lanczos,hwdownload,format=yuv420p,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+        out_w, out_h, out_w, out_h
+    );
+
+    (vf_cpu, vf_gpu_sw, vf_gpu_hw)
+}
+
+fn tail_trunc(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return chars.into_iter().collect();
+    }
+    chars[chars.len() - max..].iter().collect::<String>()
+}
+
+async fn run_ffmpeg_encode(
+    input: &str,
+    out_path: &Path,
+    vf_cpu: &str,
+    vf_gpu: &str,
+    encoder: &str,
+    use_hw_encode: bool,
+    use_nvenc: bool,
+    allow_hwaccel: bool,
+    regen_pts: bool,
+    force_ts_input: bool,
+    duration_secs: Option<f32>,
+    vf_override: Option<&str>,
+) -> Result<std::process::Output> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y");
+    // Elevate logging when using NVENC to capture filter negotiation issues.
+    if use_nvenc {
+        cmd.arg("-loglevel").arg("verbose");
+    } else {
+        cmd.arg("-loglevel").arg("warning");
+    }
+    if regen_pts {
+        cmd.arg("-fflags").arg("+genpts");
+    }
+    if allow_hwaccel {
+        for arg in ffmpeg_hwaccel_flags_for_encode(use_hw_encode) {
+            cmd.arg(arg);
+        }
+    }
+    if use_nvenc && allow_hwaccel {
+        cmd.arg("-hwaccel_output_format").arg("cuda");
+    }
+    if force_ts_input {
+        cmd.arg("-f").arg("mpegts");
+    }
+    cmd.arg("-i").arg(input);
+    if let Some(d) = duration_secs {
+        cmd.arg("-t").arg(format!("{d:.3}"));
+    }
+    let vf = vf_override.unwrap_or_else(|| if use_nvenc { vf_gpu } else { vf_cpu });
+    cmd.arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("0:a:0?")
+        .arg("-vf")
+        .arg(vf)
+        .arg("-fps_mode")
+        .arg("vfr")
+        .arg("-c:v")
+        .arg(encoder);
+
+    if use_nvenc {
+        cmd.arg("-preset").arg("p4");
+        cmd.arg("-tune").arg("hq");
+        cmd.arg("-b:v").arg("0");
+        cmd.arg("-cq").arg("23");
+    } else {
+        cmd.arg("-preset").arg("veryfast");
+        cmd.arg("-crf").arg("23");
+    }
+
+    if regen_pts {
+        if let Some(d) = duration_secs {
+            cmd.arg("-af").arg(format!("atrim=end={d:.3},asetpts=N/SR/TB"));
+        }
+        cmd.arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg("160k");
+    } else {
+        cmd.arg("-c:a").arg("copy");
+    }
+
+    cmd.arg("-shortest").arg(out_path.as_os_str());
+    cmd.output().await.context("failed to run ffmpeg")
+}
+
 async fn run_ffmpeg_internal(
     input: &str,
     out_path: &Path,
@@ -1198,107 +1500,90 @@ async fn run_ffmpeg_internal(
     regen_pts: bool,
     force_ts_input: bool,
 ) -> Result<()> {
-    let vf_cpu = format!(
-        "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
-        out_w, out_h, out_w, out_h
-    );
+    let (mut video_encoder, mut is_nvenc, mut is_hw, _encoder_forced) = ffmpeg_video_encoder();
+    let scale_cuda_available = ffmpeg_scale_cuda_available();
+    if is_hw && !scale_cuda_available {
+        eprintln!("ffmpeg: scale_cuda filter missing; forcing CPU encode");
+        video_encoder = "libx264".to_string();
+        is_nvenc = false;
+        is_hw = false;
+    }
+    let hwaccel = std::env::var("FFMPEG_HWACCEL").unwrap_or_default();
+    let hw_decode_cuda = is_nvenc && hwaccel.eq_ignore_ascii_case("cuda");
+    let (vf_cpu, vf_gpu_sw, vf_gpu_hw) = build_ffmpeg_filters(out_w, out_h);
+    let vf_gpu = if hw_decode_cuda { vf_gpu_hw.clone() } else { vf_gpu_sw.clone() };
+    let force_cpu_filters = is_stream_unstable(input) && is_nvenc;
+    if force_cpu_filters {
+        eprintln!("ffmpeg: stream flagged as unstable; using CPU filters with NVENC");
+    }
 
-    let vf_gpu = format!(
-        "hwupload_cuda,scale_cuda={}:{}:force_original_aspect_ratio=decrease,hwdownload,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
-        out_w, out_h, out_w, out_h
-    );
-
-    let (video_encoder, is_nvenc, encoder_forced) = ffmpeg_video_encoder();
-
-    let input_owned = input.to_string();
-    let out_owned = out_path.to_path_buf();
-    let vf_cpu_owned = vf_cpu.clone();
-    let vf_gpu_owned = vf_gpu.clone();
-    let regen_flag = regen_pts;
-    let force_ts_flag = force_ts_input;
-    let duration_flag = duration_secs;
-
-    let run_encode = move |encoder: &str, use_nvenc: bool| {
-        let input = input_owned.clone();
-        let out_path = out_owned.clone();
-        let vf_cpu = vf_cpu_owned.clone();
-        let vf_gpu = vf_gpu_owned.clone();
-        let regen_pts = regen_flag;
-        let force_ts_input = force_ts_flag;
-        let duration_secs = duration_flag;
-        let encoder_owned = encoder.to_string();
-        async move {
-            let mut cmd = Command::new("ffmpeg");
-            cmd.arg("-y");
-            cmd.arg("-loglevel").arg("warning");
-            if regen_pts {
-                cmd.arg("-fflags").arg("+genpts");
-            }
-            for arg in ffmpeg_hwaccel_flags() {
-                cmd.arg(arg);
-            }
-            if use_nvenc {
-                cmd.arg("-hwaccel_output_format").arg("cuda");
-            }
-            if force_ts_input {
-                cmd.arg("-f").arg("mpegts");
-            }
-            cmd.arg("-i").arg(&input);
-            if let Some(d) = duration_secs {
-                cmd.arg("-t").arg(format!("{d:.3}"));
-            }
-            cmd.arg("-map")
-                .arg("0:v:0")
-                .arg("-map")
-                .arg("0:a:0?")
-                .arg("-vf")
-                .arg(if use_nvenc { vf_gpu } else { vf_cpu })
-                .arg("-vsync")
-                .arg("vfr")
-                .arg("-c:v")
-                .arg(&encoder_owned);
-
-            if use_nvenc {
-                cmd.arg("-preset").arg("p4");
-                cmd.arg("-tune").arg("hq");
-                cmd.arg("-b:v").arg("0");
-                cmd.arg("-cq").arg("23");
-            } else {
-                cmd.arg("-preset").arg("veryfast");
-                cmd.arg("-crf").arg("23");
-            }
-
-            if regen_pts {
-                if let Some(d) = duration_secs {
-                    cmd.arg("-af").arg(format!("atrim=end={d:.3},asetpts=N/SR/TB"));
-                }
-                cmd.arg("-c:a")
-                    .arg("aac")
-                    .arg("-b:a")
-                    .arg("160k");
-            } else {
-                cmd.arg("-c:a").arg("copy");
-            }
-
-            cmd.arg("-shortest").arg(out_path.as_os_str());
-            cmd.output().await.context("failed to run ffmpeg")
-        }
-    };
-
-    let mut output = run_encode(&video_encoder, is_nvenc).await?;
+    let mut output = run_ffmpeg_encode(
+        input,
+        out_path,
+        &vf_cpu,
+        &vf_gpu,
+        &video_encoder,
+        is_hw,
+        is_nvenc,
+        !force_cpu_filters,
+        regen_pts,
+        force_ts_input,
+        duration_secs,
+        if force_cpu_filters { Some(&vf_cpu) } else { None },
+    )
+    .await?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr_first = String::from_utf8_lossy(&output.stderr).into_owned();
+        let stdout_first = String::from_utf8_lossy(&output.stdout).into_owned();
+        let mut retried_cpu = false;
 
-        let nvenc_missing = is_nvenc
-            && !encoder_forced
-            && (stderr.contains("Unknown encoder 'h264_nvenc'")
-                || stderr.to_ascii_lowercase().contains("nvenc capable"));
-
-        if nvenc_missing {
-            eprintln!("ffmpeg nvenc not available; retrying with libx264");
-            output = run_encode("libx264", false).await?;
+        if is_hw {
+            let filter_failure = stderr_indicates_filter_issue(&stderr_first);
+            if filter_failure {
+                mark_stream_unstable(input);
+            }
+            eprintln!(
+                "ffmpeg hardware path failed (status {}); falling back to CPU/libx264. stderr (truncated): {}",
+                output.status,
+                tail_trunc(&stderr_first, 400)
+            );
+            if is_nvenc && filter_failure {
+                eprintln!("ffmpeg: retrying NVENC with CPU filters (software decode)");
+                output = run_ffmpeg_encode(
+                    input,
+                    out_path,
+                    &vf_cpu,
+                    &vf_gpu,
+                    &video_encoder,
+                    true,
+                    true,
+                    false,
+                    regen_pts,
+                    force_ts_input,
+                    duration_secs,
+                    Some(&vf_cpu),
+                )
+                .await?;
+            }
+            if !output.status.success() {
+                output = run_ffmpeg_encode(
+                    input,
+                    out_path,
+                    &vf_cpu,
+                    &vf_gpu,
+                    "libx264",
+                    false,
+                    false,
+                    true,
+                    regen_pts,
+                    force_ts_input,
+                    duration_secs,
+                    None,
+                )
+                .await?;
+                retried_cpu = true;
+            }
         }
 
         if !output.status.success() {
@@ -1310,6 +1595,12 @@ async fn run_ffmpeg_internal(
                 stdout2.trim(),
                 stderr2.trim()
             );
+        } else if retried_cpu {
+            eprintln!(
+                "ffmpeg fallback succeeded with CPU/libx264 after GPU pipeline failure. Previous stderr (truncated): {} | stdout (truncated): {}",
+                tail_trunc(&stderr_first, 200),
+                tail_trunc(&stdout_first, 200)
+            );
         }
     }
 
@@ -1318,6 +1609,14 @@ async fn run_ffmpeg_internal(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Ensure CUDA backend is preferred when available; avoid falling back to CPU due to missing env.
+    if std::env::var("WHISPER_CUBLAS").is_err() {
+        std::env::set_var("WHISPER_CUBLAS", "1");
+    }
+    if std::env::var("WHISPER_GPU").is_err() {
+        std::env::set_var("WHISPER_GPU", "1");
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -1661,6 +1960,7 @@ fn print_help(bin: &str) {
     println!("  SKIP_CLIP_SAVE           If set to 1/true, skip writing clips");
     println!("  WHISPER_MODEL            Path to whisper model (default auto)");
     println!("  FFMPEG_ENCODER / FFMPEG_HWACCEL / FFMPEG_HWACCEL_DEVICE   Encoder/accel knobs");
+    println!("  FFMPEG_HWACCEL_FALLBACK  Fallback hwaccel (e.g. d3d11va, cuda, none; default none)");
     println!("  LOG_M3U8_HEADERS         Log request headers when fetching playlists");
     println!("");
     println!("Notes:");
@@ -1716,6 +2016,28 @@ mod tests {
         let segment_bytes = client.fetch_first_segment(media_url.as_str()).await?;
         assert!(!segment_bytes.is_empty(), "segment should contain data");
         Ok(())
+    }
+
+    #[test]
+    fn ffmpeg_gpu_filter_keeps_explicit_format_after_hwdownload() {
+        let (vf_cpu, vf_gpu_sw, vf_gpu_hw) = build_ffmpeg_filters(1080, 1920);
+
+        assert_eq!(
+            vf_cpu,
+            "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+        );
+        assert_eq!(
+            vf_gpu_sw,
+            "format=yuv420p,hwupload_cuda,scale_cuda=w=1080:h=1920:force_original_aspect_ratio=decrease:format=nv12:interp_algo=lanczos,hwdownload,format=yuv420p,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+        );
+        assert!(
+            vf_gpu_sw.contains("hwdownload,format=yuv420p"),
+            "explicit format after hwdownload prevents auto-inserted auto_scale filter errors"
+        );
+        assert!(
+            !vf_gpu_hw.contains("hwupload_cuda"),
+            "cuda decode path should not attempt an extra upload"
+        );
     }
 
     #[test]

@@ -18,6 +18,83 @@ const DEFAULT_RT_TARGET: f32 = 0.9;
 
 const NO_DETECT: u64 = u64::MAX;
 
+struct WhisperHandle {
+    model_path: PathBuf,
+    ctx: &'static WhisperContext,
+    state: whisper_rs::WhisperState<'static>,
+    use_gpu: bool,
+}
+
+impl WhisperHandle {
+    fn new(model_path: &Path) -> Result<Self> {
+        let model_path = model_path.to_path_buf();
+        let prefer_gpu = whisper_prefers_gpu();
+        let (ctx, use_gpu) = create_whisper_context(&model_path, prefer_gpu)
+            .or_else(|err| {
+                if prefer_gpu {
+                    eprintln!("whisper GPU init failed: {err:#}; falling back to CPU");
+                    create_whisper_context(&model_path, false)
+                } else {
+                    Err(err)
+                }
+            })?;
+        let state = ctx.create_state().context("creating whisper state")?;
+        Ok(Self {
+            model_path,
+            ctx,
+            state,
+            use_gpu,
+        })
+    }
+
+    fn transcribe_with_fallback(&mut self, audio: &[f32]) -> Result<Option<(String, f32, f32)>> {
+        match transcribe_window(&mut self.state, audio) {
+            Ok(out) => Ok(out),
+            Err(err) if self.use_gpu => {
+                eprintln!("whisper GPU path failed during inference: {err:#}; retrying on CPU");
+                let (ctx, _) = create_whisper_context(&self.model_path, false)?;
+                let state = ctx.create_state().context("creating whisper state")?;
+                self.ctx = ctx;
+                self.state = state;
+                self.use_gpu = false;
+                transcribe_window(&mut self.state, audio)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+fn whisper_prefers_gpu() -> bool {
+    match env::var("WHISPER_GPU") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            !(trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("0")
+                || trimmed.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => true,
+    }
+}
+
+fn create_whisper_context(
+    model_path: &Path,
+    use_gpu: bool,
+) -> Result<(&'static WhisperContext, bool)> {
+    let mut wparams = WhisperContextParameters::default();
+    wparams.use_gpu = use_gpu;
+
+    let ctx = WhisperContext::new_with_params(
+        model_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?,
+        wparams,
+    )
+    .context("loading whisper model")?;
+    // Leak the context so the state can borrow it for the process lifetime.
+    let ctx = Box::leak(Box::new(ctx));
+    Ok((ctx, use_gpu))
+}
+
 /// Common wake loop; caller provides how to spawn an ffmpeg PCM source (stream or mic).
 fn run_wake_loop_with_spawn<Spawn>(
     mut spawn_pcm: Spawn,
@@ -32,18 +109,8 @@ fn run_wake_loop_with_spawn<Spawn>(
 where
     Spawn: FnMut() -> Result<(Child, Box<dyn Read + Send>)> + Send + 'static,
 {
-    let mut wparams = WhisperContextParameters::default();
-    wparams.use_gpu = true; // prefer GPU-backed inference when built with CUDA/Metal
-
-    let ctx = WhisperContext::new_with_params(
-        model_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?,
-        wparams,
-    )
-    .context("loading whisper model")?;
+    let mut whisper = WhisperHandle::new(model_path)?;
     log_whisper_backend();
-    let mut state = ctx.create_state().context("creating whisper state")?;
 
     let chunk_samples = SAMPLE_RATE * CHUNK_MS / 1000;
     let chunk_bytes = chunk_samples * 2; // s16le
@@ -101,7 +168,9 @@ where
             }
             last_run = Instant::now();
 
-            if let Some((text, seg_t0_secs, seg_t1_secs)) = transcribe_window(&mut state, &pcm)? {
+            if let Some((text, seg_t0_secs, seg_t1_secs)) =
+                whisper.transcribe_with_fallback(&pcm)?
+            {
                 let window_start_secs = (total_samples.saturating_sub(pcm.len() as u64) as f32) / SAMPLE_RATE as f32;
                 let norm = normalize(&text);
                 if log_raw && !norm.is_empty() {
@@ -213,13 +282,16 @@ fn benchmark_model_rt(path: &Path) -> Option<f32> {
     let samples = SAMPLE_RATE * WINDOW_MS / 1000;
     let audio: Vec<f32> = vec![0.0; samples];
 
-    let mut wparams = WhisperContextParameters::default();
-    wparams.use_gpu = true;
-
-    let ctx = WhisperContext::new_with_params(
-        path.to_str()?,
-        wparams,
-    ).ok()?;
+    let prefer_gpu = whisper_prefers_gpu();
+    let (ctx, _use_gpu) = create_whisper_context(path, prefer_gpu)
+        .or_else(|_| {
+            if prefer_gpu {
+                create_whisper_context(path, false)
+            } else {
+                Err(anyhow::anyhow!("whisper init failed"))
+            }
+        })
+        .ok()?;
     let mut state = ctx.create_state().ok()?;
 
     let mut params = FullParams::new(SamplingStrategy::default());
