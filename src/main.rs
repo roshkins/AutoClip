@@ -149,12 +149,14 @@ impl AutoClip {
         // Requirement: wake phrase appears 50s into the clip and 10s from the end.
         let before = Duration::from_secs(50);
         let after_tail = Duration::from_secs(10);
-        let capture_window = before + after_tail; // 60s total clip length
+        let mut extra_latency = Duration::ZERO;
+        let mut capture_window = before + after_tail + extra_latency; // base + latency
         let mut buffer = RollingBuffer::new(capture_window);
         let stop = Arc::new(AtomicBool::new(false));
         let mut last_detect_instant: Option<Instant> = None;
         let start_instant = Instant::now();
         let detect_ns = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let audio_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let skip_clip_save = std::env::var("SKIP_CLIP_SAVE")
             .ok()
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -202,6 +204,7 @@ impl AutoClip {
                 fired.clone(),
                 start_instant,
                 detect_ns.clone(),
+                audio_ns.clone(),
             )?;
             println!(
                 "listening to microphone for wake phrase '{}' (model: {})",
@@ -218,6 +221,7 @@ impl AutoClip {
                 fired.clone(),
                 start_instant,
                 detect_ns.clone(),
+                audio_ns.clone(),
             )?;
             println!(
                 "listening to stream audio for wake phrase '{}' (model: {})",
@@ -239,6 +243,25 @@ impl AutoClip {
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
+            }
+
+            let audio_ns_now = audio_ns.load(std::sync::atomic::Ordering::Relaxed);
+            if audio_ns_now > 0 {
+                let audio_instant = start_instant + Duration::from_nanos(audio_ns_now);
+                let now = Instant::now();
+                if now > audio_instant {
+                    let latency = now - audio_instant;
+                    if latency > extra_latency {
+                        extra_latency = latency;
+                        capture_window = before + after_tail + extra_latency;
+                        buffer.set_capacity(capture_window);
+                        eprintln!(
+                            "processing latency ~{:.1}s; expanding buffer to ~{:.1}s",
+                            extra_latency.as_secs_f32(),
+                            capture_window.as_secs_f32()
+                        );
+                    }
+                }
             }
 
             let playlist = match hls.fetch_media(media_url.as_str()).await {
@@ -285,7 +308,8 @@ impl AutoClip {
                         last_detect_instant = Some(Instant::now());
                     }
                     println!(
-                        "wake detected; capturing 10s tail to place wake at 50s into a 60s clip (cooldown {:?})",
+                        "wake detected; capturing 10s tail to place wake at 50s into clip (buffer ~{:.1}s, cooldown {:?})",
+                        capture_window.as_secs_f32(),
                         refractory
                     );
                 }

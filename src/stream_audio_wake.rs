@@ -105,6 +105,7 @@ fn run_wake_loop_with_spawn<Spawn>(
     fired: Arc<AtomicBool>,
     _start_instant: Instant,
     detect_ns: Arc<AtomicU64>,
+    audio_ns: Arc<AtomicU64>,
 ) -> Result<()>
 where
     Spawn: FnMut() -> Result<(Child, Box<dyn Read + Send>)> + Send + 'static,
@@ -158,6 +159,12 @@ where
                 pcm.push(*s as f32 / 32768.0);
             }
             total_samples = total_samples.saturating_add(chunk_samples as u64);
+            let audio_end_secs = total_samples as f64 / SAMPLE_RATE as f64;
+            let nanos_f = (audio_end_secs * 1_000_000_000.0).round();
+            let nanos = nanos_f
+                .max(0.0)
+                .min((NO_DETECT - 1) as f64) as u64;
+            audio_ns.store(nanos, Ordering::Relaxed);
             if pcm.len() > window_samples {
                 let drop = pcm.len() - window_samples;
                 pcm.drain(0..drop);
@@ -323,6 +330,7 @@ pub fn start_stream_wake_from_hls(
     fired: Arc<AtomicBool>,
     start_instant: Instant,
     detect_ns: Arc<AtomicU64>,
+    audio_ns: Arc<AtomicU64>,
 ) -> Result<()> {
     let media_url = media_url.clone();
     let model_path = model_path.to_path_buf();
@@ -337,6 +345,7 @@ pub fn start_stream_wake_from_hls(
             fired,
             start_instant,
             detect_ns,
+            audio_ns,
         ) {
             eprintln!("stream wake loop error: {err:#}");
         }
@@ -354,6 +363,7 @@ pub fn start_mic_wake_with_ffmpeg(
     fired: Arc<AtomicBool>,
     start_instant: Instant,
     detect_ns: Arc<AtomicU64>,
+    audio_ns: Arc<AtomicU64>,
 ) -> Result<()> {
     let mic = mic_device.map(|s| s.to_string());
     let model_path = model_path.to_path_buf();
@@ -368,6 +378,7 @@ pub fn start_mic_wake_with_ffmpeg(
             fired,
             start_instant,
             detect_ns,
+            audio_ns,
         ) {
             eprintln!("mic wake loop error: {err:#}");
         }

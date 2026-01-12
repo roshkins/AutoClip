@@ -84,6 +84,11 @@ impl RollingBuffer {
         self.total_bytes
     }
 
+    pub fn set_capacity(&mut self, capacity: Duration) {
+        self.capacity = capacity;
+        self.evict();
+    }
+
     fn evict(&mut self) {
         while self.total_duration > self.capacity {
             if let Some(oldest) = self.chunks.pop_front() {
