@@ -48,11 +48,41 @@ impl RollingBuffer {
     /// Concatenate only the newest `keep` duration (oldest first). If a chunk would
     /// exceed `keep`, it is still included whole; returned duration reflects the sum
     /// of included chunks.
+    #[allow(dead_code)]
     pub fn snapshot_tail(&self, keep: Duration) -> (Vec<u8>, Duration) {
         let mut collected: Vec<&Chunk> = Vec::new();
         let mut acc = Duration::ZERO;
 
         for chunk in self.chunks.iter().rev() {
+            collected.push(chunk);
+            acc += chunk.duration;
+            if acc >= keep {
+                break;
+            }
+        }
+
+        collected.reverse();
+        let mut out = Vec::new();
+        for chunk in collected {
+            out.extend_from_slice(&chunk.data);
+        }
+
+        (out, acc)
+    }
+
+    /// Concatenate `keep` duration ending `drop_tail` before the newest chunk.
+    /// Drops whole chunks to satisfy `drop_tail` and `keep`.
+    #[allow(dead_code)]
+    pub fn snapshot_tail_offset(&self, keep: Duration, drop_tail: Duration) -> (Vec<u8>, Duration) {
+        let mut collected: Vec<&Chunk> = Vec::new();
+        let mut skipped = Duration::ZERO;
+        let mut acc = Duration::ZERO;
+
+        for chunk in self.chunks.iter().rev() {
+            if skipped < drop_tail {
+                skipped += chunk.duration;
+                continue;
+            }
             collected.push(chunk);
             acc += chunk.duration;
             if acc >= keep {
