@@ -149,14 +149,60 @@ impl AutoClip {
         // Requirement: wake phrase appears 50s into the clip and 10s from the end.
         let before = Duration::from_secs(50);
         let after_tail = Duration::from_secs(10);
-        let mut extra_latency = Duration::ZERO;
-        let mut capture_window = before + after_tail + extra_latency; // base + latency
-        let mut buffer = RollingBuffer::new(capture_window);
+        let clip_window = before + after_tail;
+        let latency_headroom = std::env::var("WAKE_BUFFER_HEADROOM_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(20));
+        let mut buffer_window = clip_window + latency_headroom;
+        let mut buffer_window_ns = duration_to_ns(buffer_window);
+        let mut buffer = RollingBuffer::new(buffer_window);
+        let buffer_target_ns = Arc::new(std::sync::atomic::AtomicU64::new(buffer_window_ns));
+        let max_latency_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let mut last_detect_instant: Option<Instant> = None;
         let start_instant = Instant::now();
         let detect_ns = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let audio_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let monitor_audio_ns = audio_ns.clone();
+        let monitor_stop = stop.clone();
+        let monitor_target = buffer_target_ns.clone();
+        let monitor_latency = max_latency_ns.clone();
+        let monitor_headroom = latency_headroom;
+        let monitor_clip = clip_window;
+        let monitor_start = start_instant;
+        std::thread::spawn(move || {
+            let mut max_latency = Duration::ZERO;
+            let mut warned = false;
+            let poll = Duration::from_millis(250);
+            while !monitor_stop.load(Ordering::Relaxed) {
+                let audio_ns_now = monitor_audio_ns.load(Ordering::Relaxed);
+                if audio_ns_now > 0 {
+                    let audio_instant = monitor_start + Duration::from_nanos(audio_ns_now);
+                    let now = Instant::now();
+                    if now > audio_instant {
+                        let latency = now - audio_instant;
+                        if latency > max_latency {
+                            max_latency = latency;
+                            if !warned && max_latency > monitor_headroom {
+                                warned = true;
+                                eprintln!(
+                                    "processing latency ~{:.1}s exceeds headroom ~{:.1}s; wake timing may drift (set WAKE_BUFFER_HEADROOM_SECS)",
+                                    max_latency.as_secs_f32(),
+                                    monitor_headroom.as_secs_f32()
+                                );
+                            }
+                            let target = monitor_clip + monitor_headroom + max_latency;
+                            monitor_target.store(duration_to_ns(target), Ordering::Relaxed);
+                            monitor_latency.store(duration_to_ns(max_latency), Ordering::Relaxed);
+                        }
+                    }
+                }
+                std::thread::sleep(poll);
+            }
+        });
+
         let skip_clip_save = std::env::var("SKIP_CLIP_SAVE")
             .ok()
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -179,6 +225,8 @@ impl AutoClip {
         println!("tracking variant: {}", media_url);
 
         let mut seen: HashSet<String> = HashSet::new();
+        let mut stream_time = Duration::ZERO;
+        let mut detect_stream_time: Option<Duration> = None;
         let mut after_remaining: Option<Duration> = None;
         let refractory = std::env::var("WAKE_REFRACTORY_SECS")
             .ok()
@@ -245,23 +293,17 @@ impl AutoClip {
                 break;
             }
 
-            let audio_ns_now = audio_ns.load(std::sync::atomic::Ordering::Relaxed);
-            if audio_ns_now > 0 {
-                let audio_instant = start_instant + Duration::from_nanos(audio_ns_now);
-                let now = Instant::now();
-                if now > audio_instant {
-                    let latency = now - audio_instant;
-                    if latency > extra_latency {
-                        extra_latency = latency;
-                        capture_window = before + after_tail + extra_latency;
-                        buffer.set_capacity(capture_window);
-                        eprintln!(
-                            "processing latency ~{:.1}s; expanding buffer to ~{:.1}s",
-                            extra_latency.as_secs_f32(),
-                            capture_window.as_secs_f32()
-                        );
-                    }
-                }
+            let target_ns = buffer_target_ns.load(Ordering::Relaxed);
+            if target_ns > buffer_window_ns {
+                buffer_window_ns = target_ns;
+                buffer_window = Duration::from_nanos(target_ns);
+                buffer.set_capacity(buffer_window);
+                let latency = Duration::from_nanos(max_latency_ns.load(Ordering::Relaxed));
+                eprintln!(
+                    "processing latency ~{:.1}s; expanding buffer to ~{:.1}s",
+                    latency.as_secs_f32(),
+                    buffer_window.as_secs_f32()
+                );
             }
 
             let playlist = match hls.fetch_media(media_url.as_str()).await {
@@ -281,10 +323,15 @@ impl AutoClip {
                     continue;
                 }
 
-                let seg_dur = Duration::from_secs_f32(seg.duration as f32);
                 match hls.fetch_segment_from_playlist(&media_url, &uri).await {
                     Ok(bytes) => {
+                        let seg_dur_playlist = Duration::from_secs_f32(seg.duration as f32);
+                        let seg_dur = choose_segment_duration(
+                            pts_duration_from_ts(&bytes),
+                            seg_dur_playlist,
+                        );
                         buffer.push(bytes, seg_dur);
+                        stream_time = stream_time.saturating_add(seg_dur);
                         made_progress = true;
                     }
                     Err(err) => {
@@ -298,24 +345,43 @@ impl AutoClip {
                         // Ignore rapid re-triggers until cooldown expires.
                         continue;
                     }
+                    let detect_ns_val = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
+                    let audio_ns_now = audio_ns.load(std::sync::atomic::Ordering::Relaxed);
+                    let age_audio = if detect_ns_val != u64::MAX && audio_ns_now >= detect_ns_val {
+                        Duration::from_nanos(audio_ns_now - detect_ns_val)
+                    } else {
+                        Duration::ZERO
+                    };
+
                     // Wait exactly 10s of post-wake audio to place wake at 50s and end at +10s.
-                    after_remaining = Some(after_tail);
                     refractory_until = Some(Instant::now() + refractory);
                     let ns = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
-                    if ns != u64::MAX {
-                        last_detect_instant = Some(start_instant + Duration::from_nanos(ns));
+                    let detected_instant = if ns != u64::MAX {
+                        start_instant + Duration::from_nanos(ns)
                     } else {
-                        last_detect_instant = Some(Instant::now());
-                    }
+                        Instant::now()
+                    };
+                    last_detect_instant = Some(detected_instant);
+                    let latency = Instant::now().saturating_duration_since(detected_instant);
+                    detect_stream_time = Some(stream_time.saturating_sub(age_audio));
+                    after_remaining = Some(after_tail);
                     println!(
-                        "wake detected; capturing 10s tail to place wake at 50s into clip (buffer ~{:.1}s, cooldown {:?})",
-                        capture_window.as_secs_f32(),
+                        "wake detected; capturing tail to place wake at 50s into clip (latency ~{:.1}s, buffer ~{:.1}s, cooldown {:?})",
+                        latency.as_secs_f32(),
+                        buffer_window.as_secs_f32(),
                         refractory
                     );
                 }
 
-                if let Some(rem) = after_remaining.as_mut() {
-                    *rem = rem.saturating_sub(seg_dur);
+            }
+
+            if let Some(rem) = after_remaining.as_mut() {
+                if let Some(detect_stream_time) = detect_stream_time {
+                    let age = stream_time.saturating_sub(detect_stream_time);
+                    let target = after_tail.saturating_sub(age);
+                    if target < *rem {
+                        *rem = target;
+                    }
                 }
             }
 
@@ -326,9 +392,39 @@ impl AutoClip {
                     }
                     let output_path = next_output_path(&save_root, &file_stub)?;
                     let ts_path = output_path.with_extension("ts");
-                    let (snapshot, snap_len) = buffer.snapshot_tail(capture_window);
+                    let snapshot = buffer.snapshot_bytes();
+                    let snap_len = buffer.total_duration();
+                    let detect_stream_time_val = detect_stream_time.unwrap_or(stream_time);
+                    let age = stream_time.saturating_sub(detect_stream_time_val);
+                    let detect_offset = snap_len.saturating_sub(age);
+                    let warn_pre_roll = detect_offset < before;
+                    let start_offset = detect_offset.saturating_sub(before);
+                    let available = snap_len.saturating_sub(start_offset);
+                    let warn_short = available < clip_window;
+                    let clip_len = clip_window;
+                    if warn_pre_roll || warn_short {
+                        eprintln!(
+                            "wake clip off-target; pre-roll ~{:.1}s, buffered ~{:.1}s, available ~{:.1}s (request {:.1}s).",
+                            detect_offset.as_secs_f32(),
+                            snap_len.as_secs_f32(),
+                            available.as_secs_f32(),
+                            clip_window.as_secs_f32()
+                        );
+                    }
+                    eprintln!(
+                        "wake clip timing: output={}, detect_offset_secs={:.3}, start_offset_secs={:.3}, snap_len_secs={:.3}, clip_len_secs={:.3}",
+                        output_path.display(),
+                        detect_offset.as_secs_f32(),
+                        start_offset.as_secs_f32(),
+                        snap_len.as_secs_f32(),
+                        clip_len.as_secs_f32()
+                    );
                     let (out_w, out_h) = parse_resolution(&resolution).unwrap_or((1080, 1920));
-                    let clip_len = snap_len;
+                    let clip_start = if start_offset > Duration::ZERO {
+                        Some(start_offset.as_secs_f32())
+                    } else {
+                        None
+                    };
 
                     if skip_clip_save {
                         println!(
@@ -338,7 +434,20 @@ impl AutoClip {
                     } else {
                         let save_future = async move {
                             fs::write(&ts_path, &snapshot).context("writing buffered TS snapshot")?;
-                            run_ffmpeg_from_file(&ts_path, &output_path, out_w, out_h, clip_len).await?;
+                            run_ffmpeg_from_file(
+                                &ts_path,
+                                &output_path,
+                                out_w,
+                                out_h,
+                                clip_len,
+                                clip_start,
+                                Some(ClipTimingHints {
+                                    estimated_total_secs: snap_len.as_secs_f32(),
+                                    detect_offset_secs: detect_offset.as_secs_f32(),
+                                    before_secs: before.as_secs_f32(),
+                                }),
+                            )
+                            .await?;
                             let detected_at = last_detect_instant.map(|t| t.elapsed().as_secs_f32());
                             println!(
                                 "wrote wakeword clip: {} (duration ~{:.1}s) | wake at ~50.0s into clip | detect_elapsed_since_save_start={:?}",
@@ -357,7 +466,9 @@ impl AutoClip {
                     }
 
                     after_remaining = None;
+                    detect_stream_time = None;
                     fired.store(false, Ordering::Relaxed);
+                    detect_ns.store(u64::MAX, Ordering::Relaxed);
                     continue;
                 }
                 if !made_progress {
@@ -367,6 +478,32 @@ impl AutoClip {
             }
 
             if fired.load(Ordering::Relaxed) && after_remaining.is_none() {
+                if refractory_until.map(|t| Instant::now() < t).unwrap_or(false) {
+                    continue;
+                }
+                let detect_ns_val = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
+                let audio_ns_now = audio_ns.load(std::sync::atomic::Ordering::Relaxed);
+                let age_audio = if detect_ns_val != u64::MAX && audio_ns_now >= detect_ns_val {
+                    Duration::from_nanos(audio_ns_now - detect_ns_val)
+                } else {
+                    Duration::ZERO
+                };
+                refractory_until = Some(Instant::now() + refractory);
+                detect_stream_time = Some(stream_time.saturating_sub(age_audio));
+                let ns = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
+                let detected_instant = if ns != u64::MAX {
+                    start_instant + Duration::from_nanos(ns)
+                } else {
+                    Instant::now()
+                };
+                last_detect_instant = Some(detected_instant);
+                let latency = Instant::now().saturating_duration_since(detected_instant);
+                println!(
+                    "wake detected; capturing tail to place wake at 50s into clip (latency ~{:.1}s, buffer ~{:.1}s, cooldown {:?})",
+                    latency.as_secs_f32(),
+                    buffer_window.as_secs_f32(),
+                    refractory
+                );
                 // Wake fired but we have not yet started counting; ensure we do.
                 after_remaining = Some(after_tail);
             }
@@ -378,6 +515,251 @@ impl AutoClip {
         Ok(())
     }
 }
+
+const TS_PACKET_SIZE: usize = 188;
+const PTS_HZ: f64 = 90_000.0;
+const PTS_WRAP: u64 = 1 << 33;
+const PCR_HZ: f64 = 27_000_000.0;
+const PCR_WRAP: u64 = (1 << 33) * 300;
+
+fn duration_to_ns(d: Duration) -> u64 {
+    let nanos = d.as_nanos();
+    if nanos > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        nanos as u64
+    }
+}
+
+fn choose_segment_duration(pts: Option<Duration>, playlist: Duration) -> Duration {
+    if let Some(pts_dur) = pts {
+        let secs = pts_dur.as_secs_f32();
+        if secs.is_finite() && secs > 0.0 {
+            return pts_dur;
+        }
+    }
+    playlist
+}
+
+// Extract a best-effort PTS span from a TS segment to align clip timing to real stream time.
+
+fn pts_duration_from_ts(data: &[u8]) -> Option<Duration> {
+    if let Some((start, end)) = pts_span_from_ts(data) {
+        if let Some(dur) = duration_from_span(start, end, PTS_WRAP, PTS_HZ) {
+            return Some(dur);
+        }
+    }
+    pcr_duration_from_ts(data)
+}
+
+
+fn pts_span_from_ts(data: &[u8]) -> Option<(u64, u64)> {
+    let sync = find_ts_sync(data)?;
+    let mut audio_first = None;
+    let mut audio_last = None;
+    let mut video_first = None;
+    let mut video_last = None;
+
+    let mut idx = sync;
+    while idx + TS_PACKET_SIZE <= data.len() {
+        let packet = &data[idx..idx + TS_PACKET_SIZE];
+        idx += TS_PACKET_SIZE;
+
+        if packet[0] != 0x47 {
+            continue;
+        }
+
+        let payload_unit_start = (packet[1] & 0x40) != 0;
+        let adaptation_control = (packet[3] >> 4) & 0x03;
+        if adaptation_control == 0 || adaptation_control == 2 {
+            continue;
+        }
+
+        let mut payload_idx = 4usize;
+        if adaptation_control == 3 {
+            let adapt_len = packet[4] as usize;
+            payload_idx = payload_idx.saturating_add(1 + adapt_len);
+        }
+        if payload_idx >= TS_PACKET_SIZE {
+            continue;
+        }
+        if !payload_unit_start {
+            continue;
+        }
+
+        let payload = &packet[payload_idx..];
+        if payload.len() < 9 {
+            continue;
+        }
+        if payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
+            continue;
+        }
+
+        let stream_id = payload[3];
+        let is_audio = is_audio_stream_id(stream_id);
+        let is_video = is_video_stream_id(stream_id);
+        if !(is_audio || is_video) {
+            continue;
+        }
+
+        let flags = payload[7];
+        let pts_dts = (flags >> 6) & 0x03;
+        if pts_dts < 2 {
+            continue;
+        }
+
+        let pts_start = 9;
+        if payload.len() < pts_start + 5 {
+            continue;
+        }
+        let Some(pts) = parse_pts(&payload[pts_start..pts_start + 5]) else {
+            continue;
+        };
+
+        if is_audio {
+            if audio_first.is_none() {
+                audio_first = Some(pts);
+            }
+            audio_last = Some(pts);
+        } else if is_video {
+            if video_first.is_none() {
+                video_first = Some(pts);
+            }
+            video_last = Some(pts);
+        }
+    }
+
+    if let (Some(first), Some(last)) = (audio_first, audio_last) {
+        if last != first {
+            return Some((first, last));
+        }
+    }
+    if let (Some(first), Some(last)) = (video_first, video_last) {
+        if last != first {
+            return Some((first, last));
+        }
+    }
+    None
+}
+
+
+fn pcr_duration_from_ts(data: &[u8]) -> Option<Duration> {
+    let (start, end) = pcr_span_from_ts(data)?;
+    duration_from_span(start, end, PCR_WRAP, PCR_HZ)
+}
+
+fn pcr_span_from_ts(data: &[u8]) -> Option<(u64, u64)> {
+    let sync = find_ts_sync(data)?;
+    let mut first = None;
+    let mut last = None;
+
+    let mut idx = sync;
+    while idx + TS_PACKET_SIZE <= data.len() {
+        let packet = &data[idx..idx + TS_PACKET_SIZE];
+        idx += TS_PACKET_SIZE;
+
+        if packet[0] != 0x47 {
+            continue;
+        }
+        if let Some(pcr) = parse_pcr(packet) {
+            if first.is_none() {
+                first = Some(pcr);
+            }
+            last = Some(pcr);
+        }
+    }
+
+    match (first, last) {
+        (Some(f), Some(l)) if l != f => Some((f, l)),
+        _ => None,
+    }
+}
+
+fn parse_pcr(packet: &[u8]) -> Option<u64> {
+    if packet.len() < TS_PACKET_SIZE {
+        return None;
+    }
+    let adaptation_control = (packet[3] >> 4) & 0x03;
+    if adaptation_control == 0 || adaptation_control == 1 {
+        return None;
+    }
+    let adapt_len = packet[4] as usize;
+    if adapt_len < 7 || 5 + adapt_len > packet.len() {
+        return None;
+    }
+    let flags = packet[5];
+    if (flags & 0x10) == 0 {
+        return None;
+    }
+    let pcr = &packet[6..12];
+    let base = ((pcr[0] as u64) << 25)
+        | ((pcr[1] as u64) << 17)
+        | ((pcr[2] as u64) << 9)
+        | ((pcr[3] as u64) << 1)
+        | ((pcr[4] as u64) >> 7);
+    let ext = (((pcr[4] & 0x01) as u64) << 8) | (pcr[5] as u64);
+    Some(base * 300 + ext)
+}
+
+fn duration_from_span(start: u64, end: u64, wrap: u64, hz: f64) -> Option<Duration> {
+    let delta = if end >= start {
+        end - start
+    } else {
+        (end + wrap) - start
+    };
+    if delta == 0 {
+        return None;
+    }
+    let secs = (delta as f64) / hz;
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(secs))
+}
+
+fn find_ts_sync(data: &[u8]) -> Option<usize> {
+    let max_scan = usize::min(data.len(), TS_PACKET_SIZE * 4);
+    for start in 0..max_scan {
+        if data[start] != 0x47 {
+            continue;
+        }
+        let next = start + TS_PACKET_SIZE;
+        if next < data.len() && data[next] == 0x47 {
+            return Some(start);
+        }
+    }
+    None
+}
+
+fn is_audio_stream_id(id: u8) -> bool {
+    (0xC0..=0xDF).contains(&id)
+}
+
+fn is_video_stream_id(id: u8) -> bool {
+    (0xE0..=0xEF).contains(&id)
+}
+
+fn parse_pts(data: &[u8]) -> Option<u64> {
+    if data.len() < 5 {
+        return None;
+    }
+    let b0 = data[0];
+    if (b0 & 0xF0) != 0x20 && (b0 & 0xF0) != 0x30 {
+        return None;
+    }
+    let b1 = data[1];
+    let b2 = data[2];
+    let b3 = data[3];
+    let b4 = data[4];
+
+    let pts = (((b0 >> 1) & 0x07) as u64) << 30
+        | (b1 as u64) << 22
+        | (((b2 >> 1) & 0x7F) as u64) << 15
+        | (b3 as u64) << 7
+        | (((b4 >> 1) & 0x7F) as u64);
+    Some(pts)
+}
+
 /// Minimal client to fetch and parse HLS playlists.
 #[derive(Clone)]
 pub struct HlsClient {
@@ -1383,7 +1765,24 @@ fn next_output_path(save_dir: &str, stub: &str) -> Result<PathBuf> {
 }
 
 async fn run_ffmpeg_30s(input_hls: &Url, out_path: &Path, out_w: u32, out_h: u32) -> Result<()> {
-    run_ffmpeg_internal(input_hls.as_str(), out_path, out_w, out_h, Some(30.0), false, false).await
+    run_ffmpeg_internal(
+        input_hls.as_str(),
+        out_path,
+        out_w,
+        out_h,
+        Some(30.0),
+        None,
+        false,
+        false,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClipTimingHints {
+    estimated_total_secs: f32,
+    detect_offset_secs: f32,
+    before_secs: f32,
 }
 
 async fn run_ffmpeg_from_file(
@@ -1392,7 +1791,65 @@ async fn run_ffmpeg_from_file(
     out_w: u32,
     out_h: u32,
     duration: Duration,
+    start_offset: Option<f32>,
+    timing: Option<ClipTimingHints>,
 ) -> Result<()> {
+    let mut duration_secs = duration.as_secs_f32();
+    let mut start_secs = start_offset.unwrap_or(0.0).max(0.0);
+    let actual_secs = probe_media_duration_secs(input_path).await;
+    let mut telemetry_scale = 1.0f32;
+    if let Some(timing) = timing {
+        if let Some(actual_secs) = actual_secs {
+            if timing.estimated_total_secs > 0.0 {
+                let scale = actual_secs / timing.estimated_total_secs;
+                if scale.is_finite() && scale > 0.0 {
+                    telemetry_scale = scale;
+                    let detect_actual = timing.detect_offset_secs * scale;
+                    let scaled_start = (detect_actual - timing.before_secs).max(0.0);
+                    if (scaled_start - start_secs).abs() > 0.05 {
+                        eprintln!(
+                            "ffprobe: scaling start offset from {:.3}s -> {:.3}s (actual {:.3}s vs est {:.3}s)",
+                            start_secs,
+                            scaled_start,
+                            actual_secs,
+                            timing.estimated_total_secs
+                        );
+                    }
+                    start_secs = scaled_start;
+                }
+            }
+        }
+        let detect_actual = timing.detect_offset_secs * telemetry_scale;
+        let wake_in_clip = (detect_actual - start_secs).max(0.0);
+        let delta = wake_in_clip - timing.before_secs;
+        eprintln!(
+            "wake telemetry: target={:.3}s actual={:.3}s delta={:+.3}s (scale={:.6})",
+            timing.before_secs,
+            wake_in_clip,
+            delta,
+            telemetry_scale
+        );
+    }
+
+    if let Some(actual_secs) = actual_secs {
+        let remaining = (actual_secs - start_secs).max(0.0);
+        if (actual_secs - duration_secs).abs() > 1.0 {
+            eprintln!(
+                "ffprobe: input duration ~{:.1}s (start {:.1}s, requested {:.1}s)",
+                actual_secs,
+                start_secs,
+                duration_secs
+            );
+        }
+        if remaining > 0.0 && remaining + 0.5 < duration_secs {
+            eprintln!(
+                "ffprobe: clamping clip length to ~{:.1}s based on input duration",
+                remaining
+            );
+            duration_secs = remaining;
+        }
+    }
+    let start_offset = if start_secs > 0.0 { Some(start_secs) } else { None };
     run_ffmpeg_internal(
         input_path
             .to_str()
@@ -1400,11 +1857,36 @@ async fn run_ffmpeg_from_file(
         out_path,
         out_w,
         out_h,
-        Some(duration.as_secs_f32()),
+        Some(duration_secs),
+        start_offset,
         true,
         true,
     )
     .await
+}
+
+async fn probe_media_duration_secs(path: &Path) -> Option<f32> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(path.as_os_str())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let val = stdout.lines().next()?.trim().parse::<f32>().ok()?;
+    if val.is_finite() && val > 0.0 {
+        Some(val)
+    } else {
+        None
+    }
 }
 
 fn build_ffmpeg_filters(out_w: u32, out_h: u32) -> (String, String, String) {
@@ -1429,6 +1911,137 @@ fn build_ffmpeg_filters(out_w: u32, out_h: u32) -> (String, String, String) {
     (vf_cpu, vf_gpu_sw, vf_gpu_hw)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipLayoutMode {
+    Full,
+    Stacked,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FaceAnchor {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Center,
+}
+
+#[derive(Clone, Debug)]
+struct ClipLayoutConfig {
+    mode: ClipLayoutMode,
+    face_ratio: f32,
+    face_crop: Option<String>,
+    face_anchor: FaceAnchor,
+}
+
+#[derive(Clone, Debug)]
+enum FilterGraph {
+    Vf(String),
+    Complex { graph: String, output: String },
+}
+
+fn read_clip_layout_config() -> ClipLayoutConfig {
+    let mode = std::env::var("CLIP_LAYOUT")
+        .ok()
+        .map(|v| v.to_ascii_lowercase())
+        .and_then(|v| match v.trim() {
+            "stacked" | "tiktok" | "stack" | "split" => Some(ClipLayoutMode::Stacked),
+            "full" | "default" | "" => Some(ClipLayoutMode::Full),
+            _ => None,
+        })
+        .unwrap_or(ClipLayoutMode::Full);
+
+    let face_ratio = std::env::var("CLIP_FACE_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(|v| v.clamp(0.2, 0.8))
+        .unwrap_or(0.40);
+
+    let face_crop = std::env::var("CLIP_FACE_CROP")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("none"))
+        .map(|v| v.strip_prefix("crop=").unwrap_or(&v).to_string());
+
+    let face_anchor = std::env::var("CLIP_FACE_ANCHOR")
+        .ok()
+        .map(|v| v.to_ascii_lowercase())
+        .and_then(|v| match v.trim() {
+            "top-right" | "right-top" | "tr" => Some(FaceAnchor::TopRight),
+            "bottom-left" | "left-bottom" | "bl" => Some(FaceAnchor::BottomLeft),
+            "bottom-right" | "right-bottom" | "br" => Some(FaceAnchor::BottomRight),
+            "center" | "centre" | "middle" => Some(FaceAnchor::Center),
+            "top-left" | "left-top" | "tl" | "" => Some(FaceAnchor::TopLeft),
+            _ => None,
+        })
+        .unwrap_or(FaceAnchor::TopLeft);
+
+    ClipLayoutConfig {
+        mode,
+        face_ratio,
+        face_crop,
+        face_anchor,
+    }
+}
+
+fn resolve_layout_heights(out_h: u32, face_ratio: f32) -> (u32, u32) {
+    let mut face_h = (out_h as f32 * face_ratio).round() as u32;
+    if face_h < 2 {
+        face_h = 2;
+    }
+    if face_h >= out_h {
+        face_h = out_h.saturating_sub(2);
+    }
+    if face_h % 2 != 0 {
+        face_h = face_h.saturating_sub(1);
+    }
+    let mut game_h = out_h.saturating_sub(face_h);
+    if game_h % 2 != 0 {
+        game_h = game_h.saturating_sub(1);
+        face_h = out_h.saturating_sub(game_h);
+    }
+    (face_h.max(2), game_h.max(2))
+}
+
+fn default_face_crop_expr(anchor: FaceAnchor) -> String {
+    const FACE_CROP_W_RATIO: f32 = 0.6;
+    const FACE_CROP_H_RATIO: f32 = 0.6;
+    let w = format!("iw*{:.3}", FACE_CROP_W_RATIO);
+    let h = format!("ih*{:.3}", FACE_CROP_H_RATIO);
+    let x = match anchor {
+        FaceAnchor::TopLeft | FaceAnchor::BottomLeft => "0".to_string(),
+        FaceAnchor::TopRight | FaceAnchor::BottomRight => format!("iw-({w})"),
+        FaceAnchor::Center => format!("(iw-({w}))/2"),
+    };
+    let y = match anchor {
+        FaceAnchor::TopLeft | FaceAnchor::TopRight => "0".to_string(),
+        FaceAnchor::BottomLeft | FaceAnchor::BottomRight => format!("ih-({h})"),
+        FaceAnchor::Center => format!("(ih-({h}))/2"),
+    };
+    format!("{w}:{h}:{x}:{y}")
+}
+
+fn build_stacked_filter_graph(out_w: u32, out_h: u32, layout: &ClipLayoutConfig) -> FilterGraph {
+    let (face_h, game_h) = resolve_layout_heights(out_h, layout.face_ratio);
+    let face_crop = layout
+        .face_crop
+        .clone()
+        .unwrap_or_else(|| default_face_crop_expr(layout.face_anchor));
+    let face_chain = format!(
+        "crop={face_crop},scale={out_w}:{face_h}:force_original_aspect_ratio=increase,crop={out_w}:{face_h}"
+    );
+    let game_chain = format!(
+        "scale={out_w}:{game_h}:force_original_aspect_ratio=increase,crop={out_w}:{game_h}"
+    );
+    let graph = format!(
+        "[0:v]split=2[face_src][game_src];[face_src]{face_chain}[face];[game_src]{game_chain}[game];[face][game]vstack=inputs=2,format=yuv420p[v]"
+    );
+    FilterGraph::Complex {
+        graph,
+        output: "v".to_string(),
+    }
+}
+
 fn tail_trunc(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -1440,16 +2053,15 @@ fn tail_trunc(s: &str, max: usize) -> String {
 async fn run_ffmpeg_encode(
     input: &str,
     out_path: &Path,
-    vf_cpu: &str,
-    vf_gpu: &str,
+    filters: &FilterGraph,
     encoder: &str,
     use_hw_encode: bool,
     use_nvenc: bool,
     allow_hwaccel: bool,
     regen_pts: bool,
     force_ts_input: bool,
+    start_offset_secs: Option<f32>,
     duration_secs: Option<f32>,
-    vf_override: Option<&str>,
 ) -> Result<std::process::Output> {
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y");
@@ -1474,16 +2086,26 @@ async fn run_ffmpeg_encode(
         cmd.arg("-f").arg("mpegts");
     }
     cmd.arg("-i").arg(input);
+    if let Some(ss) = start_offset_secs {
+        if ss > 0.0 {
+            cmd.arg("-ss").arg(format!("{ss:.3}"));
+        }
+    }
     if let Some(d) = duration_secs {
         cmd.arg("-t").arg(format!("{d:.3}"));
     }
-    let vf = vf_override.unwrap_or_else(|| if use_nvenc { vf_gpu } else { vf_cpu });
+    match filters {
+        FilterGraph::Vf(vf) => {
+            cmd.arg("-map").arg("0:v:0");
+            cmd.arg("-vf").arg(vf);
+        }
+        FilterGraph::Complex { graph, output } => {
+            cmd.arg("-filter_complex").arg(graph);
+            cmd.arg("-map").arg(format!("[{output}]"));
+        }
+    }
     cmd.arg("-map")
-        .arg("0:v:0")
-        .arg("-map")
         .arg("0:a:0?")
-        .arg("-vf")
-        .arg(vf)
         .arg("-fps_mode")
         .arg("vfr")
         .arg("-c:v")
@@ -1501,7 +2123,10 @@ async fn run_ffmpeg_encode(
 
     if regen_pts {
         if let Some(d) = duration_secs {
-            cmd.arg("-af").arg(format!("atrim=end={d:.3},asetpts=N/SR/TB"));
+            let trim_end = start_offset_secs.unwrap_or(0.0).max(0.0) + d;
+            // Keep full audio duration when seeking so -ss doesn't shorten the tail.
+            cmd.arg("-af")
+                .arg(format!("atrim=end={trim_end:.3},asetpts=N/SR/TB"));
         }
         cmd.arg("-c:a")
             .arg("aac")
@@ -1511,7 +2136,10 @@ async fn run_ffmpeg_encode(
         cmd.arg("-c:a").arg("copy");
     }
 
-    cmd.arg("-shortest").arg(out_path.as_os_str());
+    if duration_secs.is_none() {
+        cmd.arg("-shortest");
+    }
+    cmd.arg(out_path.as_os_str());
     cmd.output().await.context("failed to run ffmpeg")
 }
 
@@ -1521,6 +2149,7 @@ async fn run_ffmpeg_internal(
     out_w: u32,
     out_h: u32,
     duration_secs: Option<f32>,
+    start_offset_secs: Option<f32>,
     regen_pts: bool,
     force_ts_input: bool,
 ) -> Result<()> {
@@ -1532,28 +2161,49 @@ async fn run_ffmpeg_internal(
         is_nvenc = false;
         is_hw = false;
     }
+    let layout = read_clip_layout_config();
+    let layout_is_stacked = matches!(layout.mode, ClipLayoutMode::Stacked);
     let hwaccel = std::env::var("FFMPEG_HWACCEL").unwrap_or_default();
     let hw_decode_cuda = is_nvenc && hwaccel.eq_ignore_ascii_case("cuda");
     let (vf_cpu, vf_gpu_sw, vf_gpu_hw) = build_ffmpeg_filters(out_w, out_h);
     let vf_gpu = if hw_decode_cuda { vf_gpu_hw.clone() } else { vf_gpu_sw.clone() };
-    let force_cpu_filters = is_stream_unstable(input) && is_nvenc;
+    let filter_cpu = if layout_is_stacked {
+        build_stacked_filter_graph(out_w, out_h, &layout)
+    } else {
+        FilterGraph::Vf(vf_cpu)
+    };
+    let filter_gpu = if layout_is_stacked {
+        filter_cpu.clone()
+    } else {
+        FilterGraph::Vf(vf_gpu)
+    };
+    let force_cpu_filters = (is_stream_unstable(input) && is_nvenc) || layout_is_stacked;
     if force_cpu_filters {
-        eprintln!("ffmpeg: stream flagged as unstable; using CPU filters with NVENC");
+        if layout_is_stacked {
+            if is_hw {
+                eprintln!("ffmpeg: stacked layout uses CPU filters; disabling hwaccel decode");
+            }
+        } else {
+            eprintln!("ffmpeg: stream flagged as unstable; using CPU filters with NVENC");
+        }
     }
+
+    let use_cpu_filters = force_cpu_filters || !is_nvenc;
+    let selected_filters = if use_cpu_filters { &filter_cpu } else { &filter_gpu };
+    let allow_hwaccel = !force_cpu_filters;
 
     let mut output = run_ffmpeg_encode(
         input,
         out_path,
-        &vf_cpu,
-        &vf_gpu,
+        selected_filters,
         &video_encoder,
         is_hw,
         is_nvenc,
-        !force_cpu_filters,
+        allow_hwaccel,
         regen_pts,
         force_ts_input,
+        start_offset_secs,
         duration_secs,
-        if force_cpu_filters { Some(&vf_cpu) } else { None },
     )
     .await?;
 
@@ -1564,7 +2214,7 @@ async fn run_ffmpeg_internal(
 
         if is_hw {
             let filter_failure = stderr_indicates_filter_issue(&stderr_first);
-            if filter_failure {
+            if filter_failure && !layout_is_stacked {
                 mark_stream_unstable(input);
             }
             eprintln!(
@@ -1572,21 +2222,20 @@ async fn run_ffmpeg_internal(
                 output.status,
                 tail_trunc(&stderr_first, 400)
             );
-            if is_nvenc && filter_failure {
+            if is_nvenc && filter_failure && !use_cpu_filters {
                 eprintln!("ffmpeg: retrying NVENC with CPU filters (software decode)");
                 output = run_ffmpeg_encode(
                     input,
                     out_path,
-                    &vf_cpu,
-                    &vf_gpu,
+                    &filter_cpu,
                     &video_encoder,
                     true,
                     true,
                     false,
                     regen_pts,
                     force_ts_input,
+                    start_offset_secs,
                     duration_secs,
-                    Some(&vf_cpu),
                 )
                 .await?;
             }
@@ -1594,16 +2243,15 @@ async fn run_ffmpeg_internal(
                 output = run_ffmpeg_encode(
                     input,
                     out_path,
-                    &vf_cpu,
-                    &vf_gpu,
+                    &filter_cpu,
                     "libx264",
                     false,
                     false,
-                    true,
+                    !force_cpu_filters,
                     regen_pts,
                     force_ts_input,
+                    start_offset_secs,
                     duration_secs,
-                    None,
                 )
                 .await?;
                 retried_cpu = true;
@@ -1767,8 +2415,12 @@ async fn run_hls_buffer_demo(page_url: &str) -> Result<()> {
     // Limit to a handful of segments to keep the demo quick.
     let take_n = usize::min(8, playlist.segments.len());
     for (idx, seg) in playlist.segments.iter().take(take_n).enumerate() {
-        let seg_dur = Duration::from_secs_f32(seg.duration as f32);
+        let seg_dur_playlist = Duration::from_secs_f32(seg.duration as f32);
         let bytes = hls.fetch_segment_from_playlist(&media_url, &seg.uri).await?;
+        let seg_dur = choose_segment_duration(
+            pts_duration_from_ts(&bytes),
+            seg_dur_playlist,
+        );
         buffer.push(bytes, seg_dur);
 
         println!(
@@ -1808,7 +2460,7 @@ async fn run_hls_buffer_demo(page_url: &str) -> Result<()> {
         output_path.display()
     );
 
-    run_ffmpeg_from_file(&ts_path, &output_path, out_w, out_h, clip_len).await?;
+    run_ffmpeg_from_file(&ts_path, &output_path, out_w, out_h, clip_len, None, None).await?;
     println!("wrote clipped video to {}", output_path.display());
 
     Ok(())
@@ -1977,10 +2629,15 @@ fn print_help(bin: &str) {
     println!("");
     println!("Environment (selected):");
     println!("  CLIP_PAGE_URL            Default page when none is passed");
+    println!("  CLIP_LAYOUT              Layout mode: full (default) or stacked/tiktok");
+    println!("  CLIP_FACE_RATIO          Height ratio reserved for face panel (default 0.40)");
+    println!("  CLIP_FACE_CROP           Face crop expr w:h:x:y (optional, overrides anchor)");
+    println!("  CLIP_FACE_ANCHOR         Anchor for default face crop (top-left default)");
     println!("  M3U8_URL_OVERRIDE        Skip discovery; use this master URL directly");
     println!("  COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE   Cookies to send on discovery");
     println!("  HEADLESS_M3U8_SCRIPT / HEADLESS_M3U8_SCRIPT_TIKTOK   Override Playwright scripts");
     println!("  WAKE_REFRACTORY_SECS     Cooldown between wake detections (default 12)");
+    println!("  WAKE_BUFFER_HEADROOM_SECS   Extra buffer headroom for wake timing (default 20)");
     println!("  SKIP_CLIP_SAVE           If set to 1/true, skip writing clips");
     println!("  WHISPER_MODEL            Path to whisper model (default auto)");
     println!("  FFMPEG_ENCODER / FFMPEG_HWACCEL / FFMPEG_HWACCEL_DEVICE   Encoder/accel knobs");
