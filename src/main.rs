@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use m3u8_rs::{MasterPlaylist, MediaPlaylist, VariantStream};
-use reqwest::{header, Client};
+use reqwest::{header, Client, StatusCode};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
@@ -20,10 +20,20 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod clip_detect;
+mod clip_gameplay;
+mod clip_layout;
 mod rolling_buffer;
+use clip_detect::{detect_layout_hints, read_clip_detect_config};
+use clip_layout::{
+    build_stacked_filter_graph, read_clip_layout_config, read_clip_layout_hints, ClipLayoutMode,
+    FilterGraph,
+};
 use rolling_buffer::RollingBuffer;
 mod stream_audio_wake;
-use stream_audio_wake::{start_mic_wake_with_ffmpeg, start_stream_wake_from_hls};
+use stream_audio_wake::{
+    detect_wake_in_file, start_mic_wake_with_ffmpeg, start_stream_wake_from_hls,
+};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -221,8 +231,9 @@ impl AutoClip {
 
         let hls = HlsClient::new()?;
         let (master_url, master) = hls.fetch_master_from_page(page_url).await?;
-        let media_url = hls.highest_variant_url(&master_url, &master)?;
-        println!("tracking variant: {}", media_url);
+        let initial_media_url = hls.highest_variant_url(&master_url, &master)?;
+        println!("tracking variant: {}", initial_media_url);
+        let media_url = Arc::new(Mutex::new(initial_media_url));
 
         let mut seen: HashSet<String> = HashSet::new();
         let mut stream_time = Duration::ZERO;
@@ -261,7 +272,7 @@ impl AutoClip {
             );
         } else {
             start_stream_wake_from_hls(
-                &media_url,
+                media_url.clone(),
                 Path::new(&model_path),
                 &self.config.activation_phrase,
                 self.config.log_raw_wake,
@@ -288,7 +299,7 @@ impl AutoClip {
 
         let poll_interval = Duration::from_millis(500);
 
-        loop {
+        'stream_loop: loop {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -306,9 +317,31 @@ impl AutoClip {
                 );
             }
 
-            let playlist = match hls.fetch_media(media_url.as_str()).await {
+            let media_url_snapshot = {
+                let guard = media_url
+                    .lock()
+                    .expect("media url lock poisoned while fetching playlist");
+                guard.clone()
+            };
+            let playlist = match hls.fetch_media(media_url_snapshot.as_str()).await {
                 Ok(p) => p,
                 Err(err) => {
+                    if is_http_status(&err, StatusCode::FORBIDDEN) {
+                        eprintln!("media playlist returned 403; refreshing via headless");
+                        match hls.refresh_media_url_from_page_headless(page_url).await {
+                            Ok(new_url) => {
+                                let mut guard = media_url
+                                    .lock()
+                                    .expect("media url lock poisoned while refreshing");
+                                *guard = new_url.clone();
+                                seen.clear();
+                                eprintln!("refreshed variant: {}", new_url);
+                            }
+                            Err(refresh_err) => {
+                                eprintln!("headless refresh failed: {refresh_err:#}");
+                            }
+                        }
+                    }
                     eprintln!("failed to fetch media playlist: {err:#}; retrying");
                     sleep(Duration::from_millis(800)).await;
                     continue;
@@ -323,7 +356,7 @@ impl AutoClip {
                     continue;
                 }
 
-                match hls.fetch_segment_from_playlist(&media_url, &uri).await {
+                match hls.fetch_segment_from_playlist(&media_url_snapshot, &uri).await {
                     Ok(bytes) => {
                         let seg_dur_playlist = Duration::from_secs_f32(seg.duration as f32);
                         let seg_dur = choose_segment_duration(
@@ -335,6 +368,23 @@ impl AutoClip {
                         made_progress = true;
                     }
                     Err(err) => {
+                        if is_http_status(&err, StatusCode::FORBIDDEN) {
+                            eprintln!("segment fetch returned 403; refreshing via headless");
+                            match hls.refresh_media_url_from_page_headless(page_url).await {
+                                Ok(new_url) => {
+                                    let mut guard = media_url
+                                        .lock()
+                                        .expect("media url lock poisoned while refreshing");
+                                    *guard = new_url;
+                                    seen.clear();
+                                }
+                                Err(refresh_err) => {
+                                    eprintln!("headless refresh failed: {refresh_err:#}");
+                                }
+                            }
+                            sleep(Duration::from_millis(800)).await;
+                            continue 'stream_loop;
+                        }
                         eprintln!("failed to fetch segment {}: {err:#}", uri);
                         continue;
                     }
@@ -760,6 +810,61 @@ fn parse_pts(data: &[u8]) -> Option<u64> {
     Some(pts)
 }
 
+#[derive(Debug)]
+struct HttpStatusError {
+    status: StatusCode,
+    url: String,
+}
+
+impl HttpStatusError {
+    fn new(status: StatusCode, url: &str) -> Self {
+        Self {
+            status,
+            url: url.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "non-success status {} for {}", self.status, self.url)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
+fn is_http_status(err: &anyhow::Error, status: StatusCode) -> bool {
+    err.downcast_ref::<HttpStatusError>()
+        .map(|e| e.status == status)
+        .unwrap_or(false)
+}
+
+fn collect_env_cookies() -> Option<String> {
+    let mut cookie_parts: Vec<String> = Vec::new();
+    for key in ["COOKIE_HEADER", "KICK_COOKIE", "TIKTOK_COOKIE", "TWITCH_COOKIE"] {
+        if let Ok(val) = std::env::var(key) {
+            if !val.trim().is_empty() {
+                cookie_parts.push(val);
+            }
+        }
+    }
+    if cookie_parts.is_empty() {
+        None
+    } else {
+        Some(cookie_parts.join("; "))
+    }
+}
+
+fn headless_script_for_page(page_url: &str) -> String {
+    if page_url.contains("tiktok.com") {
+        std::env::var("HEADLESS_M3U8_SCRIPT_TIKTOK")
+            .unwrap_or_else(|_| "scripts/capture_m3u8_tiktok.js".to_string())
+    } else {
+        std::env::var("HEADLESS_M3U8_SCRIPT")
+            .unwrap_or_else(|_| "scripts/capture_m3u8.js".to_string())
+    }
+}
+
 /// Minimal client to fetch and parse HLS playlists.
 #[derive(Clone)]
 pub struct HlsClient {
@@ -807,33 +912,16 @@ impl HlsClient {
 
     /// Fetch a page via headless Playwright, extract the first m3u8 URL, and parse
     /// it as a master playlist. Adds Referer/Origin tied to the page URL. Forwards
-    /// COOKIE_HEADER or KICK_COOKIE if present. If M3U8_URL_OVERRIDE is set, use
+    /// COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE / TWITCH_COOKIE if present. If
+    /// M3U8_URL_OVERRIDE is set, use
     /// that master URL directly instead of headless extraction.
     pub async fn fetch_master_from_page(&self, page_url: &str) -> Result<(String, MasterPlaylist)> {
-        let mut cookie_parts: Vec<String> = Vec::new();
-        for key in ["COOKIE_HEADER", "KICK_COOKIE", "TIKTOK_COOKIE"] {
-            if let Ok(val) = std::env::var(key) {
-                if !val.trim().is_empty() {
-                    cookie_parts.push(val);
-                }
-            }
-        }
-        let env_cookie = if cookie_parts.is_empty() {
-            None
-        } else {
-            Some(cookie_parts.join("; "))
-        };
-
+        let env_cookie = collect_env_cookies();
         let origin = origin_for_page(page_url).unwrap_or_else(|| "https://kick.com".to_string());
 
         let is_tiktok = page_url.contains("tiktok.com");
-        let headless_script = if is_tiktok {
-            std::env::var("HEADLESS_M3U8_SCRIPT_TIKTOK")
-                .unwrap_or_else(|_| "scripts/capture_m3u8_tiktok.js".to_string())
-        } else {
-            std::env::var("HEADLESS_M3U8_SCRIPT")
-                .unwrap_or_else(|_| "scripts/capture_m3u8.js".to_string())
-        };
+        let is_twitch = page_url.contains("twitch.tv");
+        let headless_script = headless_script_for_page(page_url);
 
         if let Ok(override_url) = std::env::var("M3U8_URL_OVERRIDE") {
             let master = self
@@ -851,7 +939,27 @@ impl HlsClient {
             }
             eprintln!("TikTok HTTP discovery failed or stream offline; falling back to headless");
         }
+        if is_twitch {
+            if let Some(res) = self
+                .try_fetch_twitch_master(page_url, env_cookie.as_deref())
+                .await?
+            {
+                return Ok(res);
+            }
+            eprintln!("Twitch HTTP discovery failed or stream offline; falling back to headless");
+        }
 
+        self.fetch_master_with_headless(page_url, env_cookie.as_deref(), &headless_script)
+            .await
+    }
+
+    /// Force a headless discovery pass to refresh the master playlist.
+    pub async fn fetch_master_from_page_headless(
+        &self,
+        page_url: &str,
+    ) -> Result<(String, MasterPlaylist)> {
+        let env_cookie = collect_env_cookies();
+        let headless_script = headless_script_for_page(page_url);
         self.fetch_master_with_headless(page_url, env_cookie.as_deref(), &headless_script)
             .await
     }
@@ -999,6 +1107,110 @@ impl HlsClient {
         Ok(Some((selected, master)))
     }
 
+    async fn try_fetch_twitch_master(
+        &self,
+        page_url: &str,
+        cookie_env: Option<&str>,
+    ) -> Result<Option<(String, MasterPlaylist)>> {
+        let login = match extract_twitch_login(page_url) {
+            Some(name) => name,
+            None => {
+                eprintln!("Twitch: could not determine channel login from URL");
+                return Ok(None);
+            }
+        };
+
+        let origin = origin_for_page(page_url).unwrap_or_else(|| "https://www.twitch.tv".to_string());
+        let cookie_header = cookie_env.filter(|c| !c.trim().is_empty());
+
+        let (sig, token) = match self
+            .fetch_twitch_playback_token(&login, page_url, Some(&origin), cookie_header)
+            .await
+        {
+            Ok(t) => t,
+            Err(err) => {
+                eprintln!("Twitch: playback token fetch failed: {err:#}");
+                return Ok(None);
+            }
+        };
+
+        let hls_url = build_twitch_hls_url(&login, &sig, &token)?;
+        let master = self
+            .fetch_master_with_headers(&hls_url, Some(page_url), Some(&origin), cookie_header)
+            .await?;
+        Ok(Some((hls_url, master)))
+    }
+
+    async fn fetch_twitch_playback_token(
+        &self,
+        login: &str,
+        referer: &str,
+        origin: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<(String, String)> {
+        const DEFAULT_TWITCH_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+        const TWITCH_PLAYBACK_HASH: &str =
+            "0828119ded2d05bcfcf8e4da97d91aa47a1ec89be12f0161a2367c6a6fc1ce2c";
+
+        let client_id = std::env::var("TWITCH_CLIENT_ID").unwrap_or_else(|_| DEFAULT_TWITCH_CLIENT_ID.to_string());
+        let auth_token = std::env::var("TWITCH_OAUTH_TOKEN")
+            .or_else(|_| std::env::var("TWITCH_AUTH_TOKEN"))
+            .ok()
+            .and_then(|v| twitch_auth_header(&v));
+
+        let payload = serde_json::json!({
+            "operationName": "PlaybackAccessToken",
+            "variables": {
+                "isLive": true,
+                "login": login,
+                "isVod": false,
+                "vodID": "",
+                "playerType": "site"
+            },
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": TWITCH_PLAYBACK_HASH
+                }
+            }
+        });
+
+        let mut req = self
+            .client
+            .post("https://gql.twitch.tv/gql")
+            .header("Client-ID", client_id)
+            .header(header::ACCEPT, "application/json")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("Referer", referer);
+        if let Some(o) = origin {
+            req = req.header("Origin", o);
+        }
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        if let Some(auth) = auth_token {
+            req = req.header(header::AUTHORIZATION, auth);
+        }
+
+        let resp = req
+            .json(&payload)
+            .send()
+            .await
+            .context("requesting Twitch playback token")?;
+        let status = resp.status();
+        let body = resp.text().await.context("reading Twitch playback token body")?;
+        if !status.is_success() {
+            eprintln!("Twitch token status {} body: {}", status, truncate_str(&body, 500));
+            anyhow::bail!("Twitch token request returned status {status}");
+        }
+
+        let json: Value = serde_json::from_str(&body).context("parsing Twitch token JSON")?;
+        if let Some((sig, value)) = extract_twitch_playback_token(&json) {
+            return Ok((sig, value));
+        }
+        anyhow::bail!("Twitch token response missing playback access token");
+    }
+
     async fn fetch_text_with_headers(
         &self,
         url: &str,
@@ -1124,6 +1336,12 @@ impl HlsClient {
         Ok(parsed)
     }
 
+    /// Refresh the best variant URL from a page using headless discovery.
+    pub async fn refresh_media_url_from_page_headless(&self, page_url: &str) -> Result<Url> {
+        let (master_url, master) = self.fetch_master_from_page_headless(page_url).await?;
+        self.highest_variant_url(&master_url, &master)
+    }
+
     /// Fetch the first media segment bytes from a media playlist URL.
     pub async fn fetch_first_segment(&self, playlist_url: &str) -> Result<Vec<u8>> {
         let media = self.fetch_media(playlist_url).await?;
@@ -1203,7 +1421,7 @@ impl HlsClient {
         if !status.is_success() {
             let preview = String::from_utf8_lossy(&bytes);
             eprintln!("fetch {} -> status {} body preview: {}", url, status, preview.chars().take(500).collect::<String>());
-            anyhow::bail!("non-success status {} for {}", status, url);
+            return Err(HttpStatusError::new(status, url).into());
         }
         Ok(bytes.to_vec())
     }
@@ -1415,6 +1633,124 @@ fn pick_best_tiktok_hls(candidates: &[(String, String)]) -> Option<String> {
     candidates.first().map(|(_, url)| url.clone())
 }
 
+fn extract_twitch_login(page_url: &str) -> Option<String> {
+    let url = Url::parse(page_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !host.ends_with("twitch.tv") {
+        return None;
+    }
+
+    for (k, v) in url.query_pairs() {
+        if k.eq_ignore_ascii_case("channel") || k.eq_ignore_ascii_case("login") {
+            if is_valid_twitch_login(&v) {
+                return Some(v.to_string());
+            }
+        }
+    }
+
+    let mut segments = url.path_segments()?.filter(|s| !s.is_empty());
+    let first = segments.next()?;
+    let first_lc = first.to_ascii_lowercase();
+    if first_lc == "popout" || first_lc == "embed" {
+        if let Some(next) = segments.next() {
+            if is_valid_twitch_login(next) {
+                return Some(next.to_string());
+            }
+        }
+    }
+
+    if is_valid_twitch_login(first) {
+        return Some(first.to_string());
+    }
+
+    None
+}
+
+fn is_valid_twitch_login(login: &str) -> bool {
+    let lower = login.to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let reserved = [
+        "videos",
+        "directory",
+        "p",
+        "settings",
+        "downloads",
+        "friends",
+        "inventory",
+        "jobs",
+        "store",
+        "login",
+        "signup",
+        "search",
+        "prime",
+        "bits",
+    ];
+    if reserved.contains(&lower.as_str()) {
+        return false;
+    }
+    login.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn twitch_auth_header(token: &str) -> Option<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("oauth ") {
+        return Some(trimmed.to_string());
+    }
+    if lower.starts_with("oauth:") {
+        return Some(format!("OAuth {}", trimmed[6..].trim()));
+    }
+    if lower.starts_with("bearer ") {
+        return Some(format!("OAuth {}", trimmed[7..].trim()));
+    }
+    Some(format!("OAuth {}", trimmed))
+}
+
+fn extract_twitch_playback_token(value: &Value) -> Option<(String, String)> {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(tok) = extract_twitch_playback_token(item) {
+                    return Some(tok);
+                }
+            }
+            None
+        }
+        Value::Object(_) => {
+            let data = value.get("data")?;
+            let token = data
+                .get("streamPlaybackAccessToken")
+                .or_else(|| data.get("playbackAccessToken"))?;
+            let sig = token.get("signature")?.as_str()?;
+            let value = token.get("value")?.as_str()?;
+            Some((sig.to_string(), value.to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn build_twitch_hls_url(login: &str, sig: &str, token: &str) -> Result<String> {
+    let mut url = Url::parse(&format!("https://usher.ttvnw.net/api/channel/hls/{login}.m3u8"))
+        .context("parsing Twitch usher URL")?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("sig", sig);
+        pairs.append_pair("token", token);
+        pairs.append_pair("allow_source", "true");
+        pairs.append_pair("allow_audio_only", "true");
+        pairs.append_pair("allow_spectre", "true");
+        pairs.append_pair("player", "twitchweb");
+        pairs.append_pair("playlist_include_framerate", "true");
+        pairs.append_pair("fast_bread", "true");
+    }
+    Ok(url.to_string())
+}
+
 /// Compare variants by average bandwidth, then bandwidth, then resolution pixels, then fallback to order.
 fn compare_variant_quality(a: &VariantStream, b: &VariantStream) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -1487,6 +1823,9 @@ fn auto_assign_gpus_for_tools() {
     let user_encoder = std::env::var("FFMPEG_ENCODER")
         .ok()
         .filter(|v| !v.trim().is_empty());
+    let user_whisper = std::env::var("WHISPER_GPU")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
 
     let gpus = detect_nvidia_gpus();
     if !gpus.is_empty() {
@@ -1494,7 +1833,10 @@ fn auto_assign_gpus_for_tools() {
         let whisper_gpu = gpus[0].0;
         let ffmpeg_gpu = if gpus.len() > 1 { gpus[1].0 } else { whisper_gpu };
 
-        std::env::set_var("WHISPER_GPU", whisper_gpu.to_string());
+        if user_whisper.is_none() {
+            std::env::set_var("WHISPER_GPU", whisper_gpu.to_string());
+            eprintln!("auto GPU assign for whisper: {}", whisper_gpu);
+        }
         if user_hwaccel.is_none() {
             std::env::set_var("FFMPEG_HWACCEL", "cuda");
             std::env::set_var("FFMPEG_HWACCEL_DEVICE", ffmpeg_gpu.to_string());
@@ -1502,7 +1844,6 @@ fn auto_assign_gpus_for_tools() {
         if user_encoder.is_none() && ffmpeg_has_encoder("h264_nvenc") {
             std::env::set_var("FFMPEG_ENCODER", "h264_nvenc");
         }
-        eprintln!("auto GPU assign for whisper: {}", whisper_gpu);
         if user_hwaccel.is_none() {
             eprintln!("auto GPU assign for ffmpeg: {}", ffmpeg_gpu);
         }
@@ -1911,137 +2252,6 @@ fn build_ffmpeg_filters(out_w: u32, out_h: u32) -> (String, String, String) {
     (vf_cpu, vf_gpu_sw, vf_gpu_hw)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ClipLayoutMode {
-    Full,
-    Stacked,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum FaceAnchor {
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-    Center,
-}
-
-#[derive(Clone, Debug)]
-struct ClipLayoutConfig {
-    mode: ClipLayoutMode,
-    face_ratio: f32,
-    face_crop: Option<String>,
-    face_anchor: FaceAnchor,
-}
-
-#[derive(Clone, Debug)]
-enum FilterGraph {
-    Vf(String),
-    Complex { graph: String, output: String },
-}
-
-fn read_clip_layout_config() -> ClipLayoutConfig {
-    let mode = std::env::var("CLIP_LAYOUT")
-        .ok()
-        .map(|v| v.to_ascii_lowercase())
-        .and_then(|v| match v.trim() {
-            "stacked" | "tiktok" | "stack" | "split" => Some(ClipLayoutMode::Stacked),
-            "full" | "default" | "" => Some(ClipLayoutMode::Full),
-            _ => None,
-        })
-        .unwrap_or(ClipLayoutMode::Full);
-
-    let face_ratio = std::env::var("CLIP_FACE_RATIO")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .map(|v| v.clamp(0.2, 0.8))
-        .unwrap_or(0.40);
-
-    let face_crop = std::env::var("CLIP_FACE_CROP")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("none"))
-        .map(|v| v.strip_prefix("crop=").unwrap_or(&v).to_string());
-
-    let face_anchor = std::env::var("CLIP_FACE_ANCHOR")
-        .ok()
-        .map(|v| v.to_ascii_lowercase())
-        .and_then(|v| match v.trim() {
-            "top-right" | "right-top" | "tr" => Some(FaceAnchor::TopRight),
-            "bottom-left" | "left-bottom" | "bl" => Some(FaceAnchor::BottomLeft),
-            "bottom-right" | "right-bottom" | "br" => Some(FaceAnchor::BottomRight),
-            "center" | "centre" | "middle" => Some(FaceAnchor::Center),
-            "top-left" | "left-top" | "tl" | "" => Some(FaceAnchor::TopLeft),
-            _ => None,
-        })
-        .unwrap_or(FaceAnchor::TopLeft);
-
-    ClipLayoutConfig {
-        mode,
-        face_ratio,
-        face_crop,
-        face_anchor,
-    }
-}
-
-fn resolve_layout_heights(out_h: u32, face_ratio: f32) -> (u32, u32) {
-    let mut face_h = (out_h as f32 * face_ratio).round() as u32;
-    if face_h < 2 {
-        face_h = 2;
-    }
-    if face_h >= out_h {
-        face_h = out_h.saturating_sub(2);
-    }
-    if face_h % 2 != 0 {
-        face_h = face_h.saturating_sub(1);
-    }
-    let mut game_h = out_h.saturating_sub(face_h);
-    if game_h % 2 != 0 {
-        game_h = game_h.saturating_sub(1);
-        face_h = out_h.saturating_sub(game_h);
-    }
-    (face_h.max(2), game_h.max(2))
-}
-
-fn default_face_crop_expr(anchor: FaceAnchor) -> String {
-    const FACE_CROP_W_RATIO: f32 = 0.6;
-    const FACE_CROP_H_RATIO: f32 = 0.6;
-    let w = format!("iw*{:.3}", FACE_CROP_W_RATIO);
-    let h = format!("ih*{:.3}", FACE_CROP_H_RATIO);
-    let x = match anchor {
-        FaceAnchor::TopLeft | FaceAnchor::BottomLeft => "0".to_string(),
-        FaceAnchor::TopRight | FaceAnchor::BottomRight => format!("iw-({w})"),
-        FaceAnchor::Center => format!("(iw-({w}))/2"),
-    };
-    let y = match anchor {
-        FaceAnchor::TopLeft | FaceAnchor::TopRight => "0".to_string(),
-        FaceAnchor::BottomLeft | FaceAnchor::BottomRight => format!("ih-({h})"),
-        FaceAnchor::Center => format!("(ih-({h}))/2"),
-    };
-    format!("{w}:{h}:{x}:{y}")
-}
-
-fn build_stacked_filter_graph(out_w: u32, out_h: u32, layout: &ClipLayoutConfig) -> FilterGraph {
-    let (face_h, game_h) = resolve_layout_heights(out_h, layout.face_ratio);
-    let face_crop = layout
-        .face_crop
-        .clone()
-        .unwrap_or_else(|| default_face_crop_expr(layout.face_anchor));
-    let face_chain = format!(
-        "crop={face_crop},scale={out_w}:{face_h}:force_original_aspect_ratio=increase,crop={out_w}:{face_h}"
-    );
-    let game_chain = format!(
-        "scale={out_w}:{game_h}:force_original_aspect_ratio=increase,crop={out_w}:{game_h}"
-    );
-    let graph = format!(
-        "[0:v]split=2[face_src][game_src];[face_src]{face_chain}[face];[game_src]{game_chain}[game];[face][game]vstack=inputs=2,format=yuv420p[v]"
-    );
-    FilterGraph::Complex {
-        graph,
-        output: "v".to_string(),
-    }
-}
-
 fn tail_trunc(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -2162,13 +2372,53 @@ async fn run_ffmpeg_internal(
         is_hw = false;
     }
     let layout = read_clip_layout_config();
-    let layout_is_stacked = matches!(layout.mode, ClipLayoutMode::Stacked);
+    let mut layout_hints = read_clip_layout_hints();
+    let mut layout_is_stacked = matches!(layout.mode, ClipLayoutMode::Stacked);
+    if layout_is_stacked {
+        let detect_cfg = read_clip_detect_config();
+        let need_face = layout.face_crop.is_none() && layout_hints.face_box.is_none();
+        let need_game = layout_hints.game_center.is_none();
+        if detect_cfg.enabled && (need_face || need_game) {
+            match detect_layout_hints(input, &detect_cfg).await {
+                Ok(detected) => {
+                    if need_face {
+                        if let Some(face) = detected.face_box {
+                            layout_hints.face_box = Some(face);
+                            eprintln!(
+                                "clip detect: face box x={:.3} y={:.3} w={:.3} h={:.3}",
+                                face.x, face.y, face.w, face.h
+                            );
+                        }
+                    }
+                    if need_game {
+                        if let Some(center) = detected.game_center {
+                            layout_hints.game_center = Some(center);
+                            eprintln!(
+                                "clip detect: game center x={:.3} y={:.3}",
+                                center.x, center.y
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("clip detect: detection failed: {err:#}");
+                }
+            }
+        }
+        if layout.face_crop.is_none()
+            && layout_hints.face_box.is_none()
+            && layout_hints.face_track.is_none()
+        {
+            layout_is_stacked = false;
+            eprintln!("clip layout: no streamer cam detected; using full-frame layout");
+        }
+    }
     let hwaccel = std::env::var("FFMPEG_HWACCEL").unwrap_or_default();
     let hw_decode_cuda = is_nvenc && hwaccel.eq_ignore_ascii_case("cuda");
     let (vf_cpu, vf_gpu_sw, vf_gpu_hw) = build_ffmpeg_filters(out_w, out_h);
     let vf_gpu = if hw_decode_cuda { vf_gpu_hw.clone() } else { vf_gpu_sw.clone() };
     let filter_cpu = if layout_is_stacked {
-        build_stacked_filter_graph(out_w, out_h, &layout)
+        build_stacked_filter_graph(out_w, out_h, &layout, &layout_hints)
     } else {
         FilterGraph::Vf(vf_cpu)
     };
@@ -2339,6 +2589,20 @@ async fn main() -> Result<()> {
             }
             return run_hls_buffer_demo(&page).await;
         }
+        if cmd.eq_ignore_ascii_case("demo-ts") || cmd.eq_ignore_ascii_case("demo-file") {
+            let Some(path) = args.get(2) else {
+                eprintln!("usage: autoclip demo-ts <ts_path> [--phrase WORD] [--no-log-raw-wake]");
+                return Ok(());
+            };
+            return run_ts_wake_demo(path, override_phrase, log_raw_wake).await;
+        }
+        if cmd.eq_ignore_ascii_case("demo-detect") || cmd.eq_ignore_ascii_case("demo-face") {
+            let Some(path) = args.get(2) else {
+                eprintln!("usage: autoclip demo-detect <media_path>");
+                return Ok(());
+            };
+            return run_clip_detect_demo(path).await;
+        }
         if cmd.eq_ignore_ascii_case("demo-wakeword-mic") {
             let opts = parse_mic_args(&args[2..])?;
             return run_wakeword_mic_demo(opts).await;
@@ -2480,6 +2744,84 @@ async fn run_wakeword_mic_demo(opts: MicOpts) -> Result<()> {
     app.run_until_wake_and_clip(&opts.page_url).await
 }
 
+/// Replay a local TS file to detect a wake phrase and cut a stacked clip.
+async fn run_ts_wake_demo(
+    ts_path: &str,
+    phrase: Option<String>,
+    log_raw_wake: bool,
+) -> Result<()> {
+    let path = Path::new(ts_path);
+    if !path.exists() {
+        anyhow::bail!("TS file not found: {}", path.display());
+    }
+
+    let mut cfg = Config::example();
+    if let Some(p) = phrase {
+        cfg.activation_phrase = p;
+    }
+    cfg.log_raw_wake = log_raw_wake;
+
+    let model_path = stream_audio_wake::select_best_model_path();
+    let ts_path_buf = path.to_path_buf();
+    let wake_phrase = cfg.activation_phrase.clone();
+    let detect = tokio::task::spawn_blocking(move || {
+        detect_wake_in_file(&ts_path_buf, Path::new(&model_path), &wake_phrase, log_raw_wake)
+    })
+    .await??;
+
+    let Some(detect_secs) = detect else {
+        eprintln!("wake phrase '{}' not detected in file", cfg.activation_phrase);
+        return Ok(());
+    };
+
+    if std::env::var("CLIP_LAYOUT").is_err() {
+        std::env::set_var("CLIP_LAYOUT", "stacked");
+    }
+
+    let before = Duration::from_secs(cfg.before_buffer_length as u64);
+    let after = Duration::from_secs(cfg.after_buffer_length as u64);
+    let clip_len = before + after;
+    let start_secs = detect_secs - before.as_secs_f32();
+    let start_offset = if start_secs > 0.0 {
+        Some(start_secs)
+    } else {
+        None
+    };
+
+    let output_path = next_output_path(&cfg.save_path, &cfg.file_name_stub)?;
+    let (out_w, out_h) = parse_resolution(&cfg.resolution).unwrap_or((1080, 1920));
+    run_ffmpeg_from_file(path, &output_path, out_w, out_h, clip_len, start_offset, None).await?;
+    println!("wrote clipped video to {}", output_path.display());
+
+    Ok(())
+}
+
+/// Run face/reticle detection on a local media file and print the hints.
+async fn run_clip_detect_demo(path: &str) -> Result<()> {
+    let input = Path::new(path);
+    if !input.exists() {
+        anyhow::bail!("media file not found: {}", input.display());
+    }
+
+    let cfg = read_clip_detect_config();
+    let hints = detect_layout_hints(path, &cfg).await?;
+    if let Some(face) = hints.face_box {
+        println!(
+            "demo-detect: face x={:.3} y={:.3} w={:.3} h={:.3}",
+            face.x, face.y, face.w, face.h
+        );
+    } else {
+        println!("demo-detect: no face detected");
+    }
+    if let Some(center) = hints.game_center {
+        println!("demo-detect: game center x={:.3} y={:.3}", center.x, center.y);
+    } else {
+        println!("demo-detect: no reticle detected");
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct MicOpts {
     page_url: String,
@@ -2618,6 +2960,8 @@ fn print_help(bin: &str) {
     println!("  {bin} <page_url> [options]");
     println!("  {bin} demo-buffer");
     println!("  {bin} demo-hls-buffer <page_url>");
+    println!("  {bin} demo-ts <path_to_ts> [--phrase WORD] [--no-log-raw-wake]");
+    println!("  {bin} demo-detect <media_path>");
     println!("  {bin} demo-wakeword-mic <page_url> [--phrase WORD] [--log-raw-wake] [--mic-device NAME]");
     println!("");
     println!("Options:");
@@ -2631,10 +2975,24 @@ fn print_help(bin: &str) {
     println!("  CLIP_PAGE_URL            Default page when none is passed");
     println!("  CLIP_LAYOUT              Layout mode: full (default) or stacked/tiktok");
     println!("  CLIP_FACE_RATIO          Height ratio reserved for face panel (default 0.40)");
-    println!("  CLIP_FACE_CROP           Face crop expr w:h:x:y (optional, overrides anchor)");
+    println!("  CLIP_FACE_CROP           Face crop expr w:h:x:y (optional, overrides detection/anchor)");
+    println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 1.8)");
+    println!("  CLIP_FACE_BOX            Normalized face box x:y:w:h (0..1) for auto-crop");
     println!("  CLIP_FACE_ANCHOR         Anchor for default face crop (top-left default)");
+    println!("  CLIP_GAME_CENTER         Normalized gameplay center x:y (0..1) for reticle centering");
+    println!("  CLIP_FACE_MODEL          Face detector model path (default models/face_detection_yunet_2023mar.onnx)");
+    println!("  CLIP_FACE_SCORE          Face detection confidence threshold (default 0.5)");
+    println!("  CLIP_FACE_DEBUG          Log face detector outputs and best score");
+    println!("  CLIP_FACE_TRACK          Track face across the full clip (default true)");
+    println!("  CLIP_DETECT              Enable auto-detection for stacked layout (default true)");
+    println!("  CLIP_DETECT_SIZE         Reticle detection frame size WxH (default 960x540)");
+    println!("  CLIP_DETECT_SAMPLES      Number of detection frames to sample (default 3)");
+    println!("  CLIP_DETECT_START        Detection sample start time in seconds (default 1.0)");
+    println!("  CLIP_DETECT_STEP         Seconds between detection samples (default 1.5)");
+    println!("  CLIP_DETECT_FULL         Sample detection frames across the full clip (local files only)");
+    println!("  CLIP_TS_REALTIME         When set, read local TS files at realtime speed");
     println!("  M3U8_URL_OVERRIDE        Skip discovery; use this master URL directly");
-    println!("  COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE   Cookies to send on discovery");
+    println!("  COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE / TWITCH_COOKIE   Cookies to send on discovery");
     println!("  HEADLESS_M3U8_SCRIPT / HEADLESS_M3U8_SCRIPT_TIKTOK   Override Playwright scripts");
     println!("  WAKE_REFRACTORY_SECS     Cooldown between wake detections (default 12)");
     println!("  WAKE_BUFFER_HEADROOM_SECS   Extra buffer headroom for wake timing (default 20)");
@@ -2643,6 +3001,8 @@ fn print_help(bin: &str) {
     println!("  FFMPEG_ENCODER / FFMPEG_HWACCEL / FFMPEG_HWACCEL_DEVICE   Encoder/accel knobs");
     println!("  FFMPEG_HWACCEL_FALLBACK  Fallback hwaccel (e.g. d3d11va, cuda, none; default none)");
     println!("  LOG_M3U8_HEADERS         Log request headers when fetching playlists");
+    println!("  TWITCH_CLIENT_ID         Twitch Client-ID for playback token (default web client)");
+    println!("  TWITCH_OAUTH_TOKEN / TWITCH_AUTH_TOKEN   Twitch OAuth token for gated streams (optional)");
     println!("");
     println!("Notes:");
     println!("  - Main path: page URL -> HLS discovery (TikTok HTTP first, headless fallback) -> wake detection -> clip.");
@@ -2726,5 +3086,18 @@ mod tests {
         assert_eq!(truncate_str("short", 10), "short");
         assert_eq!(truncate_str("0123456789", 10), "0123456789");
         assert_eq!(truncate_str("0123456789A", 10), "0123456...");
+    }
+
+    #[test]
+    fn extract_twitch_login_from_url() {
+        assert_eq!(
+            extract_twitch_login("https://www.twitch.tv/rynn?twitch5=0"),
+            Some("rynn".to_string())
+        );
+        assert_eq!(
+            extract_twitch_login("https://player.twitch.tv/?channel=rynn"),
+            Some("rynn".to_string())
+        );
+        assert_eq!(extract_twitch_login("https://www.twitch.tv/directory"), None);
     }
 }

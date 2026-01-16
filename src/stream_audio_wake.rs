@@ -1,9 +1,12 @@
 use std::env;
+use std::ffi::CStr;
 use std::io::{ErrorKind, Read};
+use std::os::raw::{c_char, c_uint, c_void};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -17,16 +20,21 @@ const STEP_MS: usize = 1_000; // inference cadence
 const DEFAULT_RT_TARGET: f32 = 0.9;
 
 const NO_DETECT: u64 = u64::MAX;
+const GGML_LOG_LEVEL_DEBUG: c_uint = 5;
+
+static WHISPER_LOG_ONCE: Once = Once::new();
+static WHISPER_LOG_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 struct WhisperHandle {
     model_path: PathBuf,
     ctx: &'static WhisperContext,
-    state: whisper_rs::WhisperState<'static>,
+    state: whisper_rs::WhisperState,
     use_gpu: bool,
 }
 
 impl WhisperHandle {
     fn new(model_path: &Path) -> Result<Self> {
+        install_whisper_log_filter();
         let model_path = model_path.to_path_buf();
         let prefer_gpu = whisper_prefers_gpu();
         let (ctx, use_gpu) = create_whisper_context(&model_path, prefer_gpu)
@@ -38,7 +46,9 @@ impl WhisperHandle {
                     Err(err)
                 }
             })?;
+        eprintln!("whisper: creating state (use_gpu={use_gpu})");
         let state = ctx.create_state().context("creating whisper state")?;
+        eprintln!("whisper: state created (use_gpu={use_gpu})");
         Ok(Self {
             model_path,
             ctx,
@@ -53,7 +63,9 @@ impl WhisperHandle {
             Err(err) if self.use_gpu => {
                 eprintln!("whisper GPU path failed during inference: {err:#}; retrying on CPU");
                 let (ctx, _) = create_whisper_context(&self.model_path, false)?;
+                eprintln!("whisper: creating CPU state after GPU failure");
                 let state = ctx.create_state().context("creating whisper state")?;
+                eprintln!("whisper: CPU state created after GPU failure");
                 self.ctx = ctx;
                 self.state = state;
                 self.use_gpu = false;
@@ -62,6 +74,36 @@ impl WhisperHandle {
             Err(err) => Err(err),
         }
     }
+}
+
+fn install_whisper_log_filter() {
+    WHISPER_LOG_ONCE.call_once(|| {
+        let enable_debug = env::var("WHISPER_LOG_LEVEL")
+            .or_else(|_| env::var("GGML_LOG_LEVEL"))
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .map(|v| matches!(v.as_str(), "debug" | "trace"))
+            .unwrap_or(false);
+        WHISPER_LOG_DEBUG_ENABLED.store(enable_debug, Ordering::Relaxed);
+        unsafe {
+            whisper_rs::set_log_callback(Some(whisper_log_callback), std::ptr::null_mut());
+        }
+    });
+}
+
+unsafe extern "C" fn whisper_log_callback(
+    level: c_uint,
+    text: *const c_char,
+    _user_data: *mut c_void,
+) {
+    if text.is_null() {
+        return;
+    }
+    if level == GGML_LOG_LEVEL_DEBUG && !WHISPER_LOG_DEBUG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let msg = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    eprint!("{}", msg);
 }
 
 fn whisper_prefers_gpu() -> bool {
@@ -83,6 +125,7 @@ fn create_whisper_context(
     let mut wparams = WhisperContextParameters::default();
     wparams.use_gpu = use_gpu;
 
+    eprintln!("whisper: initializing context (use_gpu={use_gpu})");
     let ctx = WhisperContext::new_with_params(
         model_path
             .to_str()
@@ -90,6 +133,7 @@ fn create_whisper_context(
         wparams,
     )
     .context("loading whisper model")?;
+    eprintln!("whisper: context initialized (use_gpu={use_gpu})");
     // Leak the context so the state can borrow it for the process lifetime.
     let ctx = Box::leak(Box::new(ctx));
     Ok((ctx, use_gpu))
@@ -301,7 +345,7 @@ fn benchmark_model_rt(path: &Path) -> Option<f32> {
         .ok()?;
     let mut state = ctx.create_state().ok()?;
 
-    let mut params = FullParams::new(SamplingStrategy::default());
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_special(false);
@@ -322,7 +366,7 @@ fn benchmark_model_rt(path: &Path) -> Option<f32> {
 
 /// Listen to stream audio (HLS) via ffmpeg, run Whisper locally, and fire when the wake phrase is detected.
 pub fn start_stream_wake_from_hls(
-    media_url: &Url,
+    media_url: Arc<Mutex<Url>>,
     model_path: &Path,
     wake_phrase: &str,
     log_raw: bool,
@@ -337,7 +381,15 @@ pub fn start_stream_wake_from_hls(
     let wake = normalize(wake_phrase);
     std::thread::spawn(move || {
         if let Err(err) = run_wake_loop_with_spawn(
-            move || spawn_ffmpeg_pcm(&media_url),
+            move || {
+                let url = {
+                    let guard = media_url
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("media url lock poisoned"))?;
+                    guard.clone()
+                };
+                spawn_ffmpeg_pcm(&url)
+            },
             &model_path,
             &wake,
             log_raw,
@@ -351,6 +403,23 @@ pub fn start_stream_wake_from_hls(
         }
     });
     Ok(())
+}
+
+/// Detect the wake phrase inside a local media file (TS/MP4/etc) and return its timestamp (seconds).
+pub fn detect_wake_in_file(
+    input_path: &Path,
+    model_path: &Path,
+    wake_phrase: &str,
+    log_raw: bool,
+) -> Result<Option<f32>> {
+    let wake = normalize(wake_phrase);
+    let mut whisper = WhisperHandle::new(model_path)?;
+    log_whisper_backend();
+
+    let (mut ffmpeg, mut pcm_reader) = spawn_ffmpeg_pcm_file(input_path)?;
+    let result = run_wake_loop_file(&mut whisper, &mut *pcm_reader, &wake, log_raw);
+    let _ = ffmpeg.kill();
+    result
 }
 
 /// Listen to microphone audio via ffmpeg, run Whisper locally, and fire when the wake phrase is detected.
@@ -387,7 +456,7 @@ pub fn start_mic_wake_with_ffmpeg(
 }
 
 fn transcribe_window(state: &mut whisper_rs::WhisperState, audio: &[f32]) -> Result<Option<(String, f32, f32)>> {
-    let mut params = FullParams::new(SamplingStrategy::default());
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_special(false);
@@ -398,18 +467,89 @@ fn transcribe_window(state: &mut whisper_rs::WhisperState, audio: &[f32]) -> Res
     params.set_no_speech_thold(0.6);
 
     state.full(params, audio).context("running whisper")?;
-    let num_segments = state.full_n_segments().context("segment count")?;
+    let num_segments = state.full_n_segments();
     for i in 0..num_segments {
-        let text = state.full_get_segment_text(i).context("segment text")?;
-        let t0 = state.full_get_segment_t0(i).context("segment t0")?;
-        let t1 = state.full_get_segment_t1(i).context("segment t1")?;
-        let t0_secs = t0 as f32 * 0.01;
-        let t1_secs = t1 as f32 * 0.01;
+        let segment = match state.get_segment(i) {
+            Some(segment) => segment,
+            None => continue,
+        };
+        let text = segment.to_str().context("segment text")?;
+        let t0_secs = segment.start_timestamp() as f32 * 0.01;
+        let t1_secs = segment.end_timestamp() as f32 * 0.01;
         let trimmed = text.trim();
         if !trimmed.is_empty() {
             return Ok(Some((trimmed.to_string(), t0_secs, t1_secs)));
         }
     }
+    Ok(None)
+}
+
+fn run_wake_loop_file(
+    whisper: &mut WhisperHandle,
+    pcm_reader: &mut dyn Read,
+    wake_norm: &str,
+    log_raw: bool,
+) -> Result<Option<f32>> {
+    let chunk_samples = SAMPLE_RATE * CHUNK_MS / 1000;
+    let chunk_bytes = chunk_samples * 2; // s16le
+    let window_samples = SAMPLE_RATE * WINDOW_MS / 1000;
+    let step = Duration::from_millis(STEP_MS as u64);
+
+    let mut buf = vec![0i16; chunk_samples];
+    let mut pcm: Vec<f32> = Vec::with_capacity(window_samples);
+    let mut total_samples: u64 = 0;
+    let mut last_run = Instant::now();
+
+    loop {
+        if let Err(err) = read_exact_i16(pcm_reader, &mut buf, chunk_bytes) {
+            if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+                if io_err.kind() == ErrorKind::UnexpectedEof || io_err.kind() == ErrorKind::BrokenPipe {
+                    break;
+                }
+            }
+            eprintln!("file wake: ffmpeg read ended: {err:#}");
+            break;
+        }
+
+        for s in &buf {
+            pcm.push(*s as f32 / 32768.0);
+        }
+        total_samples = total_samples.saturating_add(chunk_samples as u64);
+        if pcm.len() > window_samples {
+            let drop = pcm.len() - window_samples;
+            pcm.drain(0..drop);
+        }
+
+        if last_run.elapsed() < step || pcm.len() < SAMPLE_RATE {
+            continue;
+        }
+        last_run = Instant::now();
+
+        if let Some((text, seg_t0_secs, seg_t1_secs)) =
+            whisper.transcribe_with_fallback(&pcm)?
+        {
+            let window_start_secs = (total_samples.saturating_sub(pcm.len() as u64) as f32)
+                / SAMPLE_RATE as f32;
+            let norm = normalize(&text);
+            if log_raw && !norm.is_empty() {
+                println!("file raw: {}", text.trim());
+            }
+            if norm.contains(wake_norm) {
+                let match_pos = norm.find(wake_norm).unwrap_or(0);
+                let seg_span = (seg_t1_secs - seg_t0_secs).max(0.0);
+                let frac = if !norm.is_empty() {
+                    (match_pos as f32 / norm.len() as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let phrase_start_secs = (seg_t0_secs + frac * seg_span).max(0.0);
+                let abs_t0_secs = (window_start_secs + phrase_start_secs).max(0.0);
+                eprintln!("wake phrase detected in file audio: {norm}");
+                return Ok(Some(abs_t0_secs));
+            }
+        }
+    }
+
     Ok(None)
 }
 
@@ -440,6 +580,43 @@ fn spawn_ffmpeg_pcm(media_url: &Url) -> Result<(Child, Box<dyn Read + Send>)> {
         .spawn()
         .map_err(ffmpeg_spawn_err)
         .context("spawning ffmpeg for stream audio")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("ffmpeg stdout missing"))?;
+    Ok((child, Box::new(stdout)))
+}
+
+fn spawn_ffmpeg_pcm_file(input_path: &Path) -> Result<(Child, Box<dyn Read + Send>)> {
+    let mut cmd = Command::new(ffmpeg_bin());
+    cmd.arg("-nostdin");
+    if std::env::var("CLIP_TS_REALTIME")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+    {
+        cmd.arg("-re");
+    }
+
+    cmd.arg("-i")
+        .arg(input_path)
+        .args(wake_af_flags())
+        .arg("-vn")
+        .arg("-f")
+        .arg("s16le")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg(format!("{}", SAMPLE_RATE))
+        .arg("-")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(ffmpeg_spawn_err)
+        .context("spawning ffmpeg for file audio")?;
     let stdout = child
         .stdout
         .take()
