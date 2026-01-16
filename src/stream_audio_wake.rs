@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::CStr;
 use std::io::{ErrorKind, Read};
-use std::os::raw::{c_char, c_uint, c_void};
+use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,7 @@ const STEP_MS: usize = 1_000; // inference cadence
 const DEFAULT_RT_TARGET: f32 = 0.9;
 
 const NO_DETECT: u64 = u64::MAX;
-const GGML_LOG_LEVEL_DEBUG: c_uint = 5;
+const GGML_LOG_LEVEL_DEBUG: c_int = 5;
 
 static WHISPER_LOG_ONCE: Once = Once::new();
 static WHISPER_LOG_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -92,7 +92,7 @@ fn install_whisper_log_filter() {
 }
 
 unsafe extern "C" fn whisper_log_callback(
-    level: c_uint,
+    level: c_int,
     text: *const c_char,
     _user_data: *mut c_void,
 ) {

@@ -375,7 +375,8 @@ function Build-WhisperCuda {
         Write-Host "Using CMAKE_CUDA_ARCHITECTURES='$WhisperCudaArch' (GGML_CUDA_ARCHITECTURES)" -ForegroundColor Yellow
     }
     $currentFlags = "flags=$WhisperCudaFlags`narch=$WhisperCudaArch"
-    $lastFlags = if (Test-Path $flagsPath) { Get-Content -Raw $flagsPath } else { '' }
+    $lastFlags = if (Test-Path $flagsPath) { (Get-Content -Raw $flagsPath).Trim() } else { '' }
+    $currentFlags = $currentFlags.Trim()
     $lastSucceeded = Test-Path $successPath
     $shouldClean = $false
     if ((-not $WhisperCudaFlags) -and (-not $WhisperCudaArch)) {
