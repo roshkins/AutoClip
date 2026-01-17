@@ -40,6 +40,7 @@ pub struct ClipDetectConfig {
     pub scan_full_clip: bool,
     pub track_face: bool,
     pub face_track_step_secs: Option<f32>,
+    pub face_budget_override: Option<Duration>,
     pub analysis_budget: Option<Duration>,
 }
 
@@ -157,6 +158,11 @@ pub fn read_clip_detect_config() -> ClipDetectConfig {
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
         .map(Duration::from_secs_f32);
+    let face_budget_override = std::env::var("CLIP_FACE_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(Duration::from_secs_f32);
 
     let face_model_path = std::env::var("CLIP_FACE_MODEL")
         .ok()
@@ -182,6 +188,7 @@ pub fn read_clip_detect_config() -> ClipDetectConfig {
         scan_full_clip: scan_full_clip || track_face,
         track_face,
         face_track_step_secs,
+        face_budget_override,
         analysis_budget,
     }
 }
@@ -203,7 +210,18 @@ struct FaceSweepInput {
 
 fn split_analysis_budget(
     budget: Option<Duration>,
+    face_override: Option<Duration>,
 ) -> (Option<Duration>, Option<Duration>) {
+    if let Some(face_override) = face_override {
+        if let Some(total) = budget {
+            let face_budget = face_override.min(total);
+            let gameplay_budget = total.checked_sub(face_budget);
+            let gameplay_budget = gameplay_budget
+                .filter(|v| v.as_secs_f32().is_finite() && v.as_secs_f32() > 0.0);
+            return (Some(face_budget), gameplay_budget);
+        }
+        return (Some(face_override), None);
+    }
     let Some(budget) = budget else {
         return (None, None);
     };
@@ -501,7 +519,8 @@ pub async fn detect_layout_hints(
             config.sample_step_secs.max(0.0)
         );
     }
-    let (face_budget, gameplay_budget) = split_analysis_budget(config.analysis_budget);
+    let (face_budget, gameplay_budget) =
+        split_analysis_budget(config.analysis_budget, config.face_budget_override);
     let has_budget = config.analysis_budget.is_some();
 
     let mut face_samples: Vec<FaceSample> = Vec::new();

@@ -2754,6 +2754,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FACE_DEBUG", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_FACE_TRACK", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_AUDIO_NORM", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FACE_BUDGET_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_DETECT", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_DETECT_SIZE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_DETECT_SAMPLES", mode: EnvValueMode::Required },
@@ -3611,7 +3612,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_LAYOUT              Layout mode: stacked (default) or full");
     println!("  CLIP_FACE_RATIO          Height ratio reserved for face panel (default 0.40)");
     println!("  CLIP_FACE_CROP           Face crop expr w:h:x:y (optional, overrides detection/anchor)");
-    println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 3.0)");
+    println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 3.0, max 6.0)");
     println!("  CLIP_FACE_BOX            Normalized face box x:y:w:h (0..1) for auto-crop");
     println!("  CLIP_FACE_ANCHOR         Anchor for default face crop (top-left default)");
     println!("  CLIP_GAME_CENTER         Normalized gameplay center x:y (0..1) for reticle centering");
@@ -3623,6 +3624,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_FACE_SCORE          Face detection confidence threshold (default 0.5)");
     println!("  CLIP_FACE_TRACK_STEP     Seconds between face tracking samples (default 2.0)");
     println!("  CLIP_AUDIO_NORM          Normalize clip audio loudness (default true)");
+    println!("  CLIP_FACE_BUDGET_SECS    Override face detection time budget in seconds");
     println!("  CLIP_FACE_TILE_MIN_SCORE Tile search min score (default 0.60; set <= 0 to disable)");
     println!("  CLIP_FACE_TILE_MAX_DEPTH Max bisection depth for tile search (default 3)");
     println!("  CLIP_FACE_DEBUG          Log face detector outputs and best score");

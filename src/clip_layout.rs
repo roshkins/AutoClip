@@ -84,6 +84,20 @@ impl NormalizedRect {
     }
 }
 
+fn expand_rect_width_to_aspect(rect: NormalizedRect, target_aspect: f32) -> NormalizedRect {
+    let target_aspect = if target_aspect.is_finite() && target_aspect > 0.0 {
+        target_aspect
+    } else {
+        return rect;
+    };
+    let aspect = rect.w / rect.h;
+    if !aspect.is_finite() || aspect >= target_aspect {
+        return rect;
+    }
+    let new_w = (rect.h * target_aspect).clamp(MIN_CROP_RATIO, 1.0);
+    NormalizedRect::from_center(rect.center().clamp_unit(), new_w, rect.h)
+}
+
 #[derive(Clone, Debug)]
 pub struct FaceTrackPoint {
     pub time: f32,
@@ -121,6 +135,7 @@ const DEFAULT_FACE_RATIO: f32 = 0.40;
 const DEFAULT_FACE_CONTEXT_SCALE: f32 = 3.0;
 const DEFAULT_GAME_CENTER_X: f32 = 0.50;
 const DEFAULT_GAME_CENTER_Y: f32 = 0.56;
+const MIDSHOT_FACE_RATIO: f32 = 0.50;
 const MIN_CROP_RATIO: f32 = 0.20;
 
 pub fn read_clip_layout_config() -> ClipLayoutConfig {
@@ -162,7 +177,7 @@ pub fn read_clip_layout_config() -> ClipLayoutConfig {
     let face_context_scale = env::var("CLIP_FACE_CONTEXT")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
-        .map(|v| v.clamp(1.0, 3.0))
+        .map(|v| v.clamp(1.0, 6.0))
         .unwrap_or(DEFAULT_FACE_CONTEXT_SCALE);
 
     ClipLayoutConfig {
@@ -264,19 +279,26 @@ pub fn build_stacked_filter_graph(
     layout: &ClipLayoutConfig,
     hints: &ClipLayoutHints,
 ) -> FilterGraph {
-    let tracked = build_tracked_face_crop(layout, hints);
     let face_rect = face_crop_rect(layout, hints);
-    let (face_crop, face_ratio) = if let Some(tracked) = tracked {
-        let ratio = face_ratio_from_rect(tracked.max_rect, out_w, out_h)
-            .unwrap_or(layout.face_ratio);
-        (tracked.crop_expr, ratio)
-    } else {
-        let ratio = face_rect
-            .and_then(|rect| face_ratio_from_rect(rect, out_w, out_h))
-            .unwrap_or(layout.face_ratio);
-        (build_face_crop_expr(layout, face_rect), ratio)
-    };
+    let tracked_max = tracked_face_max_rect(layout, hints);
+    let force_half = layout.face_context_scale > DEFAULT_FACE_CONTEXT_SCALE
+        && (tracked_max.is_some() || face_rect.is_some());
+    let mut face_ratio = tracked_max
+        .and_then(|rect| face_ratio_from_rect(rect, out_w, out_h))
+        .or_else(|| face_rect.and_then(|rect| face_ratio_from_rect(rect, out_w, out_h)))
+        .unwrap_or(layout.face_ratio);
+    if force_half {
+        face_ratio = MIDSHOT_FACE_RATIO;
+    }
     let (face_h, game_h) = resolve_layout_heights(out_h, face_ratio);
+    let target_aspect = out_w as f32 / face_h as f32;
+    let face_rect = face_rect.map(|rect| expand_rect_width_to_aspect(rect, target_aspect));
+    let tracked = build_tracked_face_crop(layout, hints, target_aspect);
+    let face_crop = if let Some(tracked) = tracked {
+        tracked.crop_expr
+    } else {
+        build_face_crop_expr(layout, face_rect)
+    };
     let game_center = hints.game_center.unwrap_or_else(default_game_center);
     let game_x = axis_center_expr("iw", out_w, game_center.x);
     let game_y = axis_center_expr("ih", game_h, game_center.y);
@@ -298,7 +320,6 @@ pub fn build_stacked_filter_graph(
 
 struct TrackedFaceCrop {
     crop_expr: String,
-    max_rect: NormalizedRect,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -312,6 +333,7 @@ struct TrackSample {
 fn build_tracked_face_crop(
     layout: &ClipLayoutConfig,
     hints: &ClipLayoutHints,
+    target_aspect: f32,
 ) -> Option<TrackedFaceCrop> {
     let track = hints.face_track.as_ref()?;
     if track.points.len() < 2 || layout.face_crop.is_some() {
@@ -322,12 +344,11 @@ fn build_tracked_face_crop(
     points.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut samples: Vec<TrackSample> = Vec::with_capacity(points.len());
-    let mut max_w = MIN_CROP_RATIO;
-    let mut max_h = MIN_CROP_RATIO;
     for point in points {
-        let rect = point.rect.expanded(layout.face_context_scale);
-        max_w = max_w.max(rect.w);
-        max_h = max_h.max(rect.h);
+        let rect = point
+            .rect
+            .expanded(layout.face_context_scale);
+        let rect = expand_rect_width_to_aspect(rect, target_aspect);
         samples.push(TrackSample {
             time: point.time.max(0.0),
             center: rect.center().clamp_unit(),
@@ -362,14 +383,29 @@ fn build_tracked_face_crop(
         "iw*({width_expr}):ih*({height_expr}):{x_expr}:{y_expr}"
     );
 
-    Some(TrackedFaceCrop {
-        crop_expr,
-        max_rect: NormalizedRect {
-            x: 0.0,
-            y: 0.0,
-            w: max_w,
-            h: max_h,
-        },
+    Some(TrackedFaceCrop { crop_expr })
+}
+
+fn tracked_face_max_rect(
+    layout: &ClipLayoutConfig,
+    hints: &ClipLayoutHints,
+) -> Option<NormalizedRect> {
+    let track = hints.face_track.as_ref()?;
+    if track.points.is_empty() || layout.face_crop.is_some() {
+        return None;
+    }
+    let mut max_w = MIN_CROP_RATIO;
+    let mut max_h = MIN_CROP_RATIO;
+    for point in &track.points {
+        let rect = point.rect.expanded(layout.face_context_scale);
+        max_w = max_w.max(rect.w);
+        max_h = max_h.max(rect.h);
+    }
+    Some(NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        w: max_w,
+        h: max_h,
     })
 }
 
