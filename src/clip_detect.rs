@@ -51,12 +51,14 @@ const DEFAULT_FACE_MODEL_PATH: &str = "models/face_detection_yunet_2023mar.onnx"
 const DEFAULT_FACE_SCORE: f32 = 0.5;
 const DEFAULT_FACE_TILE_MIN_SCORE: f32 = 0.60;
 const DEFAULT_FACE_TILE_MAX_DEPTH: usize = 3;
+const DEFAULT_FACE_PICK_RAW: bool = true;
 const MAX_FULL_SAMPLES: usize = 60;
 const MAX_FACE_CANDIDATES: usize = 24;
 const FACE_EDGE_MARGIN: f32 = 0.02;
 const MAX_FACE_DRIFT: f32 = 0.18;
 const FACE_MIN_PX: f32 = 10.0;
 const FACE_MAX_PX: f32 = 300.0;
+const FACE_MIN_AREA_TILED_RELAXED: f32 = 0.00025;
 const FACE_LANDMARK_REQUIRED: bool = true;
 const FACE_LANDMARK_MAX_EYE_TILT: f32 = 0.35;
 const FACE_LANDMARK_MAX_MOUTH_TILT: f32 = 0.45;
@@ -1269,6 +1271,12 @@ fn select_face_with_relaxation(
     detector: &YunetDetector,
     base_score: f32,
 ) -> Option<FaceSelectionResult> {
+    if face_pick_raw_enabled() {
+        let min_score = raw_pick_min_score(base_score);
+        if let Some(result) = select_best_raw_candidate(samples, min_score) {
+            return Some(result);
+        }
+    }
     let relaxed_score = relax_face_score(base_score, 0.5, 0.15);
     let relaxed_min_samples = if total_samples <= 1 { 1 } else { 2 };
     let passes = [
@@ -1328,6 +1336,47 @@ fn select_face_with_relaxation(
     }
 
     None
+}
+
+fn select_best_raw_candidate(
+    samples: &[FaceSample],
+    min_score: f32,
+) -> Option<FaceSelectionResult> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut observations = Vec::new();
+    for sample in samples {
+        let mut best: Option<FaceCandidate> = None;
+        for candidate in &sample.candidates {
+            if !candidate.raw_score.is_finite() || candidate.raw_score < min_score {
+                continue;
+            }
+            let replace = best
+                .as_ref()
+                .map(|best| candidate.raw_score > best.raw_score)
+                .unwrap_or(true);
+            if replace {
+                best = Some(*candidate);
+            }
+        }
+        if let Some(best) = best {
+            observations.push(FaceObservation {
+                rect: best.rect,
+                score: best.raw_score,
+                time: sample.time,
+            });
+        }
+    }
+    if observations.is_empty() {
+        return None;
+    }
+    let best = select_consensus_face(&observations)?;
+    Some(FaceSelectionResult {
+        best,
+        observations,
+        pass_label: "raw",
+    })
 }
 
 fn select_best_candidate_for_pass(
@@ -1401,7 +1450,12 @@ fn candidate_passes(
         }
     }
     let area = (candidate.model_rect.w * candidate.model_rect.h).max(0.0);
-    if !area.is_finite() || area < pass.min_area || area > pass.max_area {
+    let min_area = if !region_is_full(candidate.region) && !pass.require_landmarks {
+        pass.min_area.min(FACE_MIN_AREA_TILED_RELAXED)
+    } else {
+        pass.min_area
+    };
+    if !area.is_finite() || area < min_area || area > pass.max_area {
         return false;
     }
     if pass.require_ok_size
@@ -1515,6 +1569,16 @@ fn face_dump_raw_enabled() -> bool {
     })
 }
 
+fn face_pick_raw_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("CLIP_FACE_PICK_RAW")
+            .ok()
+            .and_then(|v| parse_bool(&v))
+            .unwrap_or(DEFAULT_FACE_PICK_RAW)
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FaceTileConfig {
     min_score: f32,
@@ -1540,6 +1604,14 @@ fn face_tile_config() -> Option<FaceTileConfig> {
         min_score: min_score.clamp(0.01, 0.99),
         max_depth,
     })
+}
+
+fn raw_pick_min_score(base_score: f32) -> f32 {
+    if let Some(tile) = face_tile_config() {
+        base_score.max(tile.min_score)
+    } else {
+        base_score
+    }
 }
 
 const YUNET_STRIDES: [usize; 3] = [8, 16, 32];
@@ -1898,7 +1970,19 @@ impl YunetDetector {
             }
         }
 
-        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        if face_pick_raw_enabled() {
+            candidates.sort_by(|a, b| {
+                b.raw_score
+                    .partial_cmp(&a.raw_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else {
+            candidates.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         if candidates.len() > MAX_FACE_CANDIDATES {
             candidates.truncate(MAX_FACE_CANDIDATES);
         }

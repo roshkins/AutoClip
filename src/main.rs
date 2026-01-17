@@ -2725,6 +2725,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FACE_BACKEND", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_DUMP_DIR", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_DUMP_RAW", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FACE_PICK_RAW", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_FACE_SCORE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_TILE_MIN_SCORE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_TILE_MAX_DEPTH", mode: EnvValueMode::Required },
@@ -3595,6 +3596,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_FACE_BACKEND        Face detector backend: auto (default), ort, or tract");
     println!("  CLIP_FACE_DUMP_DIR       Write face debug images with rectangles to this folder");
     println!("  CLIP_FACE_DUMP_RAW       Dump raw face candidates (no score filtering) when enabled");
+    println!("  CLIP_FACE_PICK_RAW       Pick faces using raw detector score (default true)");
     println!("  CLIP_FACE_SCORE          Face detection confidence threshold (default 0.5)");
     println!("  CLIP_FACE_TILE_MIN_SCORE Tile search min score (default 0.60; set <= 0 to disable)");
     println!("  CLIP_FACE_TILE_MAX_DEPTH Max bisection depth for tile search (default 3)");
