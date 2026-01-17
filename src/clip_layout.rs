@@ -118,10 +118,10 @@ pub enum FilterGraph {
 }
 
 const DEFAULT_FACE_RATIO: f32 = 0.40;
-const DEFAULT_FACE_CONTEXT_SCALE: f32 = 1.8;
+const DEFAULT_FACE_CONTEXT_SCALE: f32 = 3.0;
 const DEFAULT_GAME_CENTER_X: f32 = 0.50;
 const DEFAULT_GAME_CENTER_Y: f32 = 0.56;
-const MIN_CROP_RATIO: f32 = 0.12;
+const MIN_CROP_RATIO: f32 = 0.20;
 
 pub fn read_clip_layout_config() -> ClipLayoutConfig {
     let mode = env::var("CLIP_LAYOUT")

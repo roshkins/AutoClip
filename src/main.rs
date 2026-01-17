@@ -2320,6 +2320,21 @@ fn render_progress_line(current: f32, total: Option<f32>) -> String {
     format!("ts progress: {}", format_progress_time(current))
 }
 
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn audio_norm_enabled() -> bool {
+    std::env::var("CLIP_AUDIO_NORM")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(true)
+}
+
 async fn run_ffmpeg_encode(
     input: &str,
     out_path: &Path,
@@ -2396,17 +2411,23 @@ async fn run_ffmpeg_encode(
         cmd.arg("-crf").arg("23");
     }
 
+    let audio_norm = audio_norm_enabled();
+    let mut audio_filters: Vec<String> = Vec::new();
     if regen_pts {
         if let Some(d) = duration_secs {
             let trim_end = start_offset_secs.unwrap_or(0.0).max(0.0) + d;
             // Keep full audio duration when seeking so -ss doesn't shorten the tail.
-            cmd.arg("-af")
-                .arg(format!("atrim=end={trim_end:.3},asetpts=N/SR/TB"));
+            audio_filters.push(format!("atrim=end={trim_end:.3},asetpts=N/SR/TB"));
         }
-        cmd.arg("-c:a")
-            .arg("aac")
-            .arg("-b:a")
-            .arg("160k");
+    }
+    if audio_norm {
+        audio_filters.push("loudnorm=I=-16:LRA=11:TP=-1.5".to_string());
+    }
+    if !audio_filters.is_empty() {
+        cmd.arg("-af").arg(audio_filters.join(","));
+    }
+    if regen_pts || audio_norm {
+        cmd.arg("-c:a").arg("aac").arg("-b:a").arg("160k");
     } else {
         cmd.arg("-c:a").arg("copy");
     }
@@ -2727,10 +2748,12 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FACE_DUMP_RAW", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_FACE_PICK_RAW", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_FACE_SCORE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_TRACK_STEP", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_TILE_MIN_SCORE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_TILE_MAX_DEPTH", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_DEBUG", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_FACE_TRACK", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_AUDIO_NORM", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_DETECT", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_DETECT_SIZE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_DETECT_SAMPLES", mode: EnvValueMode::Required },
@@ -3588,7 +3611,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_LAYOUT              Layout mode: stacked (default) or full");
     println!("  CLIP_FACE_RATIO          Height ratio reserved for face panel (default 0.40)");
     println!("  CLIP_FACE_CROP           Face crop expr w:h:x:y (optional, overrides detection/anchor)");
-    println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 1.8)");
+    println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 3.0)");
     println!("  CLIP_FACE_BOX            Normalized face box x:y:w:h (0..1) for auto-crop");
     println!("  CLIP_FACE_ANCHOR         Anchor for default face crop (top-left default)");
     println!("  CLIP_GAME_CENTER         Normalized gameplay center x:y (0..1) for reticle centering");
@@ -3598,6 +3621,8 @@ fn print_help(bin: &str) {
     println!("  CLIP_FACE_DUMP_RAW       Dump raw face candidates (no score filtering) when enabled");
     println!("  CLIP_FACE_PICK_RAW       Pick faces using raw detector score (default true)");
     println!("  CLIP_FACE_SCORE          Face detection confidence threshold (default 0.5)");
+    println!("  CLIP_FACE_TRACK_STEP     Seconds between face tracking samples (default 2.0)");
+    println!("  CLIP_AUDIO_NORM          Normalize clip audio loudness (default true)");
     println!("  CLIP_FACE_TILE_MIN_SCORE Tile search min score (default 0.60; set <= 0 to disable)");
     println!("  CLIP_FACE_TILE_MAX_DEPTH Max bisection depth for tile search (default 3)");
     println!("  CLIP_FACE_DEBUG          Log face detector outputs and best score");

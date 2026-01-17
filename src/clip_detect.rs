@@ -39,6 +39,7 @@ pub struct ClipDetectConfig {
     pub face_score_threshold: f32,
     pub scan_full_clip: bool,
     pub track_face: bool,
+    pub face_track_step_secs: Option<f32>,
     pub analysis_budget: Option<Duration>,
 }
 
@@ -52,6 +53,7 @@ const DEFAULT_FACE_SCORE: f32 = 0.5;
 const DEFAULT_FACE_TILE_MIN_SCORE: f32 = 0.60;
 const DEFAULT_FACE_TILE_MAX_DEPTH: usize = 3;
 const DEFAULT_FACE_PICK_RAW: bool = true;
+const DEFAULT_FACE_TRACK_STEP_SECS: f32 = 2.0;
 const MAX_FULL_SAMPLES: usize = 60;
 const MAX_FACE_CANDIDATES: usize = 24;
 const FACE_EDGE_MARGIN: f32 = 0.02;
@@ -132,6 +134,19 @@ pub fn read_clip_detect_config() -> ClipDetectConfig {
         .and_then(|v| parse_bool(&v))
         .unwrap_or(true);
 
+    let face_track_step_secs = std::env::var("CLIP_FACE_TRACK_STEP")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.clamp(0.2, 30.0))
+        .or_else(|| {
+            if track_face {
+                Some(DEFAULT_FACE_TRACK_STEP_SECS)
+            } else {
+                None
+            }
+        });
+
     let scan_full_clip = std::env::var("CLIP_DETECT_FULL")
         .ok()
         .and_then(|v| parse_bool(&v))
@@ -166,6 +181,7 @@ pub fn read_clip_detect_config() -> ClipDetectConfig {
         face_score_threshold,
         scan_full_clip: scan_full_clip || track_face,
         track_face,
+        face_track_step_secs,
         analysis_budget,
     }
 }
@@ -449,14 +465,37 @@ pub async fn detect_layout_hints(
     } else {
         Some((config.frame_width, config.frame_height))
     };
-    let sample_times = build_sample_times(config, is_local, duration_secs);
-    let total_samples = sample_times.len();
-    if total_samples > 0 {
-        let first = sample_times.first().copied().unwrap_or(0.0);
-        let last = sample_times.last().copied().unwrap_or(first);
+    let face_sample_times = build_face_sample_times(config, is_local, duration_secs);
+    let face_total_samples = face_sample_times.len();
+    if face_total_samples > 0 {
+        let mut min_t = f32::INFINITY;
+        let mut max_t = f32::NEG_INFINITY;
+        for t in &face_sample_times {
+            min_t = min_t.min(*t);
+            max_t = max_t.max(*t);
+        }
+        let first = if min_t.is_finite() { min_t } else { 0.0 };
+        let last = if max_t.is_finite() { max_t } else { first };
+        let step = config
+            .face_track_step_secs
+            .unwrap_or(config.sample_step_secs)
+            .max(0.0);
         eprintln!(
-            "clip detect: sampling {} frame(s) from {:.2}s to {:.2}s (step {:.2}s)",
-            total_samples,
+            "clip detect: face sampling {} frame(s) from {:.2}s to {:.2}s (step {:.2}s, bisection)",
+            face_total_samples,
+            first,
+            last,
+            step
+        );
+    }
+    let gameplay_sample_times = build_sample_times(config, is_local, duration_secs);
+    let gameplay_total_samples = gameplay_sample_times.len();
+    if gameplay_total_samples > 0 {
+        let first = gameplay_sample_times.first().copied().unwrap_or(0.0);
+        let last = gameplay_sample_times.last().copied().unwrap_or(first);
+        eprintln!(
+            "clip detect: gameplay sampling {} frame(s) from {:.2}s to {:.2}s (step {:.2}s)",
+            gameplay_total_samples,
             first,
             last,
             config.sample_step_secs.max(0.0)
@@ -482,7 +521,7 @@ pub async fn detect_layout_hints(
         }
     };
 
-    if total_samples > 0 {
+    if face_total_samples > 0 {
         if let Some(detector) = face_detector.as_ref() {
             let face_start = Instant::now();
             let face_tick = Some(LoadingTicker::start(
@@ -490,7 +529,7 @@ pub async fn detect_layout_hints(
                 Duration::from_secs(5),
             ));
             let mut face_samples_attempted = 0usize;
-            for (idx, seek) in sample_times.iter().copied().enumerate() {
+            for (idx, seek) in face_sample_times.iter().copied().enumerate() {
                 if let Some(budget) = face_budget {
                     let elapsed = face_start.elapsed();
                     if elapsed >= budget {
@@ -498,7 +537,7 @@ pub async fn detect_layout_hints(
                             "clip detect: face time budget {:.1}s hit after {}/{} sample(s); stopping early",
                             budget.as_secs_f32(),
                             face_samples_attempted,
-                            total_samples
+                            face_total_samples
                         );
                         break;
                     }
@@ -506,7 +545,7 @@ pub async fn detect_layout_hints(
                 eprintln!(
                     "clip detect: face sample {}/{} at {:.2}s",
                     idx + 1,
-                    total_samples.max(1),
+                    face_total_samples.max(1),
                     seek
                 );
                 let seek_arg = if seek > 0.0 { Some(seek) } else { None };
@@ -532,7 +571,7 @@ pub async fn detect_layout_hints(
         }
     }
 
-    if total_samples > 0 {
+    if gameplay_total_samples > 0 {
         if has_budget && gameplay_budget.is_none() {
             eprintln!("clip detect: gameplay time budget 0.0s; skipping gameplay samples");
         } else {
@@ -551,7 +590,7 @@ pub async fn detect_layout_hints(
                 Duration::from_secs(5),
             ));
             let mut gameplay_samples_attempted = 0usize;
-            for (idx, seek) in sample_times.iter().copied().enumerate() {
+            for (idx, seek) in gameplay_sample_times.iter().copied().enumerate() {
                 if let Some(budget) = gameplay_budget {
                     let elapsed = gameplay_start.elapsed();
                     if elapsed >= budget {
@@ -559,7 +598,7 @@ pub async fn detect_layout_hints(
                             "clip detect: gameplay time budget {:.1}s hit after {}/{} sample(s); stopping early",
                             budget.as_secs_f32(),
                             gameplay_samples_attempted,
-                            total_samples
+                            gameplay_total_samples
                         );
                         break;
                     }
@@ -567,7 +606,7 @@ pub async fn detect_layout_hints(
                 eprintln!(
                     "clip detect: gameplay sample {}/{} at {:.2}s",
                     idx + 1,
-                    total_samples.max(1),
+                    gameplay_total_samples.max(1),
                     seek
                 );
                 let seek_arg = if seek > 0.0 { Some(seek) } else { None };
@@ -661,7 +700,7 @@ pub async fn detect_layout_hints(
     if let Some(detector) = face_detector.as_ref() {
         if let Some(result) = select_face_with_relaxation(
             &face_samples,
-            total_samples,
+            face_total_samples,
             detector,
             config.face_score_threshold,
         ) {
@@ -1491,12 +1530,25 @@ fn build_sample_times(
     is_local: bool,
     duration_secs: Option<f32>,
 ) -> Vec<f32> {
-    if !is_local {
-        let seek = config.sample_start_secs.max(0.0);
-        return vec![seek];
-    }
+    build_sample_times_with_step(
+        config.sample_count,
+        config.sample_start_secs,
+        config.sample_step_secs,
+        config.scan_full_clip,
+        is_local,
+        duration_secs,
+    )
+}
 
-    if config.scan_full_clip {
+fn build_face_sample_times(
+    config: &ClipDetectConfig,
+    is_local: bool,
+    duration_secs: Option<f32>,
+) -> Vec<f32> {
+    let step = config
+        .face_track_step_secs
+        .unwrap_or(config.sample_step_secs);
+    if is_local && config.scan_full_clip {
         if let Some(duration) = duration_secs.filter(|v| v.is_finite() && *v > 0.0) {
             let start = config.sample_start_secs.max(0.0).min(duration);
             let end = if duration > 0.1 { duration - 0.05 } else { duration };
@@ -1505,18 +1557,44 @@ fn build_sample_times(
             if span <= 0.0 {
                 return vec![start];
             }
+            let (count, _) = compute_full_sample_count(start, end, step);
+            return build_bisection_times(start, end, count.max(1));
+        }
+    }
+    build_sample_times_with_step(
+        config.sample_count,
+        config.sample_start_secs,
+        step,
+        config.scan_full_clip,
+        is_local,
+        duration_secs,
+    )
+}
 
-            let base_step = config.sample_step_secs.max(0.05);
-            let mut count = (span / base_step).floor() as usize + 1;
-            let mut step = base_step;
-            if count > MAX_FULL_SAMPLES {
-                count = MAX_FULL_SAMPLES;
-                if count > 1 {
-                    step = span / (count - 1) as f32;
-                } else {
-                    step = 0.0;
-                }
+fn build_sample_times_with_step(
+    sample_count: usize,
+    sample_start_secs: f32,
+    sample_step_secs: f32,
+    scan_full_clip: bool,
+    is_local: bool,
+    duration_secs: Option<f32>,
+) -> Vec<f32> {
+    if !is_local {
+        let seek = sample_start_secs.max(0.0);
+        return vec![seek];
+    }
+
+    if scan_full_clip {
+        if let Some(duration) = duration_secs.filter(|v| v.is_finite() && *v > 0.0) {
+            let start = sample_start_secs.max(0.0).min(duration);
+            let end = if duration > 0.1 { duration - 0.05 } else { duration };
+            let end = end.max(start);
+            let span = end - start;
+            if span <= 0.0 {
+                return vec![start];
             }
+
+            let (count, step) = compute_full_sample_count(start, end, sample_step_secs);
 
             let mut times = Vec::with_capacity(count);
             for idx in 0..count {
@@ -1526,12 +1604,107 @@ fn build_sample_times(
         }
     }
 
-    let sample_count = config.sample_count.max(1);
+    let sample_count = sample_count.max(1);
     let mut times = Vec::with_capacity(sample_count);
-    let start = config.sample_start_secs.max(0.0);
-    let step = config.sample_step_secs.max(0.01);
+    let start = sample_start_secs.max(0.0);
+    let step = sample_step_secs.max(0.01);
     for idx in 0..sample_count {
         times.push(start + step * idx as f32);
+    }
+    times
+}
+
+fn compute_full_sample_count(start: f32, end: f32, sample_step_secs: f32) -> (usize, f32) {
+    let span = (end - start).max(0.0);
+    let base_step = sample_step_secs.max(0.05);
+    let mut count = (span / base_step).floor() as usize + 1;
+    let mut step = base_step;
+    if count > MAX_FULL_SAMPLES {
+        count = MAX_FULL_SAMPLES;
+        if count > 1 {
+            step = span / (count - 1) as f32;
+        } else {
+            step = 0.0;
+        }
+    }
+    (count.max(1), step)
+}
+
+fn build_bisection_times(start: f32, end: f32, max_samples: usize) -> Vec<f32> {
+    if max_samples == 0 {
+        return Vec::new();
+    }
+    if (end - start).abs() < 0.001 {
+        return vec![start];
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Segment {
+        start: f32,
+        end: f32,
+        span: f32,
+    }
+
+    impl Segment {
+        fn new(start: f32, end: f32) -> Option<Self> {
+            let span = end - start;
+            if span > 0.001 {
+                Some(Self { start, end, span })
+            } else {
+                None
+            }
+        }
+    }
+
+    impl PartialEq for Segment {
+        fn eq(&self, other: &Self) -> bool {
+            self.span == other.span
+        }
+    }
+    impl Eq for Segment {}
+    impl PartialOrd for Segment {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            self.span.partial_cmp(&other.span)
+        }
+    }
+    impl Ord for Segment {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+        }
+    }
+
+    let mut heap = std::collections::BinaryHeap::new();
+    if let Some(seg) = Segment::new(start, end) {
+        heap.push(seg);
+    }
+    let mut times = Vec::with_capacity(max_samples);
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let min_span = ((end - start) / max_samples.max(1) as f32 * 0.6).max(0.05);
+
+    while times.len() < max_samples {
+        let Some(seg) = heap.pop() else { break };
+        let mid = (seg.start + seg.end) * 0.5;
+        let mid_q = (mid * 1000.0).round() / 1000.0;
+        let key = (mid_q * 1000.0).round() as i64;
+        if seen.insert(key) {
+            times.push(mid_q);
+        }
+        if seg.span <= min_span {
+            continue;
+        }
+        if let Some(left) = Segment::new(seg.start, mid_q) {
+            heap.push(left);
+        }
+        if let Some(right) = Segment::new(mid_q, seg.end) {
+            heap.push(right);
+        }
+        if heap.is_empty() {
+            break;
+        }
+    }
+
+    if times.is_empty() {
+        times.push(start);
     }
     times
 }
