@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 use tract_onnx::prelude::*;
 
-use crate::clip_layout::NormalizedPoint;
+use crate::clip_layout::{NormalizedPoint, NormalizedRect};
 use crate::loading::LoadingTicker;
 
 const DEFAULT_MODEL_DIR: &str = "models/clip-vit-base-patch32";
@@ -244,6 +244,7 @@ impl ClipGameplayDetector {
         rgb: &[u8],
         width: u32,
         height: u32,
+        exclude: Option<NormalizedRect>,
     ) -> Option<GameplayObservation> {
         if width < PATCH_SIZE as u32 || height < PATCH_SIZE as u32 {
             return None;
@@ -252,6 +253,7 @@ impl ClipGameplayDetector {
         if rgb.len() < expected {
             return None;
         }
+        let exclude = normalize_rect(exclude);
 
         let stride = self.stride.max(1) as usize;
         let patch = PATCH_SIZE;
@@ -264,6 +266,11 @@ impl ClipGameplayDetector {
 
         for y in (0..=max_y).step_by(step_y) {
             for x in (0..=max_x).step_by(step_x) {
+                let cx = (x + patch / 2) as f32 / width as f32;
+                let cy = (y + patch / 2) as f32 / height as f32;
+                if exclude.map(|rect| rect_contains(rect, cx, cy)).unwrap_or(false) {
+                    continue;
+                }
                 let tensor = match patch_to_tensor(rgb, width as usize, height as usize, x, y) {
                     Some(val) => val,
                     None => continue,
@@ -284,8 +291,6 @@ impl ClipGameplayDetector {
                 let neg = max_similarity(&embed, &self.negative);
                 let score = pos - neg;
                 if score.is_finite() {
-                    let cx = (x + patch / 2) as f32 / width as f32;
-                    let cy = (y + patch / 2) as f32 / height as f32;
                     scores.push(PatchScore { score, cx, cy });
                 }
             }
@@ -500,6 +505,37 @@ fn apply_text_input_facts(mut model: InferenceModel) -> Result<InferenceModel> {
 
 fn clamp_unit(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
+}
+
+fn rect_contains(rect: NormalizedRect, cx: f32, cy: f32) -> bool {
+    let x0 = rect.x.min(1.0).max(0.0);
+    let y0 = rect.y.min(1.0).max(0.0);
+    let x1 = (rect.x + rect.w).min(1.0).max(0.0);
+    let y1 = (rect.y + rect.h).min(1.0).max(0.0);
+    if x1 <= x0 || y1 <= y0 {
+        return false;
+    }
+    cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1
+}
+
+fn normalize_rect(rect: Option<NormalizedRect>) -> Option<NormalizedRect> {
+    let rect = rect?;
+    if !rect.x.is_finite()
+        || !rect.y.is_finite()
+        || !rect.w.is_finite()
+        || !rect.h.is_finite()
+    {
+        return None;
+    }
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return None;
+    }
+    Some(NormalizedRect {
+        x: clamp_unit(rect.x),
+        y: clamp_unit(rect.y),
+        w: rect.w.clamp(0.0, 1.0),
+        h: rect.h.clamp(0.0, 1.0),
+    })
 }
 
 fn gameplay_debug_enabled() -> bool {

@@ -112,6 +112,7 @@ impl AutoClip {
             .map(|s| s.to_string())
             .or_else(|| std::env::var("CLIP_PAGE_URL").ok())
             .filter(|s| !s.is_empty())
+            .map(|s| normalize_page_url(&s))
         {
             self.run_until_wake_and_clip(&page_url).await?;
             return Ok(());
@@ -459,7 +460,11 @@ impl AutoClip {
                     let start_offset = detect_offset.saturating_sub(before);
                     let available = snap_len.saturating_sub(start_offset);
                     let warn_short = available < clip_window;
-                    let clip_len = clip_window;
+                    let clip_len = if available < clip_window {
+                        available
+                    } else {
+                        clip_window
+                    };
                     if warn_pre_roll || warn_short {
                         eprintln!(
                             "wake clip off-target; pre-roll ~{:.1}s, buffered ~{:.1}s, available ~{:.1}s (request {:.1}s).",
@@ -1798,6 +1803,36 @@ fn parse_resolution(res: &str) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+fn normalize_page_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    if Url::parse(trimmed).is_ok() {
+        return trimmed.to_string();
+    }
+    if trimmed.contains("://") || looks_like_path(trimmed) {
+        return trimmed.to_string();
+    }
+    format!("https://{trimmed}")
+}
+
+fn looks_like_path(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('/')
+        || value.starts_with('\\')
+    {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
 fn sanitize_m3u8_url(raw: &str) -> String {
     raw.trim()
         .trim_matches('\'')
@@ -2577,6 +2612,9 @@ async fn run_ffmpeg_internal(
                                 face.x, face.y, face.w, face.h
                             );
                         }
+                        if layout_hints.face_track.is_none() {
+                            layout_hints.face_track = detected.face_track;
+                        }
                     }
                     if need_game {
                         if let Some(center) = detected.game_center {
@@ -2991,6 +3029,7 @@ async fn main() -> Result<()> {
                 eprintln!("usage: autoclip demo-hls-buffer <page_url>  (or set CLIP_PAGE_URL)");
                 return Ok(());
             }
+            let page = normalize_page_url(&page);
             return run_hls_buffer_demo(&page).await;
         }
         if cmd.eq_ignore_ascii_case("demo-ts") || cmd.eq_ignore_ascii_case("demo-file") {
@@ -3039,9 +3078,10 @@ async fn main() -> Result<()> {
                 eprintln!("usage: autoclip demo-wakeword-mic <page_url> [--phrase NAME] [--log-raw-wake] [--mic-device DEVICE]");
                 return Ok(());
             };
+            let page_url = normalize_page_url(page_url);
             let demo_log_raw = if log_raw_wake_set { log_raw_wake } else { false };
             let opts = resolve_mic_opts(
-                page_url.clone(),
+                page_url,
                 override_phrase.clone(),
                 demo_log_raw,
                 mic_device.clone(),
@@ -3052,7 +3092,7 @@ async fn main() -> Result<()> {
 
     let mut config = Config::example();
     if let Some(url) = page_url_arg {
-        config.kick_url = url.to_string();
+        config.kick_url = normalize_page_url(url);
     }
     if let Some(p) = override_phrase {
         config.activation_phrase = p;
@@ -3585,7 +3625,7 @@ fn prompt_for_mic_device() -> Option<String> {
 
 fn print_help(bin: &str) {
     println!("Usage:");
-    println!("  {bin} <page_url> [options]");
+    println!("  {bin} <page_url> [options]  (scheme optional, e.g. kick.com/user)");
     println!("  {bin} demo-buffer");
     println!("  {bin} demo-hls-buffer <page_url>");
     println!("  {bin} demo-ts <path_to_ts> [--phrase WORD] [--no-log-raw-wake]");

@@ -1,5 +1,9 @@
+[build]
+jobs = 16
+
 [env]
 CMAKE_GENERATOR = "Visual Studio 17 2022"
 CUDA_PATH = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1"
 CUDA_PATH_V11_8 = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1"
 NVCC_PREPEND_FLAGS = "--allow-unsupported-compiler"
+CMAKE_BUILD_PARALLEL_LEVEL = "16"

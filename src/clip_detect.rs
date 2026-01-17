@@ -55,6 +55,7 @@ const DEFAULT_FACE_TILE_MIN_SCORE: f32 = 0.60;
 const DEFAULT_FACE_TILE_MAX_DEPTH: usize = 3;
 const DEFAULT_FACE_PICK_RAW: bool = true;
 const DEFAULT_FACE_TRACK_STEP_SECS: f32 = 2.0;
+const GAMEPLAY_FACE_EXCLUDE_SCALE: f32 = 1.4;
 const MAX_FULL_SAMPLES: usize = 60;
 const MAX_FACE_CANDIDATES: usize = 24;
 const FACE_EDGE_MARGIN: f32 = 0.02;
@@ -531,6 +532,9 @@ pub async fn detect_layout_hints(
     let mut gameplay_sum_x = 0.0f32;
     let mut gameplay_sum_y = 0.0f32;
     let mut gameplay_best: Option<GameplayObservation> = None;
+    let mut face_best: Option<FaceConsensus> = None;
+    let mut face_observations: Vec<FaceObservation> = Vec::new();
+    let mut face_exclude: Option<NormalizedRect> = None;
 
     let face_detector = match YunetDetector::new(config) {
         Ok(detector) => detector,
@@ -588,6 +592,33 @@ pub async fn detect_layout_hints(
         } else {
             eprintln!("clip detect: face detection disabled; skipping face samples");
         }
+    }
+
+    if let Some(detector) = face_detector.as_ref() {
+        if let Some(result) = select_face_with_relaxation(
+            &face_samples,
+            face_total_samples,
+            detector,
+            config.face_score_threshold,
+        ) {
+            if result.pass_label != "strict" {
+                eprintln!(
+                    "clip detect: relaxing face filters -> {}",
+                    result.pass_label
+                );
+            }
+            face_best = Some(result.best);
+            face_observations = result.observations;
+        }
+    }
+    face_exclude = face_best
+        .as_ref()
+        .map(|best| expand_rect(best.rect, GAMEPLAY_FACE_EXCLUDE_SCALE));
+    if let Some(rect) = face_exclude {
+        log_gameplay_debug(&format!(
+            "clip detect: gameplay exclusion x={:.3} y={:.3} w={:.3} h={:.3}",
+            rect.x, rect.y, rect.w, rect.h
+        ));
     }
 
     if gameplay_total_samples > 0 {
@@ -648,9 +679,18 @@ pub async fn detect_layout_hints(
                 if let Some(reticle) =
                     detect_reticle_candidate(&frame, config.frame_width, config.frame_height)
                 {
-                    reticle_sum_x += reticle.center.x * reticle.score;
-                    reticle_sum_y += reticle.center.y * reticle.score;
-                    reticle_weight += reticle.score;
+                    if face_exclude
+                        .map(|rect| rect_contains_point(rect, reticle.center))
+                        .unwrap_or(false)
+                    {
+                        log_gameplay_debug(
+                            "clip detect: reticle overlaps face; ignoring reticle hint",
+                        );
+                    } else {
+                        reticle_sum_x += reticle.center.x * reticle.score;
+                        reticle_sum_y += reticle.center.y * reticle.score;
+                        reticle_weight += reticle.score;
+                    }
                 }
 
                 if let Some(detector) = gameplay_detector.as_ref() {
@@ -686,7 +726,7 @@ pub async fn detect_layout_hints(
                         (frame.as_slice(), config.frame_width, config.frame_height)
                     };
 
-                    if let Some(obs) = detector.detect(rgb, gw, gh) {
+                    if let Some(obs) = detector.detect(rgb, gw, gh, face_exclude) {
                         let weight = obs.score.max(0.0);
                         if weight > 0.0 {
                             gameplay_sum_x += obs.center.x * weight;
@@ -714,25 +754,6 @@ pub async fn detect_layout_hints(
         }
     }
 
-    let mut face_best: Option<FaceConsensus> = None;
-    let mut face_observations: Vec<FaceObservation> = Vec::new();
-    if let Some(detector) = face_detector.as_ref() {
-        if let Some(result) = select_face_with_relaxation(
-            &face_samples,
-            face_total_samples,
-            detector,
-            config.face_score_threshold,
-        ) {
-            if result.pass_label != "strict" {
-                eprintln!(
-                    "clip detect: relaxing face filters -> {}",
-                    result.pass_label
-                );
-            }
-            face_best = Some(result.best);
-            face_observations = result.observations;
-        }
-    }
     hints.face_box = face_best.map(|c| c.rect);
 
     if config.track_face {
@@ -795,6 +816,18 @@ pub async fn detect_layout_hints(
             x: clamp_unit(reticle_sum_x / reticle_weight),
             y: clamp_unit(reticle_sum_y / reticle_weight),
         });
+    }
+    if let (Some(center), Some(exclude)) = (hints.game_center, face_exclude) {
+        if rect_contains_point(exclude, center) {
+            let nudged = nudge_center_outside_rect(center, exclude);
+            if nudged != center {
+                log_gameplay_debug(&format!(
+                    "clip detect: nudging game center x={:.3} y={:.3} away from face",
+                    nudged.x, nudged.y
+                ));
+                hints.game_center = Some(nudged);
+            }
+        }
     }
 
     Ok(hints)
@@ -3260,6 +3293,58 @@ fn rect_center(rect: NormalizedRect) -> NormalizedPoint {
         x: rect.x + rect.w / 2.0,
         y: rect.y + rect.h / 2.0,
     }
+}
+
+fn expand_rect(rect: NormalizedRect, scale: f32) -> NormalizedRect {
+    let scale = if scale.is_finite() { scale.max(1.0) } else { 1.0 };
+    let center = rect_center(rect);
+    let w = (rect.w * scale).clamp(0.0, 1.0);
+    let h = (rect.h * scale).clamp(0.0, 1.0);
+    recenter_rect(
+        NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            w,
+            h,
+        },
+        center,
+    )
+}
+
+fn rect_contains_point(rect: NormalizedRect, point: NormalizedPoint) -> bool {
+    let x0 = clamp_unit(rect.x);
+    let y0 = clamp_unit(rect.y);
+    let x1 = clamp_unit(rect.x + rect.w);
+    let y1 = clamp_unit(rect.y + rect.h);
+    if x1 <= x0 || y1 <= y0 {
+        return false;
+    }
+    point.x >= x0 && point.x <= x1 && point.y >= y0 && point.y <= y1
+}
+
+fn nudge_center_outside_rect(
+    center: NormalizedPoint,
+    rect: NormalizedRect,
+) -> NormalizedPoint {
+    if !rect_contains_point(rect, center) {
+        return center;
+    }
+    let left_space = rect.x.max(0.0);
+    let right_space = (1.0 - (rect.x + rect.w)).max(0.0);
+    let top_space = rect.y.max(0.0);
+    let bottom_space = (1.0 - (rect.y + rect.h)).max(0.0);
+    let margin = 0.02;
+    let mut out = center;
+    if right_space >= left_space && right_space >= top_space && right_space >= bottom_space {
+        out.x = clamp_unit(rect.x + rect.w + margin);
+    } else if left_space >= top_space && left_space >= bottom_space {
+        out.x = clamp_unit(rect.x - margin);
+    } else if bottom_space >= top_space {
+        out.y = clamp_unit(rect.y + rect.h + margin);
+    } else {
+        out.y = clamp_unit(rect.y - margin);
+    }
+    out
 }
 
 fn select_consensus_face(observations: &[FaceObservation]) -> Option<FaceConsensus> {

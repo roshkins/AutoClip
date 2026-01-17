@@ -30,6 +30,7 @@
 - Audio is normalized by default (`CLIP_AUDIO_NORM=true`) using FFmpeg loudnorm; disable with `--clip-audio-norm=false`.
 - When `CLIP_FACE_CONTEXT` is raised above the default (3.0), the face panel is pinned to 50% height to keep gameplay visible.
 - Face crops widen to match the face panel aspect ratio so the top pane never letterboxes.
+- Use `CLIP_FACE_BUDGET_SECS` to override the face analysis time budget (otherwise capped at 20s).
 - Reprocess a saved TS snapshot with `.\target\debug\autoclip.exe reprocess-ts .\clips\clip_001.ts`.
 - Validate the gameplay CLIP model with `.\target\debug\autoclip.exe check-gameplay-model .\models\clip-vit-base-patch32-xenova`.
 - For help: `.\target\debug\autoclip.exe --help`
