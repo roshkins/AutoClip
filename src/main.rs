@@ -11,8 +11,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::time::sleep;
 use url::Url;
 use std::sync::Arc;
@@ -23,13 +25,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod clip_detect;
 mod clip_gameplay;
 mod clip_layout;
+mod loading;
 mod rolling_buffer;
-use clip_detect::{detect_layout_hints, read_clip_detect_config};
+use clip_detect::{detect_layout_hints, read_clip_detect_config, run_face_threshold_sweep};
+use clip_gameplay::{read_clip_gameplay_config, ClipGameplayDetector};
 use clip_layout::{
     build_stacked_filter_graph, read_clip_layout_config, read_clip_layout_hints, ClipLayoutMode,
     FilterGraph,
 };
 use rolling_buffer::RollingBuffer;
+#[cfg(feature = "whisper")]
+mod stream_audio_wake;
+#[cfg(not(feature = "whisper"))]
+#[path = "stream_audio_wake_stub.rs"]
 mod stream_audio_wake;
 use stream_audio_wake::{
     detect_wake_in_file, start_mic_wake_with_ffmpeg, start_stream_wake_from_hls,
@@ -2115,6 +2123,7 @@ async fn run_ffmpeg_30s(input_hls: &Url, out_path: &Path, out_w: u32, out_h: u32
         None,
         false,
         false,
+        None,
     )
     .await
 }
@@ -2202,6 +2211,7 @@ async fn run_ffmpeg_from_file(
         start_offset,
         true,
         true,
+        None,
     )
     .await
 }
@@ -2260,6 +2270,56 @@ fn tail_trunc(s: &str, max: usize) -> String {
     chars[chars.len() - max..].iter().collect::<String>()
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ProgressSpec {
+    total_secs: Option<f32>,
+}
+
+fn parse_ffmpeg_timecode(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+    let mut parts = value.split(':');
+    let hours: f32 = parts.next()?.parse().ok()?;
+    let minutes: f32 = parts.next()?.parse().ok()?;
+    let seconds: f32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let total = hours * 3600.0 + minutes * 60.0 + seconds;
+    if total.is_finite() && total >= 0.0 {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn format_progress_time(secs: f32) -> String {
+    let secs = if secs.is_finite() && secs > 0.0 { secs } else { 0.0 };
+    let total = secs.floor() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+fn render_progress_line(current: f32, total: Option<f32>) -> String {
+    if let Some(total) = total.filter(|v| v.is_finite() && *v > 0.0) {
+        let pct = (current / total * 100.0).clamp(0.0, 100.0);
+        return format!(
+            "ts progress: {pct:5.1}% ({}/{})",
+            format_progress_time(current),
+            format_progress_time(total)
+        );
+    }
+    format!("ts progress: {}", format_progress_time(current))
+}
+
 async fn run_ffmpeg_encode(
     input: &str,
     out_path: &Path,
@@ -2272,6 +2332,7 @@ async fn run_ffmpeg_encode(
     force_ts_input: bool,
     start_offset_secs: Option<f32>,
     duration_secs: Option<f32>,
+    progress: Option<ProgressSpec>,
 ) -> Result<std::process::Output> {
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y");
@@ -2294,6 +2355,10 @@ async fn run_ffmpeg_encode(
     }
     if force_ts_input {
         cmd.arg("-f").arg("mpegts");
+    }
+    if progress.is_some() {
+        cmd.arg("-progress").arg("pipe:1");
+        cmd.arg("-nostats");
     }
     cmd.arg("-i").arg(input);
     if let Some(ss) = start_offset_secs {
@@ -2350,7 +2415,108 @@ async fn run_ffmpeg_encode(
         cmd.arg("-shortest");
     }
     cmd.arg(out_path.as_os_str());
-    cmd.output().await.context("failed to run ffmpeg")
+    if let Some(progress) = progress {
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to spawn ffmpeg")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing ffmpeg stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing ffmpeg stderr"))?;
+
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            reader
+                .read_to_end(&mut buf)
+                .await
+                .context("reading ffmpeg stderr")?;
+            Ok::<Vec<u8>, anyhow::Error>(buf)
+        });
+
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        let mut stdout_buf = Vec::new();
+        let total_secs = progress
+            .total_secs
+            .filter(|v| v.is_finite() && *v > 0.0);
+        let mut last_time: Option<f32> = None;
+        let mut last_print = Instant::now();
+        let mut last_pct = -1.0f32;
+        let mut last_reported_time: Option<f32> = None;
+        let mut printed = false;
+
+        while let Some(line) = stdout_lines
+            .next_line()
+            .await
+            .context("reading ffmpeg progress")?
+        {
+            stdout_buf.extend_from_slice(line.as_bytes());
+            stdout_buf.push(b'\n');
+
+            if let Some(value) = line.strip_prefix("out_time=") {
+                last_time = parse_ffmpeg_timecode(value);
+            } else if let Some(value) = line.strip_prefix("out_time_us=") {
+                if let Ok(us) = value.trim().parse::<f32>() {
+                    last_time = Some(us / 1_000_000.0);
+                }
+            } else if let Some(value) = line.strip_prefix("out_time_ms=") {
+                if let Ok(raw) = value.trim().parse::<f32>() {
+                    last_time = Some(raw / 1_000_000.0);
+                }
+            } else if line.trim() == "progress=end" {
+                if let Some(total) = total_secs {
+                    last_time = Some(total);
+                }
+            }
+
+            if let Some(current) = last_time {
+                let should_print = if let Some(total) = total_secs {
+                    let pct = (current / total * 100.0).clamp(0.0, 100.0);
+                    if pct - last_pct >= 0.5 {
+                        last_pct = pct;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    let advance = last_reported_time
+                        .map(|prev| (current - prev).abs() >= 0.5)
+                        .unwrap_or(true);
+                    if advance {
+                        last_reported_time = Some(current);
+                    }
+                    advance
+                } || last_print.elapsed() > Duration::from_millis(500);
+                if should_print {
+                    printed = true;
+                    last_print = Instant::now();
+                    eprint!("\r{}", render_progress_line(current, total_secs));
+                    let _ = io::stderr().flush();
+                }
+            }
+        }
+
+        let status = child.wait().await.context("waiting for ffmpeg")?;
+        let stderr_buf = stderr_task
+            .await
+            .context("joining ffmpeg stderr task")??;
+        if printed {
+            eprintln!();
+        }
+        Ok(std::process::Output {
+            status,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        })
+    } else {
+        cmd.output().await.context("failed to run ffmpeg")
+    }
 }
 
 async fn run_ffmpeg_internal(
@@ -2362,6 +2528,7 @@ async fn run_ffmpeg_internal(
     start_offset_secs: Option<f32>,
     regen_pts: bool,
     force_ts_input: bool,
+    progress: Option<ProgressSpec>,
 ) -> Result<()> {
     let (mut video_encoder, mut is_nvenc, mut is_hw, _encoder_forced) = ffmpeg_video_encoder();
     let scale_cuda_available = ffmpeg_scale_cuda_available();
@@ -2454,6 +2621,7 @@ async fn run_ffmpeg_internal(
         force_ts_input,
         start_offset_secs,
         duration_secs,
+        progress,
     )
     .await?;
 
@@ -2486,6 +2654,7 @@ async fn run_ffmpeg_internal(
                     force_ts_input,
                     start_offset_secs,
                     duration_secs,
+                    progress,
                 )
                 .await?;
             }
@@ -2502,6 +2671,7 @@ async fn run_ffmpeg_internal(
                     force_ts_input,
                     start_offset_secs,
                     duration_secs,
+                    progress,
                 )
                 .await?;
                 retried_cpu = true;
@@ -2529,8 +2699,248 @@ async fn run_ffmpeg_internal(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum EnvValueMode {
+    Required,
+    Optional,
+    Flag,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EnvSpec {
+    env: &'static str,
+    mode: EnvValueMode,
+}
+
+const ENV_SPECS: &[EnvSpec] = &[
+    EnvSpec { env: "CLIP_PAGE_URL", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_LAYOUT", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_RATIO", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_CROP", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_CONTEXT", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_BOX", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_ANCHOR", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAME_CENTER", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MODEL", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_BACKEND", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_DUMP_DIR", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_DUMP_RAW", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FACE_SCORE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_TILE_MIN_SCORE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_TILE_MAX_DEPTH", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_DEBUG", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FACE_TRACK", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_DETECT", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_DETECT_SIZE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_DETECT_SAMPLES", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_DETECT_START", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_DETECT_STEP", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_DETECT_FULL", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_DETECT_BUDGET_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_TS_REALTIME", mode: EnvValueMode::Flag },
+    EnvSpec { env: "CLIP_GAMEPLAY", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_GAMEPLAY_MODEL_DIR", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_TEXT_MODEL", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_VISION_MODEL", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_TOKENIZER", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_STRIDE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_TOPK", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_SCORE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_SIZE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_LABELS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_NEG_LABELS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_DEBUG", mode: EnvValueMode::Optional },
+    EnvSpec { env: "M3U8_URL_OVERRIDE", mode: EnvValueMode::Required },
+    EnvSpec { env: "M3U8_TEST_URL", mode: EnvValueMode::Required },
+    EnvSpec { env: "M3U8_PAGE_URL", mode: EnvValueMode::Required },
+    EnvSpec { env: "COOKIE_HEADER", mode: EnvValueMode::Required },
+    EnvSpec { env: "KICK_COOKIE", mode: EnvValueMode::Required },
+    EnvSpec { env: "TIKTOK_COOKIE", mode: EnvValueMode::Required },
+    EnvSpec { env: "TWITCH_COOKIE", mode: EnvValueMode::Required },
+    EnvSpec { env: "HEADLESS_M3U8_SCRIPT", mode: EnvValueMode::Required },
+    EnvSpec { env: "HEADLESS_M3U8_SCRIPT_TIKTOK", mode: EnvValueMode::Required },
+    EnvSpec { env: "LOG_M3U8_HEADERS", mode: EnvValueMode::Flag },
+    EnvSpec { env: "TWITCH_CLIENT_ID", mode: EnvValueMode::Required },
+    EnvSpec { env: "TWITCH_OAUTH_TOKEN", mode: EnvValueMode::Required },
+    EnvSpec { env: "TWITCH_AUTH_TOKEN", mode: EnvValueMode::Required },
+    EnvSpec { env: "WAKE_REFRACTORY_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "WAKE_BUFFER_HEADROOM_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "WAKE_FF_AF", mode: EnvValueMode::Required },
+    EnvSpec { env: "SKIP_CLIP_SAVE", mode: EnvValueMode::Optional },
+    EnvSpec { env: "MIC_DEVICE", mode: EnvValueMode::Required },
+    EnvSpec { env: "WHISPER_MODEL", mode: EnvValueMode::Required },
+    EnvSpec { env: "WHISPER_RT_TARGET", mode: EnvValueMode::Required },
+    EnvSpec { env: "WHISPER_MODEL_CANDIDATES", mode: EnvValueMode::Required },
+    EnvSpec { env: "WHISPER_GPU", mode: EnvValueMode::Optional },
+    EnvSpec { env: "WHISPER_CUBLAS", mode: EnvValueMode::Optional },
+    EnvSpec { env: "WHISPER_LOG_LEVEL", mode: EnvValueMode::Required },
+    EnvSpec { env: "GGML_LOG_LEVEL", mode: EnvValueMode::Required },
+    EnvSpec { env: "FFMPEG_BIN", mode: EnvValueMode::Required },
+    EnvSpec { env: "FFMPEG_ENCODER", mode: EnvValueMode::Required },
+    EnvSpec { env: "FFMPEG_HWACCEL", mode: EnvValueMode::Required },
+    EnvSpec { env: "FFMPEG_HWACCEL_DEVICE", mode: EnvValueMode::Required },
+    EnvSpec { env: "FFMPEG_HWACCEL_FALLBACK", mode: EnvValueMode::Required },
+];
+
+struct ParsedCli {
+    positionals: Vec<String>,
+    override_phrase: Option<String>,
+    log_raw_wake: bool,
+    log_raw_wake_set: bool,
+    mic_device: Option<String>,
+    env_overrides: Vec<(String, String)>,
+}
+
+fn env_to_flag(env: &str) -> String {
+    env.to_ascii_lowercase().replace('_', "-")
+}
+
+fn parse_cli_args(args: &[String]) -> Result<ParsedCli> {
+    let mut positionals = Vec::new();
+    let mut env_overrides = Vec::new();
+    let mut override_phrase = None;
+    let mut log_raw_wake = true;
+    let mut log_raw_wake_set = false;
+    let mut mic_device = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            positionals.extend(args[i + 1..].iter().cloned());
+            break;
+        }
+        if let Some(rest) = arg.strip_prefix("--phrase=") {
+            override_phrase = Some(rest.to_string());
+            i += 1;
+            continue;
+        }
+        if arg == "--phrase" {
+            i += 1;
+            let Some(val) = args.get(i) else {
+                anyhow::bail!("--phrase expects a value");
+            };
+            override_phrase = Some(val.clone());
+            i += 1;
+            continue;
+        }
+        if arg == "--log-raw-wake" {
+            log_raw_wake = true;
+            log_raw_wake_set = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--no-log-raw-wake" {
+            log_raw_wake = false;
+            log_raw_wake_set = true;
+            i += 1;
+            continue;
+        }
+
+        let mut handled_env = false;
+        if let Some(raw_flag) = arg.strip_prefix("--") {
+            let (flag, inline_value) = match raw_flag.split_once('=') {
+                Some((f, v)) => (f.to_ascii_lowercase(), Some(v.to_string())),
+                None => (raw_flag.to_ascii_lowercase(), None),
+            };
+            for spec in ENV_SPECS {
+                let spec_flag = env_to_flag(spec.env);
+                if spec_flag == flag {
+                    let value = match spec.mode {
+                        EnvValueMode::Required => {
+                            if let Some(val) = inline_value {
+                                val
+                            } else {
+                                let next = args.get(i + 1).ok_or_else(|| {
+                                    anyhow::anyhow!("--{flag} expects a value")
+                                })?;
+                                if next.starts_with("--") {
+                                    anyhow::bail!("--{flag} expects a value");
+                                }
+                                i += 1;
+                                next.clone()
+                            }
+                        }
+                        EnvValueMode::Optional => inline_value.unwrap_or_else(|| "1".to_string()),
+                        EnvValueMode::Flag => inline_value.unwrap_or_else(|| "1".to_string()),
+                    };
+                    if spec.env == "MIC_DEVICE" {
+                        mic_device = Some(value.clone());
+                    }
+                    env_overrides.push((spec.env.to_string(), value));
+                    handled_env = true;
+                    break;
+                }
+            }
+        }
+
+        if handled_env {
+            i += 1;
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+
+        positionals.push(arg.clone());
+        i += 1;
+    }
+
+    Ok(ParsedCli {
+        positionals,
+        override_phrase,
+        log_raw_wake,
+        log_raw_wake_set,
+        mic_device,
+        env_overrides,
+    })
+}
+
+fn apply_env_overrides(overrides: &[(String, String)]) {
+    for (key, value) in overrides {
+        std::env::set_var(key, value);
+    }
+}
+
+fn resolve_mic_opts(
+    page_url: String,
+    phrase: Option<String>,
+    log_raw_wake: bool,
+    mic_device: Option<String>,
+) -> Result<MicOpts> {
+    let mut mic_device = mic_device.or_else(|| std::env::var("MIC_DEVICE").ok());
+    if mic_device.is_none() {
+        mic_device = prompt_for_mic_device();
+    }
+    Ok(MicOpts {
+        page_url,
+        phrase,
+        log_raw_wake,
+        mic_device,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help(args.get(0).map(String::as_str).unwrap_or("autoclip"));
+        return Ok(());
+    }
+
+    let ParsedCli {
+        positionals,
+        override_phrase,
+        log_raw_wake,
+        log_raw_wake_set,
+        mic_device,
+        env_overrides,
+    } = parse_cli_args(&args[1..])?;
+    apply_env_overrides(&env_overrides);
+
     // Ensure CUDA backend is preferred when available; avoid falling back to CPU due to missing env.
     if std::env::var("WHISPER_CUBLAS").is_err() {
         std::env::set_var("WHISPER_CUBLAS", "1");
@@ -2539,47 +2949,16 @@ async fn main() -> Result<()> {
         std::env::set_var("WHISPER_GPU", "1");
     }
 
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_help(args.get(0).map(String::as_str).unwrap_or("autoclip"));
-        return Ok(());
-    }
-
     auto_assign_gpus_for_tools();
-    let page_url_arg = args.get(1).map(|s| s.as_str());
-    let mut override_phrase: Option<String> = None;
-    let mut log_raw_wake = true; // default on; can be suppressed
-
-    // Parse optional flags for wakeword control.
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--phrase" => {
-                if let Some(val) = args.get(i + 1) {
-                    override_phrase = Some(val.clone());
-                }
-                i += 2;
-            }
-            "--log-raw-wake" => {
-                log_raw_wake = true;
-                i += 1;
-            }
-            "--no-log-raw-wake" => {
-                log_raw_wake = false;
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
+    let page_url_arg = positionals.get(0).map(|s| s.as_str());
 
     if let Some(cmd) = page_url_arg {
         if cmd.eq_ignore_ascii_case("demo-buffer") {
             return run_buffer_demo().await;
         }
         if cmd.eq_ignore_ascii_case("demo-hls-buffer") {
-            let page = args
-                .get(2)
+            let page = positionals
+                .get(1)
                 .cloned()
                 .or_else(|| std::env::var("CLIP_PAGE_URL").ok())
                 .unwrap_or_default();
@@ -2590,21 +2969,58 @@ async fn main() -> Result<()> {
             return run_hls_buffer_demo(&page).await;
         }
         if cmd.eq_ignore_ascii_case("demo-ts") || cmd.eq_ignore_ascii_case("demo-file") {
-            let Some(path) = args.get(2) else {
+            let Some(path) = positionals.get(1) else {
                 eprintln!("usage: autoclip demo-ts <ts_path> [--phrase WORD] [--no-log-raw-wake]");
                 return Ok(());
             };
-            return run_ts_wake_demo(path, override_phrase, log_raw_wake).await;
+            return run_ts_wake_demo(path, override_phrase.clone(), log_raw_wake).await;
+        }
+        if cmd.eq_ignore_ascii_case("reprocess-ts") {
+            let Some(path) = positionals.get(1) else {
+                eprintln!("usage: autoclip reprocess-ts <ts_path>");
+                return Ok(());
+            };
+            return run_reprocess_ts(path).await;
+        }
+        if cmd.eq_ignore_ascii_case("check-gameplay-model") {
+            let model_dir = positionals.get(1).map(|s| s.as_str());
+            return run_check_gameplay_model(model_dir);
         }
         if cmd.eq_ignore_ascii_case("demo-detect") || cmd.eq_ignore_ascii_case("demo-face") {
-            let Some(path) = args.get(2) else {
+            let Some(path) = positionals.get(1) else {
                 eprintln!("usage: autoclip demo-detect <media_path>");
                 return Ok(());
             };
             return run_clip_detect_demo(path).await;
         }
+        if cmd.eq_ignore_ascii_case("face-sweep") {
+            let Some(pos_dir) = positionals.get(1) else {
+                eprintln!("usage: autoclip face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
+                return Ok(());
+            };
+            let Some(neg_dir) = positionals.get(2) else {
+                eprintln!("usage: autoclip face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
+                return Ok(());
+            };
+            let extra = if positionals.len() > 3 {
+                &positionals[3..]
+            } else {
+                &[]
+            };
+            return run_face_sweep(pos_dir, neg_dir, extra).await;
+        }
         if cmd.eq_ignore_ascii_case("demo-wakeword-mic") {
-            let opts = parse_mic_args(&args[2..])?;
+            let Some(page_url) = positionals.get(1) else {
+                eprintln!("usage: autoclip demo-wakeword-mic <page_url> [--phrase NAME] [--log-raw-wake] [--mic-device DEVICE]");
+                return Ok(());
+            };
+            let demo_log_raw = if log_raw_wake_set { log_raw_wake } else { false };
+            let opts = resolve_mic_opts(
+                page_url.clone(),
+                override_phrase.clone(),
+                demo_log_raw,
+                mic_device.clone(),
+            )?;
             return run_wakeword_mic_demo(opts).await;
         }
     }
@@ -2619,7 +3035,7 @@ async fn main() -> Result<()> {
     config.log_raw_wake = log_raw_wake;
 
     if page_url_arg.is_none() && std::env::var("CLIP_PAGE_URL").is_err() {
-        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-wakeword-mic <page_url> [--phrase NAME] [--no-log-raw-wake]");
+        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-ts <ts_path> | autoclip reprocess-ts <ts_path> | autoclip check-gameplay-model [model_dir] | autoclip demo-wakeword-mic <page_url> [--phrase NAME] [--no-log-raw-wake] | autoclip face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
         return Ok(());
     }
 
@@ -2796,6 +3212,88 @@ async fn run_ts_wake_demo(
     Ok(())
 }
 
+/// Reprocess a TS snapshot into a new MP4 using the current layout settings.
+async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
+    let path = Path::new(ts_path);
+    if !path.exists() {
+        anyhow::bail!("TS file not found: {}", path.display());
+    }
+
+    let cfg = Config::example();
+    let output_path = next_output_path(&cfg.save_path, &cfg.file_name_stub)?;
+    let (out_w, out_h) = parse_resolution(&cfg.resolution).unwrap_or((1080, 1920));
+    let progress_total_secs = probe_media_duration_secs(path).await;
+    if std::env::var("CLIP_DETECT_STEP").is_err() {
+        std::env::set_var("CLIP_DETECT_STEP", "10");
+    }
+    if std::env::var("CLIP_DETECT_START").is_err() {
+        std::env::set_var("CLIP_DETECT_START", "5");
+    }
+    if std::env::var("CLIP_DETECT_BUDGET_SECS").is_err() {
+        std::env::set_var("CLIP_DETECT_BUDGET_SECS", "30");
+    }
+    if std::env::var("CLIP_FACE_TRACK").is_err() {
+        std::env::set_var("CLIP_FACE_TRACK", "1");
+    }
+    run_ffmpeg_internal(
+        path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-utf8 input path"))?,
+        &output_path,
+        out_w,
+        out_h,
+        None,
+        None,
+        true,
+        true,
+        Some(ProgressSpec {
+            total_secs: progress_total_secs,
+        }),
+    )
+    .await?;
+    println!("reprocessed TS clip -> {}", output_path.display());
+    Ok(())
+}
+
+fn run_check_gameplay_model(model_dir: Option<&str>) -> Result<()> {
+    if let Some(dir) = model_dir {
+        std::env::set_var("CLIP_GAMEPLAY_MODEL_DIR", dir);
+    }
+
+    let config = read_clip_gameplay_config(960, 540);
+    if !config.enabled {
+        anyhow::bail!("gameplay model check: CLIP_GAMEPLAY is disabled");
+    }
+    if !config.text_model_path.exists() {
+        anyhow::bail!(
+            "gameplay model check: text model not found at {}",
+            config.text_model_path.display()
+        );
+    }
+    if !config.vision_model_path.exists() {
+        anyhow::bail!(
+            "gameplay model check: vision model not found at {}",
+            config.vision_model_path.display()
+        );
+    }
+    if !config.tokenizer_path.exists() {
+        anyhow::bail!(
+            "gameplay model check: tokenizer not found at {}",
+            config.tokenizer_path.display()
+        );
+    }
+
+    let detector = ClipGameplayDetector::new(&config)?;
+    if detector.is_none() {
+        anyhow::bail!("gameplay model check: detector not initialized");
+    }
+
+    println!("gameplay model check: OK");
+    println!("  text: {}", config.text_model_path.display());
+    println!("  vision: {}", config.vision_model_path.display());
+    println!("  tokenizer: {}", config.tokenizer_path.display());
+    Ok(())
+}
+
 /// Run face/reticle detection on a local media file and print the hints.
 async fn run_clip_detect_demo(path: &str) -> Result<()> {
     let input = Path::new(path);
@@ -2822,58 +3320,163 @@ async fn run_clip_detect_demo(path: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_face_eval_media(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|v| v.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "tiff" | "tif" | "mp4" | "mkv"
+            | "mov" | "m4v" | "ts"
+    )
+}
+
+fn collect_face_eval_inputs(root: &Path) -> Result<Vec<String>> {
+    if !root.exists() {
+        anyhow::bail!("path not found: {}", root.display());
+    }
+    if !root.is_dir() {
+        anyhow::bail!("not a directory: {}", root.display());
+    }
+    let mut stack = vec![root.to_path_buf()];
+    let mut out = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if is_face_eval_media(&path) {
+                out.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+async fn run_face_sweep(pos_dir: &str, neg_dir: &str, extra: &[String]) -> Result<()> {
+    let pos_root = Path::new(pos_dir);
+    let neg_root = Path::new(neg_dir);
+    let positives = collect_face_eval_inputs(pos_root)?;
+    let negatives = collect_face_eval_inputs(neg_root)?;
+    if positives.is_empty() {
+        anyhow::bail!("no positives found under {}", pos_root.display());
+    }
+    if negatives.is_empty() {
+        anyhow::bail!("no negatives found under {}", neg_root.display());
+    }
+
+    let mut score_start = 0.2f32;
+    let mut score_end = 0.7f32;
+    let mut score_step = 0.05f32;
+    let mut out_path: Option<PathBuf> = None;
+
+    if extra.len() >= 3 {
+        let parsed = (
+            extra[0].parse::<f32>().ok(),
+            extra[1].parse::<f32>().ok(),
+            extra[2].parse::<f32>().ok(),
+        );
+        if let (Some(start), Some(end), Some(step)) = parsed {
+            score_start = start;
+            score_end = end;
+            score_step = step;
+            if extra.len() >= 4 {
+                out_path = Some(PathBuf::from(&extra[3]));
+            }
+        } else if !extra.is_empty() {
+            out_path = Some(PathBuf::from(&extra[0]));
+        }
+    } else if extra.len() == 1 {
+        out_path = Some(PathBuf::from(&extra[0]));
+    }
+
+    if !(score_start.is_finite() && score_end.is_finite() && score_step.is_finite()) {
+        anyhow::bail!("invalid score range");
+    }
+    if score_step <= 0.0 {
+        anyhow::bail!("score step must be > 0");
+    }
+    if score_end < score_start {
+        std::mem::swap(&mut score_start, &mut score_end);
+    }
+
+    let mut scores = Vec::new();
+    let mut current = score_start;
+    while current <= score_end + 1e-6 {
+        scores.push(current);
+        current += score_step;
+    }
+    if scores.is_empty() {
+        anyhow::bail!("no scores generated for sweep");
+    }
+
+    let cfg = read_clip_detect_config();
+    let stats = run_face_threshold_sweep(&positives, &negatives, &scores, &cfg).await?;
+
+    let out_path = out_path.unwrap_or_else(|| PathBuf::from("face_eval/threshold_sweep.csv"));
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut csv = String::new();
+    csv.push_str("score,pos_total,pos_found,pos_rate,neg_total,neg_found,neg_rate,precision,score_metric\n");
+    let mut best: Option<(f32, f32, f32)> = None;
+    for stat in &stats {
+        let pos_rate = if stat.pos_total > 0 {
+            stat.pos_found as f32 / stat.pos_total as f32
+        } else {
+            0.0
+        };
+        let neg_rate = if stat.neg_total > 0 {
+            stat.neg_found as f32 / stat.neg_total as f32
+        } else {
+            0.0
+        };
+        let precision = if stat.pos_found + stat.neg_found > 0 {
+            stat.pos_found as f32 / (stat.pos_found + stat.neg_found) as f32
+        } else {
+            0.0
+        };
+        let score_metric = pos_rate - neg_rate;
+        csv.push_str(&format!(
+            "{:.4},{},{},{:.4},{},{},{:.4},{:.4},{:.4}\n",
+            stat.score,
+            stat.pos_total,
+            stat.pos_found,
+            pos_rate,
+            stat.neg_total,
+            stat.neg_found,
+            neg_rate,
+            precision,
+            score_metric
+        ));
+        if best
+            .as_ref()
+            .map(|(_, metric, _)| score_metric > *metric)
+            .unwrap_or(true)
+        {
+            best = Some((stat.score, score_metric, neg_rate));
+        }
+    }
+    fs::write(&out_path, csv)?;
+    println!("face sweep: wrote {}", out_path.display());
+    if let Some((score, metric, neg_rate)) = best {
+        println!(
+            "face sweep: recommended CLIP_FACE_SCORE={:.2} (metric={:.3}, neg_rate={:.2})",
+            score, metric, neg_rate
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct MicOpts {
     page_url: String,
     phrase: Option<String>,
     log_raw_wake: bool,
     mic_device: Option<String>,
-}
-
-fn parse_mic_args(args: &[String]) -> Result<MicOpts> {
-    if args.is_empty() {
-        anyhow::bail!("usage: autoclip demo-wakeword-mic <page_url> [--phrase NAME] [--log-raw-wake] [--mic-device DEVICE]");
-    }
-
-    let page_url = args[0].clone();
-    let mut phrase = None;
-    let mut log_raw_wake = false;
-    let mut mic_device: Option<String> = None;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--phrase" => {
-                i += 1;
-                phrase = args.get(i).cloned();
-            }
-            "--log-raw-wake" => {
-                log_raw_wake = true;
-            }
-            "--mic-device" => {
-                i += 1;
-                mic_device = args.get(i).cloned();
-            }
-            other => {
-                anyhow::bail!("unknown flag {other}");
-            }
-        }
-        i += 1;
-    }
-
-    if mic_device.is_none() {
-        if let Ok(env_dev) = std::env::var("MIC_DEVICE") {
-            if !env_dev.trim().is_empty() {
-                mic_device = Some(env_dev);
-            }
-        }
-    }
-
-    if mic_device.is_none() {
-        mic_device = prompt_for_mic_device();
-    }
-
-    Ok(MicOpts { page_url, phrase, log_raw_wake, mic_device })
 }
 
 fn prompt_for_mic_device() -> Option<String> {
@@ -2961,7 +3564,10 @@ fn print_help(bin: &str) {
     println!("  {bin} demo-buffer");
     println!("  {bin} demo-hls-buffer <page_url>");
     println!("  {bin} demo-ts <path_to_ts> [--phrase WORD] [--no-log-raw-wake]");
+    println!("  {bin} reprocess-ts <path_to_ts>");
+    println!("  {bin} check-gameplay-model [model_dir]");
     println!("  {bin} demo-detect <media_path>");
+    println!("  {bin} face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
     println!("  {bin} demo-wakeword-mic <page_url> [--phrase WORD] [--log-raw-wake] [--mic-device NAME]");
     println!("");
     println!("Options:");
@@ -2971,9 +3577,14 @@ fn print_help(bin: &str) {
     println!("  --mic-device NAME      Microphone device for mic wake mode");
     println!("  -h, --help             Show this help");
     println!("");
+    println!("CLI overrides:");
+    println!("  Any environment variable below can be passed as a CLI flag by lowercasing");
+    println!("  and replacing '_' with '-' (e.g., CLIP_LAYOUT -> --clip-layout=stacked).");
+    println!("  For boolean env vars, use the '=true'/'=false' form to avoid ambiguity.");
+    println!("");
     println!("Environment (selected):");
     println!("  CLIP_PAGE_URL            Default page when none is passed");
-    println!("  CLIP_LAYOUT              Layout mode: full (default) or stacked/tiktok");
+    println!("  CLIP_LAYOUT              Layout mode: stacked (default) or full");
     println!("  CLIP_FACE_RATIO          Height ratio reserved for face panel (default 0.40)");
     println!("  CLIP_FACE_CROP           Face crop expr w:h:x:y (optional, overrides detection/anchor)");
     println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 1.8)");
@@ -2981,7 +3592,12 @@ fn print_help(bin: &str) {
     println!("  CLIP_FACE_ANCHOR         Anchor for default face crop (top-left default)");
     println!("  CLIP_GAME_CENTER         Normalized gameplay center x:y (0..1) for reticle centering");
     println!("  CLIP_FACE_MODEL          Face detector model path (default models/face_detection_yunet_2023mar.onnx)");
+    println!("  CLIP_FACE_BACKEND        Face detector backend: auto (default), ort, or tract");
+    println!("  CLIP_FACE_DUMP_DIR       Write face debug images with rectangles to this folder");
+    println!("  CLIP_FACE_DUMP_RAW       Dump raw face candidates (no score filtering) when enabled");
     println!("  CLIP_FACE_SCORE          Face detection confidence threshold (default 0.5)");
+    println!("  CLIP_FACE_TILE_MIN_SCORE Tile search min score (default 0.60; set <= 0 to disable)");
+    println!("  CLIP_FACE_TILE_MAX_DEPTH Max bisection depth for tile search (default 3)");
     println!("  CLIP_FACE_DEBUG          Log face detector outputs and best score");
     println!("  CLIP_FACE_TRACK          Track face across the full clip (default true)");
     println!("  CLIP_DETECT              Enable auto-detection for stacked layout (default true)");
@@ -2990,6 +3606,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_DETECT_START        Detection sample start time in seconds (default 1.0)");
     println!("  CLIP_DETECT_STEP         Seconds between detection samples (default 1.5)");
     println!("  CLIP_DETECT_FULL         Sample detection frames across the full clip (local files only)");
+    println!("  CLIP_DETECT_BUDGET_SECS  Max seconds to spend analyzing detection samples");
     println!("  CLIP_TS_REALTIME         When set, read local TS files at realtime speed");
     println!("  M3U8_URL_OVERRIDE        Skip discovery; use this master URL directly");
     println!("  COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE / TWITCH_COOKIE   Cookies to send on discovery");

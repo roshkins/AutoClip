@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 use tract_onnx::prelude::*;
 
 use crate::clip_layout::NormalizedPoint;
+use crate::loading::LoadingTicker;
 
 const DEFAULT_MODEL_DIR: &str = "models/clip-vit-base-patch32";
 const DEFAULT_STRIDE: u32 = 112;
@@ -59,13 +61,18 @@ pub fn read_clip_gameplay_config(
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| onnx_dir.join("clip_text.onnx"));
+        .unwrap_or_else(|| {
+            default_onnx_path(
+                &onnx_dir,
+                &["clip_text_fixed.onnx", "clip_text.onnx", "text_model.onnx"],
+            )
+        });
     let vision_model_path = std::env::var("CLIP_GAMEPLAY_VISION_MODEL")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| onnx_dir.join("clip_vision.onnx"));
+        .unwrap_or_else(|| default_onnx_path(&onnx_dir, &["clip_vision.onnx", "vision_model.onnx"]));
     let tokenizer_path = std::env::var("CLIP_GAMEPLAY_TOKENIZER")
         .ok()
         .map(|v| v.trim().to_string())
@@ -124,6 +131,16 @@ pub fn read_clip_gameplay_config(
     }
 }
 
+fn default_onnx_path(onnx_dir: &PathBuf, candidates: &[&str]) -> PathBuf {
+    for name in candidates {
+        let path = onnx_dir.join(name);
+        if path.exists() {
+            return path;
+        }
+    }
+    onnx_dir.join(candidates[0])
+}
+
 pub struct ClipGameplayDetector {
     text_model: TypedRunnableModel<TypedModel>,
     vision_model: TypedRunnableModel<TypedModel>,
@@ -148,28 +165,61 @@ impl ClipGameplayDetector {
             return Ok(None);
         }
 
+        let tokenizer_start = Instant::now();
+        let tokenizer_tick =
+            LoadingTicker::start("clip gameplay: loading tokenizer", Duration::from_secs(5));
         let tokenizer = Tokenizer::from_file(&config.tokenizer_path).map_err(|err| {
             anyhow::anyhow!(
                 "loading tokenizer at {} failed: {err}",
                 config.tokenizer_path.display()
             )
         })?;
+        drop(tokenizer_tick);
+        eprintln!(
+            "clip gameplay: tokenizer loaded in {:.1}s",
+            tokenizer_start.elapsed().as_secs_f32()
+        );
         let pad_id = tokenizer
             .token_to_id("<|endoftext|>")
             .unwrap_or(0);
 
+        let text_start = Instant::now();
+        let text_tick =
+            LoadingTicker::start("clip gameplay: loading text model", Duration::from_secs(5));
         let text_model = tract_onnx::onnx()
             .model_for_path(&config.text_model_path)
-            .with_context(|| format!("loading text model at {}", config.text_model_path.display()))?
-            .into_optimized()?
-            .into_runnable()?;
+            .with_context(|| format!("loading text model at {}", config.text_model_path.display()))?;
+        let text_model = apply_text_input_facts(text_model)?;
+        let text_model = text_model.into_optimized()?.into_runnable()?;
+        drop(text_tick);
+        eprintln!(
+            "clip gameplay: text model loaded in {:.1}s",
+            text_start.elapsed().as_secs_f32()
+        );
+
+        let vision_start = Instant::now();
+        let vision_tick =
+            LoadingTicker::start("clip gameplay: loading vision model", Duration::from_secs(5));
         let vision_model = tract_onnx::onnx()
             .model_for_path(&config.vision_model_path)
             .with_context(|| {
                 format!("loading vision model at {}", config.vision_model_path.display())
-            })?
+            })?;
+        let vision_model = vision_model
+            .with_input_fact(
+                0,
+                InferenceFact::dt_shape(
+                    f32::datum_type(),
+                    tvec!(1usize, 3usize, PATCH_SIZE, PATCH_SIZE),
+                ),
+            )?
             .into_optimized()?
             .into_runnable()?;
+        drop(vision_tick);
+        eprintln!(
+            "clip gameplay: vision model loaded in {:.1}s",
+            vision_start.elapsed().as_secs_f32()
+        );
 
         let mut detector = Self {
             text_model,
@@ -284,14 +334,24 @@ impl ClipGameplayDetector {
 
     fn encode_prompts(&self, prompts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::new();
+        let input_count = self.text_model.model().input_outlets()?.len();
+        if input_count == 0 {
+            anyhow::bail!("text model has no inputs");
+        }
         for prompt in prompts {
             let (ids, mask) = encode_prompt(&self.tokenizer, self.pad_id, prompt)?;
             let input_ids = Tensor::from_shape(&[1usize, SEQ_LEN], &ids)?;
-            let attention = Tensor::from_shape(&[1usize, SEQ_LEN], &mask)?;
-            let output = self
-                .text_model
-                .run(tvec!(input_ids.into(), attention.into()))
-                .with_context(|| format!("text model failed on prompt '{prompt}'"))?;
+            let output = match input_count {
+                1 => self.text_model.run(tvec!(input_ids.into())),
+                2 => {
+                    let attention = Tensor::from_shape(&[1usize, SEQ_LEN], &mask)?;
+                    self.text_model.run(tvec!(input_ids.into(), attention.into()))
+                }
+                other => anyhow::bail!(
+                    "text model has unsupported input count {other}; expected 1 or 2"
+                ),
+            }
+            .with_context(|| format!("text model failed on prompt '{prompt}'"))?;
             let embed = output
                 .get(0)
                 .and_then(|v| v.to_array_view::<f32>().ok())
@@ -425,6 +485,17 @@ fn parse_label_list(value: String) -> Vec<String> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .collect()
+}
+
+fn apply_text_input_facts(mut model: InferenceModel) -> Result<InferenceModel> {
+    let input_count = model.input_outlets()?.len();
+    for idx in 0..input_count {
+        model = model.with_input_fact(
+            idx,
+            InferenceFact::dt_shape(i64::datum_type(), tvec!(1usize, SEQ_LEN)),
+        )?;
+    }
+    Ok(model)
 }
 
 fn clamp_unit(value: f32) -> f32 {

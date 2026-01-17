@@ -132,7 +132,7 @@ pub fn read_clip_layout_config() -> ClipLayoutConfig {
             "full" | "default" | "" => Some(ClipLayoutMode::Full),
             _ => None,
         })
-        .unwrap_or(ClipLayoutMode::Full);
+        .unwrap_or(ClipLayoutMode::Stacked);
 
     let face_ratio = env::var("CLIP_FACE_RATIO")
         .ok()
