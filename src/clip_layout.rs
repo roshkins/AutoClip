@@ -46,6 +46,7 @@ impl NormalizedRect {
         }
     }
 
+    #[cfg(test)]
     fn expanded(&self, scale: f32) -> Self {
         let scale = scale.max(1.0);
         let center = self.center().clamp_unit();
@@ -98,6 +99,67 @@ fn expand_rect_width_to_aspect(rect: NormalizedRect, target_aspect: f32) -> Norm
     NormalizedRect::from_center(rect.center().clamp_unit(), new_w, rect.h)
 }
 
+fn frame_rect_for_face(
+    face_rect: NormalizedRect,
+    spec: FaceFrameSpec,
+    target_aspect: f32,
+    bounds: NormalizedRect,
+) -> NormalizedRect {
+    let bounds = normalize_bounds(bounds);
+    let mut head_top = face_rect.y + face_rect.h * spec.head_top_offset;
+    if !head_top.is_finite() {
+        head_top = face_rect.y;
+    }
+    let mut width = if spec.shoulder_width_scale.is_finite() && spec.shoulder_width_scale > 0.0 {
+        face_rect.w * spec.shoulder_width_scale
+    } else {
+        face_rect.w
+    };
+    if !width.is_finite() || width <= 0.0 {
+        width = face_rect.w.max(MIN_CROP_RATIO);
+    }
+    width = width.clamp(MIN_CROP_RATIO, bounds.w.max(MIN_CROP_RATIO));
+    let mut height = if target_aspect.is_finite() && target_aspect > 0.0 {
+        width / target_aspect
+    } else {
+        width
+    };
+    if !height.is_finite() || height <= 0.0 {
+        height = face_rect.h.max(MIN_CROP_RATIO);
+    }
+    if height > bounds.h {
+        height = bounds.h.max(MIN_CROP_RATIO);
+        if target_aspect.is_finite() && target_aspect > 0.0 {
+            width = (height * target_aspect).min(bounds.w);
+        }
+    }
+    let center_x = face_rect.x + face_rect.w / 2.0;
+    let mut x = center_x - width / 2.0;
+    let mut y = head_top;
+    let min_x = bounds.x;
+    let max_x = (bounds.x + bounds.w - width).max(min_x);
+    let min_y = bounds.y;
+    let max_y = (bounds.y + bounds.h - height).max(min_y);
+    if x < min_x {
+        x = min_x;
+    }
+    if x > max_x {
+        x = max_x;
+    }
+    if y < min_y {
+        y = min_y;
+    }
+    if y > max_y {
+        y = max_y;
+    }
+    NormalizedRect {
+        x: clamp_unit(x),
+        y: clamp_unit(y),
+        w: width,
+        h: height,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FaceTrackPoint {
     pub time: f32,
@@ -118,10 +180,18 @@ pub struct ClipLayoutConfig {
     pub face_context_scale: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaceFrameSpec {
+    pub head_top_offset: f32,
+    pub shoulder_width_scale: f32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ClipLayoutHints {
     pub face_box: Option<NormalizedRect>,
     pub face_track: Option<FaceTrack>,
+    pub face_region: Option<NormalizedRect>,
+    pub face_frame_spec: Option<FaceFrameSpec>,
     pub game_center: Option<NormalizedPoint>,
 }
 
@@ -132,9 +202,10 @@ pub enum FilterGraph {
 }
 
 const DEFAULT_FACE_RATIO: f32 = 0.40;
-const DEFAULT_FACE_CONTEXT_SCALE: f32 = 3.0;
+const DEFAULT_FACE_CONTEXT_SCALE: f32 = 6.0;
+const FORCE_HALF_FACE_CONTEXT: f32 = 3.0;
 const DEFAULT_GAME_CENTER_X: f32 = 0.50;
-const DEFAULT_GAME_CENTER_Y: f32 = 0.56;
+const DEFAULT_GAME_CENTER_Y: f32 = 0.50;
 const MIDSHOT_FACE_RATIO: f32 = 0.50;
 const MIN_CROP_RATIO: f32 = 0.20;
 
@@ -177,7 +248,8 @@ pub fn read_clip_layout_config() -> ClipLayoutConfig {
     let face_context_scale = env::var("CLIP_FACE_CONTEXT")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
-        .map(|v| v.clamp(1.0, 6.0))
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.max(1.0))
         .unwrap_or(DEFAULT_FACE_CONTEXT_SCALE);
 
     ClipLayoutConfig {
@@ -191,11 +263,14 @@ pub fn read_clip_layout_config() -> ClipLayoutConfig {
 
 pub fn read_clip_layout_hints() -> ClipLayoutHints {
     let face_box = env::var("CLIP_FACE_BOX").ok().and_then(|v| parse_rect(&v));
+    let face_region = env::var("CLIP_FACE_REGION").ok().and_then(|v| parse_rect(&v));
     let game_center = env::var("CLIP_GAME_CENTER").ok().and_then(|v| parse_point(&v));
 
     ClipLayoutHints {
         face_box,
         face_track: None,
+        face_region,
+        face_frame_spec: None,
         game_center,
     }
 }
@@ -237,13 +312,29 @@ fn default_face_crop_expr(anchor: FaceAnchor) -> String {
     format!("{w}:{h}:{x}:{y}")
 }
 
-fn face_crop_rect(layout: &ClipLayoutConfig, hints: &ClipLayoutHints) -> Option<NormalizedRect> {
+fn face_crop_rect(
+    layout: &ClipLayoutConfig,
+    hints: &ClipLayoutHints,
+    target_aspect: f32,
+) -> Option<NormalizedRect> {
     if layout.face_crop.is_some() {
         return None;
     }
-    hints
-        .face_box
-        .map(|face_box| face_box.expanded(layout.face_context_scale))
+    let face_box = hints.face_box?;
+    let bounds = hints.face_region.unwrap_or(NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    });
+    if let Some(spec) = hints.face_frame_spec {
+        return Some(frame_rect_for_face(face_box, spec, target_aspect, bounds));
+    }
+    Some(expand_rect_in_bounds(
+        face_box,
+        layout.face_context_scale,
+        bounds,
+    ))
 }
 
 fn build_face_crop_expr(layout: &ClipLayoutConfig, rect: Option<NormalizedRect>) -> String {
@@ -279,19 +370,26 @@ pub fn build_stacked_filter_graph(
     layout: &ClipLayoutConfig,
     hints: &ClipLayoutHints,
 ) -> FilterGraph {
-    let face_rect = face_crop_rect(layout, hints);
-    let tracked_max = tracked_face_max_rect(layout, hints);
-    let force_half = layout.face_context_scale > DEFAULT_FACE_CONTEXT_SCALE
+    let base_face_h = resolve_layout_heights(out_h, layout.face_ratio).0;
+    let base_aspect = out_w as f32 / base_face_h as f32;
+    let face_rect = face_crop_rect(layout, hints, base_aspect);
+    let tracked_max = tracked_face_max_rect(layout, hints, base_aspect);
+    let force_half = layout.face_context_scale > FORCE_HALF_FACE_CONTEXT
         && (tracked_max.is_some() || face_rect.is_some());
-    let mut face_ratio = tracked_max
-        .and_then(|rect| face_ratio_from_rect(rect, out_w, out_h))
-        .or_else(|| face_rect.and_then(|rect| face_ratio_from_rect(rect, out_w, out_h)))
-        .unwrap_or(layout.face_ratio);
+    let mut face_ratio = if hints.face_frame_spec.is_some() {
+        layout.face_ratio
+    } else {
+        tracked_max
+            .and_then(|rect| face_ratio_from_rect(rect, out_w, out_h))
+            .or_else(|| face_rect.and_then(|rect| face_ratio_from_rect(rect, out_w, out_h)))
+            .unwrap_or(layout.face_ratio)
+    };
     if force_half {
         face_ratio = MIDSHOT_FACE_RATIO;
     }
     let (face_h, game_h) = resolve_layout_heights(out_h, face_ratio);
     let target_aspect = out_w as f32 / face_h as f32;
+    let face_rect = face_crop_rect(layout, hints, target_aspect);
     let face_rect = face_rect.map(|rect| expand_rect_width_to_aspect(rect, target_aspect));
     let tracked = build_tracked_face_crop(layout, hints, target_aspect);
     let face_crop = if let Some(tracked) = tracked {
@@ -318,6 +416,40 @@ pub fn build_stacked_filter_graph(
     }
 }
 
+pub fn build_face_only_filter_graph(
+    out_w: u32,
+    out_h: u32,
+    layout: &ClipLayoutConfig,
+    hints: &ClipLayoutHints,
+) -> FilterGraph {
+    let target_aspect = out_w as f32 / out_h as f32;
+    let face_rect = face_crop_rect(layout, hints, target_aspect);
+    let face_rect = face_rect.map(|rect| expand_rect_width_to_aspect(rect, target_aspect));
+    let tracked = build_tracked_face_crop(layout, hints, target_aspect);
+    let face_crop = if let Some(tracked) = tracked {
+        tracked.crop_expr
+    } else {
+        build_face_crop_expr(layout, face_rect)
+    };
+    let chain = format!(
+        "crop={face_crop},scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},format=yuv420p"
+    );
+    FilterGraph::Vf(chain)
+}
+
+pub fn build_full_frame_fill_filter_graph(
+    out_w: u32,
+    out_h: u32,
+    center: NormalizedPoint,
+) -> FilterGraph {
+    let x = axis_center_expr("iw", out_w, center.x);
+    let y = axis_center_expr("ih", out_h, center.y);
+    let chain = format!(
+        "scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h}:{x}:{y},format=yuv420p"
+    );
+    FilterGraph::Vf(chain)
+}
+
 struct TrackedFaceCrop {
     crop_expr: String,
 }
@@ -342,12 +474,21 @@ fn build_tracked_face_crop(
 
     let mut points = track.points.clone();
     points.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+    let bounds = hints.face_region.unwrap_or(NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    });
 
     let mut samples: Vec<TrackSample> = Vec::with_capacity(points.len());
+    let frame_spec = hints.face_frame_spec;
     for point in points {
-        let rect = point
-            .rect
-            .expanded(layout.face_context_scale);
+        let rect = if let Some(spec) = frame_spec {
+            frame_rect_for_face(point.rect, spec, target_aspect, bounds)
+        } else {
+            expand_rect_in_bounds(point.rect, layout.face_context_scale, bounds)
+        };
         let rect = expand_rect_width_to_aspect(rect, target_aspect);
         samples.push(TrackSample {
             time: point.time.max(0.0),
@@ -389,15 +530,27 @@ fn build_tracked_face_crop(
 fn tracked_face_max_rect(
     layout: &ClipLayoutConfig,
     hints: &ClipLayoutHints,
+    target_aspect: f32,
 ) -> Option<NormalizedRect> {
     let track = hints.face_track.as_ref()?;
     if track.points.is_empty() || layout.face_crop.is_some() {
         return None;
     }
+    let bounds = hints.face_region.unwrap_or(NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    });
+    let frame_spec = hints.face_frame_spec;
     let mut max_w = MIN_CROP_RATIO;
     let mut max_h = MIN_CROP_RATIO;
     for point in &track.points {
-        let rect = point.rect.expanded(layout.face_context_scale);
+        let rect = if let Some(spec) = frame_spec {
+            frame_rect_for_face(point.rect, spec, target_aspect, bounds)
+        } else {
+            expand_rect_in_bounds(point.rect, layout.face_context_scale, bounds)
+        };
         max_w = max_w.max(rect.w);
         max_h = max_h.max(rect.h);
     }
@@ -510,6 +663,75 @@ fn parse_unit_list(value: &str, expected: usize) -> Option<Vec<f32>> {
     }
 }
 
+fn expand_rect_in_bounds(
+    rect: NormalizedRect,
+    scale: f32,
+    bounds: NormalizedRect,
+) -> NormalizedRect {
+    let scale = if scale.is_finite() { scale.max(1.0) } else { 1.0 };
+    let bounds = normalize_bounds(bounds);
+    let desired_w = (rect.w * scale)
+        .max(rect.w)
+        .clamp(MIN_CROP_RATIO, bounds.w.max(MIN_CROP_RATIO));
+    let desired_h = (rect.h * scale)
+        .max(rect.h)
+        .clamp(MIN_CROP_RATIO, bounds.h.max(MIN_CROP_RATIO));
+    let mut x = rect.x + rect.w / 2.0 - desired_w / 2.0;
+    let mut y = rect.y + rect.h / 2.0 - desired_h / 2.0;
+    let min_x = bounds.x;
+    let max_x = (bounds.x + bounds.w - desired_w).max(min_x);
+    let min_y = bounds.y;
+    let max_y = (bounds.y + bounds.h - desired_h).max(min_y);
+    if x < min_x {
+        x = min_x;
+    }
+    if x > max_x {
+        x = max_x;
+    }
+    if y < min_y {
+        y = min_y;
+    }
+    if y > max_y {
+        y = max_y;
+    }
+    NormalizedRect {
+        x: clamp_unit(x),
+        y: clamp_unit(y),
+        w: desired_w,
+        h: desired_h,
+    }
+}
+
+fn normalize_bounds(bounds: NormalizedRect) -> NormalizedRect {
+    if bounds.w <= 0.0 || bounds.h <= 0.0 {
+        return NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        };
+    }
+    let x = bounds.x.clamp(0.0, 1.0);
+    let y = bounds.y.clamp(0.0, 1.0);
+    let mut w = bounds.w.clamp(0.0, 1.0);
+    let mut h = bounds.h.clamp(0.0, 1.0);
+    if x + w > 1.0 {
+        w = (1.0 - x).max(0.0);
+    }
+    if y + h > 1.0 {
+        h = (1.0 - y).max(0.0);
+    }
+    if w <= 0.0 || h <= 0.0 {
+        return NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        };
+    }
+    NormalizedRect { x, y, w, h }
+}
+
 fn parse_unit_value(value: f32) -> Option<f32> {
     if value.is_finite() && (0.0..=1.0).contains(&value) {
         Some(value)
@@ -572,6 +794,8 @@ mod tests {
                 h: 0.2,
             }),
             face_track: None,
+            face_region: None,
+            face_frame_spec: None,
             game_center: Some(NormalizedPoint { x: 0.5, y: 0.6 }),
         };
         let FilterGraph::Complex { graph, output } =

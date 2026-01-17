@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 use tract_onnx::prelude::*;
@@ -8,7 +7,8 @@ use tract_onnx::prelude::*;
 use crate::clip_layout::{NormalizedPoint, NormalizedRect};
 use crate::loading::LoadingTicker;
 
-const DEFAULT_MODEL_DIR: &str = "models/clip-vit-base-patch32";
+const DEFAULT_MODEL_DIR: &str = "models/clip-vit-base-patch32-xenova";
+const FALLBACK_MODEL_DIR: &str = "models/clip-vit-base-patch32";
 const DEFAULT_STRIDE: u32 = 112;
 const DEFAULT_TOP_K: usize = 6;
 const DEFAULT_SCORE_MIN: f32 = 0.12;
@@ -34,9 +34,18 @@ pub struct ClipGameplayConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct GameplayObservation {
+pub struct ClipRegionObservation {
+    pub rect: NormalizedRect,
     pub center: NormalizedPoint,
     pub score: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClipLabelSet {
+    pub positive: Vec<Vec<f32>>,
+    pub negative: Vec<Vec<f32>>,
+    pub score_min: f32,
+    pub top_k: usize,
 }
 
 pub fn read_clip_gameplay_config(
@@ -52,7 +61,13 @@ pub fn read_clip_gameplay_config(
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string());
+        .unwrap_or_else(|| {
+            if PathBuf::from(DEFAULT_MODEL_DIR).exists() {
+                DEFAULT_MODEL_DIR.to_string()
+            } else {
+                FALLBACK_MODEL_DIR.to_string()
+            }
+        });
     let model_dir = PathBuf::from(model_dir);
     let onnx_dir = model_dir.join("onnx");
 
@@ -239,13 +254,51 @@ impl ClipGameplayDetector {
         Ok(Some(detector))
     }
 
-    pub fn detect(
+    pub fn label_set(&self) -> ClipLabelSet {
+        ClipLabelSet {
+            positive: self.positive.clone(),
+            negative: self.negative.clone(),
+            score_min: self.score_min,
+            top_k: self.top_k,
+        }
+    }
+
+    pub fn encode_label_set(
+        &self,
+        positive_labels: &[String],
+        negative_labels: &[String],
+        score_min: f32,
+        top_k: usize,
+    ) -> Result<ClipLabelSet> {
+        let positive = self.encode_prompts(positive_labels)?;
+        let negative = self.encode_prompts(negative_labels)?;
+        Ok(ClipLabelSet {
+            positive,
+            negative,
+            score_min,
+            top_k,
+        })
+    }
+
+    pub fn detect_region(
         &self,
         rgb: &[u8],
         width: u32,
         height: u32,
         exclude: Option<NormalizedRect>,
-    ) -> Option<GameplayObservation> {
+        labels: &ClipLabelSet,
+    ) -> Option<ClipRegionObservation> {
+        self.detect_region_with_labels(rgb, width, height, exclude, labels)
+    }
+
+    fn detect_region_with_labels(
+        &self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        exclude: Option<NormalizedRect>,
+        labels: &ClipLabelSet,
+    ) -> Option<ClipRegionObservation> {
         if width < PATCH_SIZE as u32 || height < PATCH_SIZE as u32 {
             return None;
         }
@@ -255,6 +308,97 @@ impl ClipGameplayDetector {
         }
         let exclude = normalize_rect(exclude);
 
+        let mut scores = self.score_patches(
+            rgb,
+            width,
+            height,
+            exclude,
+            &labels.positive,
+            &labels.negative,
+        )?;
+
+        if scores.is_empty() {
+            return None;
+        }
+
+        scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let top_k = labels.top_k.min(scores.len()).max(1);
+        let mut weight_sum = 0.0f32;
+        let mut sum_x = 0.0f32;
+        let mut sum_y = 0.0f32;
+        let best_score = scores[0].score;
+        let patch_w = PATCH_SIZE as f32 / width as f32;
+        let patch_h = PATCH_SIZE as f32 / height as f32;
+        let mut min_x = 1.0f32;
+        let mut min_y = 1.0f32;
+        let mut max_x = 0.0f32;
+        let mut max_y = 0.0f32;
+
+        for patch in scores.iter().take(top_k) {
+            if patch.score < labels.score_min {
+                continue;
+            }
+            let weight = patch.score.max(0.0);
+            if weight <= 0.0 {
+                continue;
+            }
+            weight_sum += weight;
+            sum_x += patch.cx * weight;
+            sum_y += patch.cy * weight;
+            let x0 = (patch.cx - patch_w / 2.0).clamp(0.0, 1.0);
+            let y0 = (patch.cy - patch_h / 2.0).clamp(0.0, 1.0);
+            let x1 = (patch.cx + patch_w / 2.0).clamp(0.0, 1.0);
+            let y1 = (patch.cy + patch_h / 2.0).clamp(0.0, 1.0);
+            min_x = min_x.min(x0);
+            min_y = min_y.min(y0);
+            max_x = max_x.max(x1);
+            max_y = max_y.max(y1);
+        }
+
+        if weight_sum <= 0.0 {
+            if best_score < labels.score_min {
+                return None;
+            }
+            let best = scores[0];
+            weight_sum = 1.0;
+            sum_x = best.cx;
+            sum_y = best.cy;
+            let x0 = (best.cx - patch_w / 2.0).clamp(0.0, 1.0);
+            let y0 = (best.cy - patch_h / 2.0).clamp(0.0, 1.0);
+            let x1 = (best.cx + patch_w / 2.0).clamp(0.0, 1.0);
+            let y1 = (best.cy + patch_h / 2.0).clamp(0.0, 1.0);
+            min_x = x0;
+            min_y = y0;
+            max_x = x1;
+            max_y = y1;
+        }
+
+        let rect = NormalizedRect {
+            x: clamp_unit(min_x),
+            y: clamp_unit(min_y),
+            w: clamp_unit((max_x - min_x).max(patch_w)),
+            h: clamp_unit((max_y - min_y).max(patch_h)),
+        };
+
+        Some(ClipRegionObservation {
+            rect,
+            center: NormalizedPoint {
+                x: clamp_unit(sum_x / weight_sum),
+                y: clamp_unit(sum_y / weight_sum),
+            },
+            score: best_score,
+        })
+    }
+
+    fn score_patches(
+        &self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        exclude: Option<NormalizedRect>,
+        positive: &[Vec<f32>],
+        negative: &[Vec<f32>],
+    ) -> Option<Vec<PatchScore>> {
         let stride = self.stride.max(1) as usize;
         let patch = PATCH_SIZE;
         let mut scores: Vec<PatchScore> = Vec::new();
@@ -287,8 +431,8 @@ impl ClipGameplayDetector {
                 if !normalize_vec(&mut embed) {
                     continue;
                 }
-                let pos = max_similarity(&embed, &self.positive);
-                let neg = max_similarity(&embed, &self.negative);
+                let pos = max_similarity(&embed, positive);
+                let neg = max_similarity(&embed, negative);
                 let score = pos - neg;
                 if score.is_finite() {
                     scores.push(PatchScore { score, cx, cy });
@@ -296,45 +440,7 @@ impl ClipGameplayDetector {
             }
         }
 
-        if scores.is_empty() {
-            return None;
-        }
-
-        scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        let top_k = self.top_k.min(scores.len());
-        let mut weight_sum = 0.0f32;
-        let mut sum_x = 0.0f32;
-        let mut sum_y = 0.0f32;
-        let best_score = scores[0].score;
-        for patch in scores.iter().take(top_k) {
-            if patch.score < self.score_min {
-                continue;
-            }
-            let weight = patch.score.max(0.0);
-            if weight <= 0.0 {
-                continue;
-            }
-            weight_sum += weight;
-            sum_x += patch.cx * weight;
-            sum_y += patch.cy * weight;
-        }
-
-        if weight_sum <= 0.0 {
-            if best_score < self.score_min {
-                return None;
-            }
-            weight_sum = 1.0;
-            sum_x = scores[0].cx;
-            sum_y = scores[0].cy;
-        }
-
-        Some(GameplayObservation {
-            center: NormalizedPoint {
-                x: clamp_unit(sum_x / weight_sum),
-                y: clamp_unit(sum_y / weight_sum),
-            },
-            score: best_score,
-        })
+        Some(scores)
     }
 
     fn encode_prompts(&self, prompts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -484,7 +590,7 @@ fn parse_size(value: &str) -> Option<(u32, u32)> {
     }
 }
 
-fn parse_label_list(value: String) -> Vec<String> {
+pub fn parse_label_list(value: String) -> Vec<String> {
     value
         .split(|c| c == '|' || c == ',')
         .map(|v| v.trim().to_string())
@@ -539,13 +645,10 @@ fn normalize_rect(rect: Option<NormalizedRect>) -> Option<NormalizedRect> {
 }
 
 fn gameplay_debug_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("CLIP_GAMEPLAY_DEBUG")
-            .ok()
-            .and_then(|v| parse_bool(&v))
-            .unwrap_or(false)
-    })
+    std::env::var("CLIP_GAMEPLAY_DEBUG")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
 }
 
 pub fn log_gameplay_debug(message: &str) {

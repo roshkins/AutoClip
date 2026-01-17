@@ -1,15 +1,17 @@
 use anyhow::{Context, Result};
 use std::cmp::{max, min};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tract_onnx::prelude::*;
 use tract_onnx::tract_hir::infer::Factoid;
 use tract_onnx::tract_hir::internal::DimLike;
 
-use crate::clip_gameplay::{ClipGameplayDetector, GameplayObservation, read_clip_gameplay_config, log_gameplay_debug};
-use crate::clip_layout::{ClipLayoutHints, NormalizedPoint, NormalizedRect};
+use crate::clip_gameplay::{
+    ClipGameplayDetector, ClipLabelSet, ClipRegionObservation, log_gameplay_debug,
+    parse_label_list, read_clip_gameplay_config,
+};
+use crate::clip_layout::{ClipLayoutHints, FaceFrameSpec, NormalizedPoint, NormalizedRect};
 use crate::loading::LoadingTicker;
 
 #[cfg(feature = "ort")]
@@ -50,12 +52,11 @@ const DEFAULT_SAMPLE_STEP: f32 = 1.5;
 const DEFAULT_FRAME_WIDTH: u32 = 960;
 const DEFAULT_FRAME_HEIGHT: u32 = 540;
 const DEFAULT_FACE_MODEL_PATH: &str = "models/face_detection_yunet_2023mar.onnx";
-const DEFAULT_FACE_SCORE: f32 = 0.5;
+const DEFAULT_FACE_SCORE: f32 = 0.6;
 const DEFAULT_FACE_TILE_MIN_SCORE: f32 = 0.60;
 const DEFAULT_FACE_TILE_MAX_DEPTH: usize = 3;
 const DEFAULT_FACE_PICK_RAW: bool = true;
 const DEFAULT_FACE_TRACK_STEP_SECS: f32 = 2.0;
-const GAMEPLAY_FACE_EXCLUDE_SCALE: f32 = 1.4;
 const MAX_FULL_SAMPLES: usize = 60;
 const MAX_FACE_CANDIDATES: usize = 24;
 const FACE_EDGE_MARGIN: f32 = 0.02;
@@ -71,8 +72,48 @@ const FACE_LANDMARK_MOUTH_CENTER_MAX: f32 = 0.35;
 const FACE_LANDMARK_MIN_EYE_RATIO: f32 = 0.18;
 const FACE_LANDMARK_EYE_NOSE_MIN: f32 = 0.05;
 const FACE_LANDMARK_NOSE_MOUTH_MIN: f32 = 0.06;
-const FACE_SCAN_REGION_SIZES: [f32; 2] = [0.5, 0.35];
+const FACE_SCAN_REGION_SIZES: [f32; 3] = [0.7, 0.5, 0.35];
 const FACE_REGION_MARGIN: f32 = 0.02;
+const FACE_FRAME_HEAD_TOP_DEFAULT: f32 = -0.18;
+const FACE_FRAME_HEAD_TOP_MIN: f32 = -0.6;
+const FACE_FRAME_HEAD_TOP_MAX: f32 = 0.2;
+const FACE_FRAME_EYE_TOP_RATIO: f32 = 0.40;
+const FACE_FRAME_EYE_CHIN_RATIO: f32 = 0.60;
+const FACE_FRAME_SHOULDER_SCALE: f32 = 2.6;
+
+fn read_env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+
+fn face_frame_head_top_default() -> f32 {
+    read_env_f32("CLIP_FACE_FRAME_HEAD_TOP", FACE_FRAME_HEAD_TOP_DEFAULT)
+}
+
+fn face_frame_head_top_min() -> f32 {
+    read_env_f32("CLIP_FACE_FRAME_HEAD_TOP_MIN", FACE_FRAME_HEAD_TOP_MIN)
+}
+
+fn face_frame_head_top_max() -> f32 {
+    read_env_f32("CLIP_FACE_FRAME_HEAD_TOP_MAX", FACE_FRAME_HEAD_TOP_MAX)
+}
+
+fn face_frame_eye_top_ratio() -> f32 {
+    read_env_f32("CLIP_FACE_FRAME_EYE_TOP_RATIO", FACE_FRAME_EYE_TOP_RATIO)
+}
+
+fn face_frame_eye_chin_ratio() -> f32 {
+    let ratio = read_env_f32("CLIP_FACE_FRAME_EYE_CHIN_RATIO", FACE_FRAME_EYE_CHIN_RATIO);
+    if ratio <= 0.0 { FACE_FRAME_EYE_CHIN_RATIO } else { ratio }
+}
+
+fn face_frame_shoulder_scale() -> f32 {
+    let scale = read_env_f32("CLIP_FACE_FRAME_SHOULDER_SCALE", FACE_FRAME_SHOULDER_SCALE);
+    if scale <= 0.0 { FACE_FRAME_SHOULDER_SCALE } else { scale }
+}
 
 fn parse_face_backend(value: &str) -> Option<FaceBackend> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -431,7 +472,7 @@ async fn build_face_sweep_inputs(
         for seek in sample_times {
             let seek_arg = if seek > 0.0 { Some(seek) } else { None };
             let candidates =
-                detect_face_candidates(input, seek_arg, detector, source_dims).await;
+                detect_face_candidates(input, seek_arg, detector, source_dims, None).await;
             if !candidates.is_empty() {
                 face_samples.push(FaceSample {
                     time: seek,
@@ -507,9 +548,14 @@ pub async fn detect_layout_hints(
             step
         );
     }
-    let gameplay_sample_times = build_sample_times(config, is_local, duration_secs);
+    let gameplay_detection = clip_region_detection_enabled();
+    let gameplay_sample_times = if gameplay_detection {
+        build_sample_times(config, is_local, duration_secs)
+    } else {
+        Vec::new()
+    };
     let gameplay_total_samples = gameplay_sample_times.len();
-    if gameplay_total_samples > 0 {
+    if gameplay_detection && gameplay_total_samples > 0 {
         let first = gameplay_sample_times.first().copied().unwrap_or(0.0);
         let last = gameplay_sample_times.last().copied().unwrap_or(first);
         eprintln!(
@@ -531,10 +577,13 @@ pub async fn detect_layout_hints(
     let mut gameplay_weight = 0.0f32;
     let mut gameplay_sum_x = 0.0f32;
     let mut gameplay_sum_y = 0.0f32;
-    let mut gameplay_best: Option<GameplayObservation> = None;
+    let mut gameplay_best: Option<ClipRegionObservation> = None;
     let mut face_best: Option<FaceConsensus> = None;
     let mut face_observations: Vec<FaceObservation> = Vec::new();
-    let mut face_exclude: Option<NormalizedRect> = None;
+    let mut gameplay_config = None;
+    let mut clip_detector: Option<ClipGameplayDetector> = None;
+    let mut gameplay_labels: Option<ClipLabelSet> = None;
+    let mut cam_labels: Option<ClipLabelSet> = None;
 
     let face_detector = match YunetDetector::new(config) {
         Ok(detector) => detector,
@@ -543,6 +592,75 @@ pub async fn detect_layout_hints(
             None
         }
     };
+
+    if gameplay_detection {
+        let cfg = read_clip_gameplay_config(config.frame_width, config.frame_height);
+        gameplay_config = Some(cfg.clone());
+        let detector = match ClipGameplayDetector::new(&cfg) {
+            Ok(detector) => detector,
+            Err(err) => {
+                eprintln!("clip detect: failed to load CLIP model: {err:#}");
+                None
+            }
+        };
+        if let Some(detector) = detector {
+            let cam_score = cam_score_min(cfg.score_min);
+            let cam_top_k = cam_top_k(cfg.top_k);
+            let cam_labels_raw = cam_label_list();
+            let cam_neg_labels_raw = cam_neg_label_list();
+            if !cam_labels_raw.is_empty() && !cam_neg_labels_raw.is_empty() {
+                match detector.encode_label_set(
+                    &cam_labels_raw,
+                    &cam_neg_labels_raw,
+                    cam_score,
+                    cam_top_k,
+                ) {
+                    Ok(labels) => cam_labels = Some(labels),
+                    Err(err) => {
+                        eprintln!("clip detect: failed to encode cam labels: {err:#}");
+                    }
+                }
+            }
+            gameplay_labels = Some(detector.label_set());
+            clip_detector = Some(detector);
+        }
+    }
+
+    if hints.face_region.is_none() {
+        if let (Some(detector), Some(labels)) = (clip_detector.as_ref(), cam_labels.as_ref()) {
+            let cam_seek = face_sample_times
+                .first()
+                .copied()
+                .or_else(|| gameplay_sample_times.first().copied())
+                .unwrap_or(config.sample_start_secs);
+            let (cam_w, cam_h) = gameplay_config
+                .as_ref()
+                .map(|cfg| (cfg.frame_width, cfg.frame_height))
+                .unwrap_or((config.frame_width, config.frame_height));
+            let seek_arg = if cam_seek > 0.0 { Some(cam_seek) } else { None };
+            match extract_frame_rgb(input, seek_arg, cam_w, cam_h).await {
+                Ok(frame) => {
+                    if let Some(obs) = detector.detect_region(
+                        frame.as_slice(),
+                        cam_w,
+                        cam_h,
+                        None,
+                        labels,
+                    ) {
+                        let region = expand_rect(obs.rect, cam_region_scale());
+                        hints.face_region = Some(region);
+                        eprintln!(
+                            "clip detect: cam region score={:.4} x={:.3} y={:.3} w={:.3} h={:.3}",
+                            obs.score, region.x, region.y, region.w, region.h
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!("clip detect: cam frame extraction failed ({cam_seek:.2}s): {err:#}");
+                }
+            }
+        }
+    }
 
     if face_total_samples > 0 {
         if let Some(detector) = face_detector.as_ref() {
@@ -572,7 +690,14 @@ pub async fn detect_layout_hints(
                     seek
                 );
                 let seek_arg = if seek > 0.0 { Some(seek) } else { None };
-                let candidates = detect_face_candidates(input, seek_arg, detector, source_dims).await;
+                let candidates = detect_face_candidates(
+                    input,
+                    seek_arg,
+                    detector,
+                    source_dims,
+                    hints.face_region,
+                )
+                .await;
                 face_samples_attempted += 1;
                 if !candidates.is_empty() {
                     face_samples.push(FaceSample {
@@ -601,45 +726,39 @@ pub async fn detect_layout_hints(
             detector,
             config.face_score_threshold,
         ) {
-            if result.pass_label != "strict" {
+            let accept_face =
+                result.pass_label == "raw" || result.best.score >= config.face_score_threshold;
+            if accept_face {
+                if result.pass_label != "strict" {
+                    eprintln!(
+                        "clip detect: relaxing face filters -> {}",
+                        result.pass_label
+                    );
+                }
+                face_best = Some(result.best);
+                face_observations = result.observations;
+            } else {
                 eprintln!(
-                    "clip detect: relaxing face filters -> {}",
-                    result.pass_label
+                    "clip detect: best face score {:.4} below threshold {:.2}; ignoring",
+                    result.best.score,
+                    config.face_score_threshold
                 );
             }
-            face_best = Some(result.best);
-            face_observations = result.observations;
         }
     }
-    face_exclude = face_best
-        .as_ref()
-        .map(|best| expand_rect(best.rect, GAMEPLAY_FACE_EXCLUDE_SCALE));
-    if let Some(rect) = face_exclude {
-        log_gameplay_debug(&format!(
-            "clip detect: gameplay exclusion x={:.3} y={:.3} w={:.3} h={:.3}",
-            rect.x, rect.y, rect.w, rect.h
-        ));
-    }
-
-    if gameplay_total_samples > 0 {
+    if gameplay_detection && gameplay_total_samples > 0 {
         if has_budget && gameplay_budget.is_none() {
             eprintln!("clip detect: gameplay time budget 0.0s; skipping gameplay samples");
         } else {
-            let gameplay_config = read_clip_gameplay_config(config.frame_width, config.frame_height);
-            let gameplay_detector = match ClipGameplayDetector::new(&gameplay_config) {
-                Ok(detector) => detector,
-                Err(err) => {
-                    eprintln!("clip detect: failed to load gameplay model: {err:#}");
-                    None
-                }
-            };
-
             let gameplay_start = Instant::now();
             let gameplay_tick = Some(LoadingTicker::start(
                 "clip detect: analyzing gameplay samples",
                 Duration::from_secs(5),
             ));
             let mut gameplay_samples_attempted = 0usize;
+            let use_reticle = clip_detector.is_none();
+            let labels = gameplay_labels.as_ref();
+            let cfg = gameplay_config.as_ref();
             for (idx, seek) in gameplay_sample_times.iter().copied().enumerate() {
                 if let Some(budget) = gameplay_budget {
                     let elapsed = gameplay_start.elapsed();
@@ -676,34 +795,29 @@ pub async fn detect_layout_hints(
                 };
                 gameplay_samples_attempted += 1;
 
-                if let Some(reticle) =
-                    detect_reticle_candidate(&frame, config.frame_width, config.frame_height)
-                {
-                    if face_exclude
-                        .map(|rect| rect_contains_point(rect, reticle.center))
-                        .unwrap_or(false)
+                if use_reticle {
+                    if let Some(reticle) =
+                        detect_reticle_candidate(&frame, config.frame_width, config.frame_height)
                     {
-                        log_gameplay_debug(
-                            "clip detect: reticle overlaps face; ignoring reticle hint",
-                        );
-                    } else {
                         reticle_sum_x += reticle.center.x * reticle.score;
                         reticle_sum_y += reticle.center.y * reticle.score;
                         reticle_weight += reticle.score;
                     }
                 }
 
-                if let Some(detector) = gameplay_detector.as_ref() {
-                    let gameplay_frame = if gameplay_config.frame_width == config.frame_width
-                        && gameplay_config.frame_height == config.frame_height
+                if let (Some(detector), Some(labels), Some(cfg)) =
+                    (clip_detector.as_ref(), labels, cfg)
+                {
+                    let gameplay_frame = if cfg.frame_width == config.frame_width
+                        && cfg.frame_height == config.frame_height
                     {
                         None
                     } else {
                         match extract_frame_rgb(
                             input,
                             seek_arg,
-                            gameplay_config.frame_width,
-                            gameplay_config.frame_height,
+                            cfg.frame_width,
+                            cfg.frame_height,
                         )
                         .await
                         {
@@ -717,16 +831,12 @@ pub async fn detect_layout_hints(
                         }
                     };
                     let (rgb, gw, gh) = if let Some(ref data) = gameplay_frame {
-                        (
-                            data.as_slice(),
-                            gameplay_config.frame_width,
-                            gameplay_config.frame_height,
-                        )
+                        (data.as_slice(), cfg.frame_width, cfg.frame_height)
                     } else {
                         (frame.as_slice(), config.frame_width, config.frame_height)
                     };
 
-                    if let Some(obs) = detector.detect(rgb, gw, gh, face_exclude) {
+                    if let Some(obs) = detector.detect_region(rgb, gw, gh, None, labels) {
                         let weight = obs.score.max(0.0);
                         if weight > 0.0 {
                             gameplay_sum_x += obs.center.x * weight;
@@ -754,7 +864,20 @@ pub async fn detect_layout_hints(
         }
     }
 
-    hints.face_box = face_best.map(|c| c.rect);
+    if let Some(best) = face_best {
+        hints.face_box = Some(best.rect);
+        hints.face_frame_spec = Some(best.frame_spec);
+        let region = pick_face_region(best.rect).or_else(|| {
+            if best.region.w >= 0.25 && best.region.h >= 0.25 {
+                Some(best.region)
+            } else {
+                None
+            }
+        });
+        if hints.face_region.is_none() {
+            hints.face_region = region;
+        }
+    }
 
     if config.track_face {
         if let Some(best) = &face_best {
@@ -798,11 +921,23 @@ pub async fn detect_layout_hints(
         } else {
             eprintln!("clip detect: face box not detected");
         }
+        if let Some(region) = hints.face_region {
+            eprintln!(
+                "clip detect: face region x={:.3} y={:.3} w={:.3} h={:.3}",
+                region.x, region.y, region.w, region.h
+            );
+        }
     }
     if let Some(best) = gameplay_best {
         log_gameplay_debug(&format!(
-            "clip detect: gameplay pick score={:.4} center x={:.3} y={:.3}",
-            best.score, best.center.x, best.center.y
+            "clip detect: gameplay pick score={:.4} center x={:.3} y={:.3} region x={:.3} y={:.3} w={:.3} h={:.3}",
+            best.score,
+            best.center.x,
+            best.center.y,
+            best.rect.x,
+            best.rect.y,
+            best.rect.w,
+            best.rect.h
         ));
     }
 
@@ -817,19 +952,6 @@ pub async fn detect_layout_hints(
             y: clamp_unit(reticle_sum_y / reticle_weight),
         });
     }
-    if let (Some(center), Some(exclude)) = (hints.game_center, face_exclude) {
-        if rect_contains_point(exclude, center) {
-            let nudged = nudge_center_outside_rect(center, exclude);
-            if nudged != center {
-                log_gameplay_debug(&format!(
-                    "clip detect: nudging game center x={:.3} y={:.3} away from face",
-                    nudged.x, nudged.y
-                ));
-                hints.game_center = Some(nudged);
-            }
-        }
-    }
-
     Ok(hints)
 }
 
@@ -979,11 +1101,33 @@ fn rect_inside_region(rect: NormalizedRect, region: NormalizedRect, margin: f32)
         && rect.y + rect.h <= bottom
 }
 
+fn pick_face_region(face_rect: NormalizedRect) -> Option<NormalizedRect> {
+    let mut best: Option<NormalizedRect> = None;
+    for region in build_face_scan_regions() {
+        if region_is_full(region.rect) {
+            continue;
+        }
+        if !rect_inside_region(face_rect, region.rect, FACE_REGION_MARGIN) {
+            continue;
+        }
+        let area = region.rect.w * region.rect.h;
+        let replace = match best {
+            None => true,
+            Some(current) => area > current.w * current.h,
+        };
+        if replace {
+            best = Some(region.rect);
+        }
+    }
+    best
+}
+
 async fn detect_face_candidates(
     input: &str,
     seek: Option<f32>,
     detector: &YunetDetector,
     source_dims: Option<(u32, u32)>,
+    preferred_region: Option<NormalizedRect>,
 ) -> Vec<FaceCandidate> {
     let regions = build_face_scan_regions();
     let full_region = regions
@@ -999,6 +1143,35 @@ async fn detect_face_candidates(
 
     let mut all_candidates = Vec::new();
     let dump_raw = face_dump_raw_enabled();
+    if let Some(region) = preferred_region {
+        if region.w > 0.0 && region.h > 0.0 {
+            match detect_faces_in_region(input, seek, detector, region, source_dims).await {
+                Ok(mut candidates) => {
+                    if face_debug_enabled() {
+                        eprintln!(
+                            "clip detect: face scan cam -> {} candidates",
+                            candidates.len()
+                        );
+                    }
+                    all_candidates.append(&mut candidates);
+                }
+                Err(err) => {
+                    eprintln!("clip detect: face frame extraction failed (cam): {err:#}");
+                }
+            }
+            if dump_raw {
+                match detect_faces_in_region_raw(input, seek, detector, region, source_dims).await {
+                    Ok(raw_candidates) => {
+                        maybe_dump_face_candidates(input, seek, &raw_candidates, "faces_cam_raw")
+                            .await;
+                    }
+                    Err(err) => {
+                        eprintln!("clip detect: face raw dump failed (cam): {err:#}");
+                    }
+                }
+            }
+        }
+    }
     let mut full_candidates = match detect_faces_in_region(
         input,
         seek,
@@ -1405,6 +1578,8 @@ fn select_face_with_relaxation(
                     rect: best.rect,
                     score: best.score,
                     time: sample.time,
+                    region: best.region,
+                    frame_spec: face_frame_spec_for_candidate(&best),
                 });
             }
         }
@@ -1438,24 +1613,41 @@ fn select_best_raw_candidate(
     }
     let mut observations = Vec::new();
     for sample in samples {
-        let mut best: Option<FaceCandidate> = None;
+        let mut best: Option<(f32, f32, FaceCandidate)> = None;
+        let has_landmarks = sample
+            .candidates
+            .iter()
+            .any(|c| c.landmarks_ok && c.raw_score.is_finite() && c.raw_score >= min_score);
         for candidate in &sample.candidates {
             if !candidate.raw_score.is_finite() || candidate.raw_score < min_score {
                 continue;
             }
-            let replace = best
-                .as_ref()
-                .map(|best| candidate.raw_score > best.raw_score)
-                .unwrap_or(true);
+            if has_landmarks && !candidate.landmarks_ok {
+                continue;
+            }
+            let weighted =
+                face_candidate_weighted_score(candidate.model_rect, candidate.raw_score);
+            if !weighted.is_finite() {
+                continue;
+            }
+            let replace = match best {
+                None => true,
+                Some((best_weighted, best_raw, _)) => {
+                    weighted > best_weighted
+                        || (weighted == best_weighted && candidate.raw_score > best_raw)
+                }
+            };
             if replace {
-                best = Some(*candidate);
+                best = Some((weighted, candidate.raw_score, *candidate));
             }
         }
-        if let Some(best) = best {
+        if let Some((_weighted, raw, best)) = best {
             observations.push(FaceObservation {
                 rect: best.rect,
-                score: best.raw_score,
+                score: raw,
                 time: sample.time,
+                region: best.region,
+                frame_spec: face_frame_spec_for_candidate(&best),
             });
         }
     }
@@ -1762,46 +1954,32 @@ fn build_bisection_times(start: f32, end: f32, max_samples: usize) -> Vec<f32> {
 }
 
 fn face_debug_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("CLIP_FACE_DEBUG")
-            .ok()
-            .and_then(|v| parse_bool(&v))
-            .unwrap_or(false)
-    })
+    std::env::var("CLIP_FACE_DEBUG")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
 }
 
 fn face_dump_dir() -> Option<PathBuf> {
-    static CACHED: OnceLock<Option<PathBuf>> = OnceLock::new();
-    CACHED
-        .get_or_init(|| {
-            std::env::var("CLIP_FACE_DUMP_DIR")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-        })
-        .clone()
+    std::env::var("CLIP_FACE_DUMP_DIR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn face_dump_raw_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("CLIP_FACE_DUMP_RAW")
-            .ok()
-            .and_then(|v| parse_bool(&v))
-            .unwrap_or(false)
-    })
+    std::env::var("CLIP_FACE_DUMP_RAW")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
 }
 
 fn face_pick_raw_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("CLIP_FACE_PICK_RAW")
-            .ok()
-            .and_then(|v| parse_bool(&v))
-            .unwrap_or(DEFAULT_FACE_PICK_RAW)
-    })
+    std::env::var("CLIP_FACE_PICK_RAW")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(DEFAULT_FACE_PICK_RAW)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1837,6 +2015,62 @@ fn raw_pick_min_score(base_score: f32) -> f32 {
     } else {
         base_score
     }
+}
+
+fn clip_region_detection_enabled() -> bool {
+    std::env::var("CLIP_REGION_DETECT")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .or_else(|| {
+            std::env::var("CLIP_GAMEPLAY_DETECT")
+                .ok()
+                .and_then(|v| parse_bool(&v))
+        })
+        .unwrap_or(true)
+}
+
+fn cam_label_list() -> Vec<String> {
+    parse_label_list(
+        std::env::var("CLIP_CAM_LABELS")
+            .ok()
+            .unwrap_or_else(|| {
+                "webcam overlay|streamer cam|facecam|person portrait|streamer".to_string()
+            }),
+    )
+}
+
+fn cam_neg_label_list() -> Vec<String> {
+    parse_label_list(
+        std::env::var("CLIP_CAM_NEG_LABELS")
+            .ok()
+            .unwrap_or_else(|| {
+                "video game gameplay|game UI|game HUD|chat box|text overlay".to_string()
+            }),
+    )
+}
+
+fn cam_score_min(default_score: f32) -> f32 {
+    std::env::var("CLIP_CAM_SCORE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(|v| v.clamp(-1.0, 1.0))
+        .unwrap_or(default_score)
+}
+
+fn cam_top_k(default_top_k: usize) -> usize {
+    std::env::var("CLIP_CAM_TOPK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, 24))
+        .unwrap_or(default_top_k)
+}
+
+fn cam_region_scale() -> f32 {
+    std::env::var("CLIP_CAM_REGION_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(|v| v.clamp(1.0, 3.0))
+        .unwrap_or(1.6)
 }
 
 const YUNET_STRIDES: [usize; 3] = [8, 16, 32];
@@ -2296,6 +2530,7 @@ impl YunetDetector {
                     raw_score: score,
                     score: weighted_score,
                     landmarks_ok: false,
+                    landmarks: None,
                     region,
                 });
             }
@@ -2428,6 +2663,7 @@ impl YunetDetector {
                 }
                 let mut model_rect = rect;
                 let mut landmarks_ok = false;
+                let mut landmarks: Option<[NormalizedPoint; 5]> = None;
                 if let (Some(kps_vals), Some(layout)) = (kps_vals, kps_layout) {
                     if let Some(points) = decode_keypoints(
                         kps_vals,
@@ -2443,6 +2679,7 @@ impl YunetDetector {
                         }
                         let center = points_center(&points);
                         model_rect = recenter_rect(model_rect, center);
+                        landmarks = map_landmarks(mapping, points);
                     }
                 }
                 let mapped_rect = match mapping {
@@ -2464,6 +2701,7 @@ impl YunetDetector {
                         raw_score: score,
                         score: weighted_score,
                         landmarks_ok,
+                        landmarks,
                         region,
                     });
                 }
@@ -2845,6 +3083,36 @@ fn landmarks_frontal(points: &[NormalizedPoint; 5], rect: NormalizedRect) -> boo
     true
 }
 
+fn face_frame_spec_for_candidate(candidate: &FaceCandidate) -> FaceFrameSpec {
+    let mut head_top_offset = face_frame_head_top_default();
+    if candidate.landmarks_ok {
+        if let Some(points) = candidate.landmarks {
+            if let Some(landmarks) = classify_landmarks(&points) {
+                let eye_mid = midpoint(landmarks.left_eye, landmarks.right_eye);
+                let chin_y = candidate.rect.y + candidate.rect.h;
+                let eye_to_chin = chin_y - eye_mid.y;
+                if eye_to_chin.is_finite() && eye_to_chin > 1e-4 {
+                    let eye_top_ratio = face_frame_eye_top_ratio();
+                    let eye_chin_ratio = face_frame_eye_chin_ratio();
+                    let head_height = eye_to_chin / eye_chin_ratio;
+                    let head_top = eye_mid.y - eye_top_ratio * head_height;
+                    let denom = candidate.rect.h.max(1e-4);
+                    let offset = (head_top - candidate.rect.y) / denom;
+                    if offset.is_finite() {
+                        let min_offset = face_frame_head_top_min();
+                        let max_offset = face_frame_head_top_max().max(min_offset);
+                        head_top_offset = offset.clamp(min_offset, max_offset);
+                    }
+                }
+            }
+        }
+    }
+    FaceFrameSpec {
+        head_top_offset,
+        shoulder_width_scale: face_frame_shoulder_scale(),
+    }
+}
+
 fn normalize_rect(
     x: f32,
     y: f32,
@@ -3006,6 +3274,48 @@ impl FrameMapping {
             w: clamp_unit(w / self.full_w),
             h: clamp_unit(h / self.full_h),
         })
+    }
+
+    fn map_point(&self, point: NormalizedPoint) -> Option<NormalizedPoint> {
+        if self.scale <= 0.0
+            || self.full_w <= 0.0
+            || self.full_h <= 0.0
+            || self.region_w <= 0.0
+            || self.region_h <= 0.0
+        {
+            return None;
+        }
+        let x_model = point.x * self.model_w;
+        let y_model = point.y * self.model_h;
+        let x_region = (x_model - self.pad_x) / self.scale;
+        let y_region = (y_model - self.pad_y) / self.scale;
+        let x_src = x_region + self.region_x;
+        let y_src = y_region + self.region_y;
+        if !x_src.is_finite() || !y_src.is_finite() {
+            return None;
+        }
+        let x = x_src.clamp(0.0, self.full_w);
+        let y = y_src.clamp(0.0, self.full_h);
+        Some(NormalizedPoint {
+            x: clamp_unit(x / self.full_w),
+            y: clamp_unit(y / self.full_h),
+        })
+    }
+}
+
+fn map_landmarks(
+    mapping: Option<&FrameMapping>,
+    points: [NormalizedPoint; 5],
+) -> Option<[NormalizedPoint; 5]> {
+    if let Some(mapper) = mapping {
+        let mut out = [NormalizedPoint { x: 0.0, y: 0.0 }; 5];
+        for (idx, point) in points.iter().copied().enumerate() {
+            let mapped = mapper.map_point(point)?;
+            out[idx] = mapped;
+        }
+        Some(out)
+    } else {
+        Some(points)
     }
 }
 
@@ -3236,6 +3546,7 @@ struct FaceCandidate {
     raw_score: f32,
     score: f32,
     landmarks_ok: bool,
+    landmarks: Option<[NormalizedPoint; 5]>,
     region: NormalizedRect,
 }
 
@@ -3256,6 +3567,8 @@ struct FaceObservation {
     rect: NormalizedRect,
     score: f32,
     time: f32,
+    region: NormalizedRect,
+    frame_spec: FaceFrameSpec,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3265,6 +3578,8 @@ struct FaceConsensus {
     time: f32,
     count: usize,
     max_dist: f32,
+    region: NormalizedRect,
+    frame_spec: FaceFrameSpec,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3309,42 +3624,6 @@ fn expand_rect(rect: NormalizedRect, scale: f32) -> NormalizedRect {
         },
         center,
     )
-}
-
-fn rect_contains_point(rect: NormalizedRect, point: NormalizedPoint) -> bool {
-    let x0 = clamp_unit(rect.x);
-    let y0 = clamp_unit(rect.y);
-    let x1 = clamp_unit(rect.x + rect.w);
-    let y1 = clamp_unit(rect.y + rect.h);
-    if x1 <= x0 || y1 <= y0 {
-        return false;
-    }
-    point.x >= x0 && point.x <= x1 && point.y >= y0 && point.y <= y1
-}
-
-fn nudge_center_outside_rect(
-    center: NormalizedPoint,
-    rect: NormalizedRect,
-) -> NormalizedPoint {
-    if !rect_contains_point(rect, center) {
-        return center;
-    }
-    let left_space = rect.x.max(0.0);
-    let right_space = (1.0 - (rect.x + rect.w)).max(0.0);
-    let top_space = rect.y.max(0.0);
-    let bottom_space = (1.0 - (rect.y + rect.h)).max(0.0);
-    let margin = 0.02;
-    let mut out = center;
-    if right_space >= left_space && right_space >= top_space && right_space >= bottom_space {
-        out.x = clamp_unit(rect.x + rect.w + margin);
-    } else if left_space >= top_space && left_space >= bottom_space {
-        out.x = clamp_unit(rect.x - margin);
-    } else if bottom_space >= top_space {
-        out.y = clamp_unit(rect.y + rect.h + margin);
-    } else {
-        out.y = clamp_unit(rect.y - margin);
-    }
-    out
 }
 
 fn select_consensus_face(observations: &[FaceObservation]) -> Option<FaceConsensus> {
@@ -3476,6 +3755,8 @@ impl FaceCluster {
                 time: self.best.time,
                 count: self.count,
                 max_dist: self.max_dist,
+                region: self.best.region,
+                frame_spec: self.best.frame_spec,
             }
         } else {
             FaceConsensus {
@@ -3484,6 +3765,8 @@ impl FaceCluster {
                 time: self.best.time,
                 count: self.count,
                 max_dist: self.max_dist,
+                region: self.best.region,
+                frame_spec: self.best.frame_spec,
             }
         }
     }

@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::process::Command;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::time::sleep;
@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
 
 mod clip_detect;
 mod clip_gameplay;
@@ -30,8 +31,8 @@ mod rolling_buffer;
 use clip_detect::{detect_layout_hints, read_clip_detect_config, run_face_threshold_sweep};
 use clip_gameplay::{read_clip_gameplay_config, ClipGameplayDetector};
 use clip_layout::{
-    build_stacked_filter_graph, read_clip_layout_config, read_clip_layout_hints, ClipLayoutMode,
-    FilterGraph,
+    build_face_only_filter_graph, build_full_frame_fill_filter_graph, build_stacked_filter_graph,
+    read_clip_layout_config, read_clip_layout_hints, ClipLayoutMode, FilterGraph, NormalizedPoint,
 };
 use rolling_buffer::RollingBuffer;
 #[cfg(feature = "whisper")]
@@ -237,6 +238,11 @@ impl AutoClip {
         let stop_for_audio = stop.clone();
 
         let fired = Arc::new(AtomicBool::new(false));
+        let mut pending_saves: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut live_config = LiveConfigState::from_env();
+        if let Some(state) = live_config.as_mut() {
+            state.maybe_refresh();
+        }
 
         let hls = HlsClient::new()?;
         let (master_url, master) = hls.fetch_master_from_page(page_url).await?;
@@ -254,6 +260,8 @@ impl AutoClip {
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(12));
         let mut refractory_until: Option<Instant> = None;
+        let latency_refresh_threshold = Duration::from_secs(240);
+        let mut last_latency_refresh: Option<Instant> = None;
 
         // Start listening for the wake phrase, either from microphone or stream audio.
         let model_path = stream_audio_wake::select_best_model_path();
@@ -309,8 +317,43 @@ impl AutoClip {
         let poll_interval = Duration::from_millis(500);
 
         'stream_loop: loop {
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed)
+                && !fired.load(Ordering::Relaxed)
+                && after_remaining.is_none()
+            {
                 break;
+            }
+            if let Some(state) = live_config.as_mut() {
+                state.maybe_refresh();
+            }
+
+            let latency = Duration::from_nanos(max_latency_ns.load(Ordering::Relaxed));
+            if latency >= latency_refresh_threshold {
+                let now = Instant::now();
+                let can_refresh = last_latency_refresh
+                    .map(|t| now.duration_since(t) > Duration::from_secs(30))
+                    .unwrap_or(true);
+                if can_refresh {
+                    last_latency_refresh = Some(now);
+                    eprintln!(
+                        "processing latency {:.1}s exceeded {:.1}s; refreshing m3u8 via headless",
+                        latency.as_secs_f32(),
+                        latency_refresh_threshold.as_secs_f32()
+                    );
+                    match hls.refresh_media_url_from_page_headless(page_url).await {
+                        Ok(new_url) => {
+                            let mut guard = media_url
+                                .lock()
+                                .expect("media url lock poisoned while refreshing");
+                            *guard = new_url.clone();
+                            seen.clear();
+                            eprintln!("refreshed variant: {}", new_url);
+                        }
+                        Err(err) => {
+                            eprintln!("headless refresh failed: {err:#}");
+                        }
+                    }
+                }
             }
 
             let target_ns = buffer_target_ns.load(Ordering::Relaxed);
@@ -345,6 +388,7 @@ impl AutoClip {
                                 *guard = new_url.clone();
                                 seen.clear();
                                 eprintln!("refreshed variant: {}", new_url);
+                                continue 'stream_loop;
                             }
                             Err(refresh_err) => {
                                 eprintln!("headless refresh failed: {refresh_err:#}");
@@ -386,13 +430,12 @@ impl AutoClip {
                                         .expect("media url lock poisoned while refreshing");
                                     *guard = new_url;
                                     seen.clear();
+                                    continue 'stream_loop;
                                 }
                                 Err(refresh_err) => {
                                     eprintln!("headless refresh failed: {refresh_err:#}");
                                 }
                             }
-                            sleep(Duration::from_millis(800)).await;
-                            continue 'stream_loop;
                         }
                         eprintln!("failed to fetch segment {}: {err:#}", uri);
                         continue;
@@ -446,9 +489,6 @@ impl AutoClip {
 
             if let Some(rem_mut) = after_remaining.as_mut() {
                 if *rem_mut <= Duration::ZERO {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
                     let output_path = next_output_path(&save_root, &file_stub)?;
                     let ts_path = output_path.with_extension("ts");
                     let snapshot = buffer.snapshot_bytes();
@@ -521,11 +561,12 @@ impl AutoClip {
                             Ok::<(), anyhow::Error>(())
                         };
 
-                        tokio::spawn(async move {
+                        let handle = tokio::spawn(async move {
                             if let Err(err) = save_future.await {
                                 eprintln!("failed to persist wakeword clip: {err:#}");
                             }
                         });
+                        pending_saves.push(handle);
                     }
 
                     after_remaining = None;
@@ -572,6 +613,18 @@ impl AutoClip {
             }
 
             sleep(poll_interval).await;
+        }
+
+        if !pending_saves.is_empty() {
+            eprintln!(
+                "waiting for {} in-flight clip(s) before shutdown",
+                pending_saves.len()
+            );
+            for handle in pending_saves {
+                if let Err(err) = handle.await {
+                    eprintln!("clip task failed: {err}");
+                }
+            }
         }
 
         // continuous loop
@@ -2297,6 +2350,38 @@ fn build_ffmpeg_filters(out_w: u32, out_h: u32) -> (String, String, String) {
     (vf_cpu, vf_gpu_sw, vf_gpu_hw)
 }
 
+fn axis_center_expr(axis: &str, crop_dim: u32, center: f32) -> String {
+    let center = center.clamp(0.0, 1.0);
+    let half = crop_dim as f32 / 2.0;
+    let half_str = format!("{half:.1}");
+    format!(
+        "max(min({axis}*{center:.4}-{half_str}\\, {axis}-{crop_dim})\\, 0)"
+    )
+}
+
+fn build_ffmpeg_fill_filters(
+    out_w: u32,
+    out_h: u32,
+    center: NormalizedPoint,
+) -> (String, String, String) {
+    let x = axis_center_expr("iw", out_w, center.x);
+    let y = axis_center_expr("ih", out_h, center.y);
+    let vf_cpu = format!(
+        "scale={}:{}:force_original_aspect_ratio=increase,crop={}:{}:{x}:{y},format=yuv420p",
+        out_w, out_h, out_w, out_h
+    );
+    let vf_gpu_sw = format!(
+        "format=yuv420p,hwupload_cuda,scale_cuda=w={}:h={}:force_original_aspect_ratio=increase:format=nv12:interp_algo=lanczos,hwdownload,format=yuv420p,crop={}:{}:{x}:{y},format=yuv420p",
+        out_w, out_h, out_w, out_h
+    );
+    let vf_gpu_hw = format!(
+        "scale_cuda=w={}:h={}:force_original_aspect_ratio=increase:format=nv12:interp_algo=lanczos,hwdownload,format=yuv420p,crop={}:{}:{x}:{y},format=yuv420p",
+        out_w, out_h, out_w, out_h
+    );
+
+    (vf_cpu, vf_gpu_sw, vf_gpu_hw)
+}
+
 fn tail_trunc(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -2361,6 +2446,13 @@ fn parse_bool(value: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn gameplay_enabled() -> bool {
+    std::env::var("CLIP_GAMEPLAY")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(true)
 }
 
 fn audio_norm_enabled() -> bool {
@@ -2597,11 +2689,13 @@ async fn run_ffmpeg_internal(
     let layout = read_clip_layout_config();
     let mut layout_hints = read_clip_layout_hints();
     let mut layout_is_stacked = matches!(layout.mode, ClipLayoutMode::Stacked);
+    let mut face_only = false;
+    let mut fullscreen_fill = false;
     if layout_is_stacked {
         let detect_cfg = read_clip_detect_config();
         let need_face = layout.face_crop.is_none() && layout_hints.face_box.is_none();
-        let need_game = layout_hints.game_center.is_none();
-        if detect_cfg.enabled && (need_face || need_game) {
+        let had_game_center = layout_hints.game_center.is_some();
+        if detect_cfg.enabled && need_face {
             match detect_layout_hints(input, &detect_cfg).await {
                 Ok(detected) => {
                     if need_face {
@@ -2616,48 +2710,67 @@ async fn run_ffmpeg_internal(
                             layout_hints.face_track = detected.face_track;
                         }
                     }
-                    if need_game {
-                        if let Some(center) = detected.game_center {
-                            layout_hints.game_center = Some(center);
-                            eprintln!(
-                                "clip detect: game center x={:.3} y={:.3}",
-                                center.x, center.y
-                            );
-                        }
-                    }
                 }
                 Err(err) => {
                     eprintln!("clip detect: detection failed: {err:#}");
                 }
             }
         }
-        if layout.face_crop.is_none()
-            && layout_hints.face_box.is_none()
-            && layout_hints.face_track.is_none()
-        {
+        if !had_game_center {
+            layout_hints.game_center = None;
+        }
+        let face_found = layout.face_crop.is_some()
+            || layout_hints.face_box.is_some()
+            || layout_hints.face_track.is_some();
+        if !face_found {
             layout_is_stacked = false;
-            eprintln!("clip layout: no streamer cam detected; using full-frame layout");
+            fullscreen_fill = true;
+            eprintln!("clip layout: no streamer cam detected; using full-frame gameplay fill");
+        } else if !gameplay_enabled() {
+            layout_is_stacked = false;
+            face_only = true;
+            eprintln!("clip layout: gameplay disabled; using face-only layout");
         }
     }
     let hwaccel = std::env::var("FFMPEG_HWACCEL").unwrap_or_default();
     let hw_decode_cuda = is_nvenc && hwaccel.eq_ignore_ascii_case("cuda");
+    let fullscreen_center = layout_hints
+        .game_center
+        .unwrap_or(NormalizedPoint { x: 0.5, y: 0.5 });
     let (vf_cpu, vf_gpu_sw, vf_gpu_hw) = build_ffmpeg_filters(out_w, out_h);
+    let (_vf_fill_cpu, vf_fill_gpu_sw, vf_fill_gpu_hw) =
+        build_ffmpeg_fill_filters(out_w, out_h, fullscreen_center);
     let vf_gpu = if hw_decode_cuda { vf_gpu_hw.clone() } else { vf_gpu_sw.clone() };
+    let vf_fill_gpu = if hw_decode_cuda {
+        vf_fill_gpu_hw.clone()
+    } else {
+        vf_fill_gpu_sw.clone()
+    };
     let filter_cpu = if layout_is_stacked {
         build_stacked_filter_graph(out_w, out_h, &layout, &layout_hints)
+    } else if face_only {
+        build_face_only_filter_graph(out_w, out_h, &layout, &layout_hints)
+    } else if fullscreen_fill {
+        build_full_frame_fill_filter_graph(out_w, out_h, fullscreen_center)
     } else {
         FilterGraph::Vf(vf_cpu)
     };
-    let filter_gpu = if layout_is_stacked {
+    let filter_gpu = if layout_is_stacked || face_only {
         filter_cpu.clone()
+    } else if fullscreen_fill {
+        FilterGraph::Vf(vf_fill_gpu)
     } else {
         FilterGraph::Vf(vf_gpu)
     };
-    let force_cpu_filters = (is_stream_unstable(input) && is_nvenc) || layout_is_stacked;
+    let force_cpu_filters = (is_stream_unstable(input) && is_nvenc) || layout_is_stacked || face_only;
     if force_cpu_filters {
         if layout_is_stacked {
             if is_hw {
                 eprintln!("ffmpeg: stacked layout uses CPU filters; disabling hwaccel decode");
+            }
+        } else if face_only {
+            if is_hw {
+                eprintln!("ffmpeg: face-only layout uses CPU filters; disabling hwaccel decode");
             }
         } else {
             eprintln!("ffmpeg: stream flagged as unstable; using CPU filters with NVENC");
@@ -2778,6 +2891,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FACE_CROP", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_CONTEXT", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_BOX", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_REGION", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_ANCHOR", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_GAME_CENTER", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_MODEL", mode: EnvValueMode::Required },
@@ -2789,6 +2903,12 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FACE_TRACK_STEP", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_TILE_MIN_SCORE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_TILE_MAX_DEPTH", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_FRAME_HEAD_TOP", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_FRAME_HEAD_TOP_MIN", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_FRAME_HEAD_TOP_MAX", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_FRAME_EYE_TOP_RATIO", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_FRAME_EYE_CHIN_RATIO", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_FRAME_SHOULDER_SCALE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_DEBUG", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_FACE_TRACK", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_AUDIO_NORM", mode: EnvValueMode::Optional },
@@ -2802,6 +2922,9 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_DETECT_BUDGET_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_TS_REALTIME", mode: EnvValueMode::Flag },
     EnvSpec { env: "CLIP_GAMEPLAY", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_REGION_DETECT", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_LIVE_CONFIG", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_LIVE_CONFIG_POLL_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_GAMEPLAY_MODEL_DIR", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_GAMEPLAY_TEXT_MODEL", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_GAMEPLAY_VISION_MODEL", mode: EnvValueMode::Required },
@@ -2813,6 +2936,11 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_GAMEPLAY_LABELS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_GAMEPLAY_NEG_LABELS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_GAMEPLAY_DEBUG", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_CAM_LABELS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_CAM_NEG_LABELS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_CAM_SCORE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_CAM_TOPK", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_CAM_REGION_SCALE", mode: EnvValueMode::Required },
     EnvSpec { env: "M3U8_URL_OVERRIDE", mode: EnvValueMode::Required },
     EnvSpec { env: "M3U8_TEST_URL", mode: EnvValueMode::Required },
     EnvSpec { env: "M3U8_PAGE_URL", mode: EnvValueMode::Required },
@@ -2967,6 +3095,341 @@ fn apply_env_overrides(overrides: &[(String, String)]) {
     }
 }
 
+const LIVE_CONFIG_IGNORE_KEYS: &[&str] = &["CLIP_LIVE_CONFIG", "CLIP_LIVE_CONFIG_POLL_SECS"];
+const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
+    ("CLIP_FACE_FRAME_HEAD_TOP", "-0.18"),
+    ("CLIP_FACE_FRAME_HEAD_TOP_MIN", "-0.6"),
+    ("CLIP_FACE_FRAME_HEAD_TOP_MAX", "0.2"),
+    ("CLIP_FACE_FRAME_EYE_TOP_RATIO", "0.40"),
+    ("CLIP_FACE_FRAME_EYE_CHIN_RATIO", "0.60"),
+    ("CLIP_FACE_FRAME_SHOULDER_SCALE", "2.6"),
+];
+
+struct LiveConfigState {
+    path: PathBuf,
+    poll_interval: Duration,
+    last_checked: Instant,
+    last_modified: Option<SystemTime>,
+    applied: HashMap<String, String>,
+    baseline: HashMap<String, Option<String>>,
+    missing_logged: bool,
+}
+
+impl LiveConfigState {
+    fn from_env() -> Option<Self> {
+        let path = std::env::var("CLIP_LIVE_CONFIG")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())?;
+        let poll_secs = std::env::var("CLIP_LIVE_CONFIG_POLL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(2.0);
+        let poll_interval = Duration::from_secs_f32(poll_secs);
+        let now = Instant::now();
+        let last_checked = now.checked_sub(poll_interval).unwrap_or(now);
+        Some(Self {
+            path: PathBuf::from(path),
+            poll_interval,
+            last_checked,
+            last_modified: None,
+            applied: HashMap::new(),
+            baseline: HashMap::new(),
+            missing_logged: false,
+        })
+    }
+
+    fn maybe_refresh(&mut self) {
+        if self.last_checked.elapsed() < self.poll_interval {
+            return;
+        }
+        self.last_checked = Instant::now();
+
+        let metadata = match fs::metadata(&self.path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                if !self.missing_logged {
+                    eprintln!(
+                        "live config: file not found at {}; skipping updates",
+                        self.path.display()
+                    );
+                }
+                self.missing_logged = true;
+                self.clear_applied();
+                return;
+            }
+        };
+
+        let modified = metadata.modified().ok();
+        if modified.is_some() && modified == self.last_modified {
+            return;
+        }
+        self.last_modified = modified;
+        self.missing_logged = false;
+
+        let contents = match fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                eprintln!(
+                    "live config: failed to read {}: {err}",
+                    self.path.display()
+                );
+                return;
+            }
+        };
+
+        let next = parse_live_config(&contents);
+        self.apply_settings(next);
+    }
+
+    fn apply_settings(&mut self, next: HashMap<String, String>) {
+        if next == self.applied {
+            return;
+        }
+
+        let mut updated = Vec::new();
+        for (key, value) in &next {
+            if self.applied.get(key) == Some(value) {
+                continue;
+            }
+            if !self.baseline.contains_key(key) {
+                self.baseline.insert(key.clone(), std::env::var(key).ok());
+            }
+            std::env::set_var(key, value);
+            updated.push(key.clone());
+        }
+
+        let removed: Vec<String> = self
+            .applied
+            .keys()
+            .filter(|key| !next.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in &removed {
+            self.restore_baseline(key);
+        }
+
+        if !updated.is_empty() || !removed.is_empty() {
+            if !updated.is_empty() {
+                eprintln!("live config: applied {}", updated.join(", "));
+            }
+            if !removed.is_empty() {
+                eprintln!("live config: cleared {}", removed.join(", "));
+            }
+        }
+
+        self.applied = next;
+    }
+
+    fn clear_applied(&mut self) {
+        if self.applied.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = self.applied.keys().cloned().collect();
+        for key in keys {
+            self.restore_baseline(&key);
+        }
+        self.applied.clear();
+    }
+
+    fn restore_baseline(&mut self, key: &str) {
+        match self.baseline.get(key).cloned().unwrap_or(None) {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+}
+
+fn parse_live_config(contents: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (idx, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+
+        let (raw_key, raw_value) = split_live_config_line(line);
+        let Some(raw_key) = raw_key else { continue };
+        let value = raw_value.unwrap_or_else(|| "1".to_string());
+        let Some(env_key) = normalize_live_config_key(raw_key) else {
+            eprintln!(
+                "live config: unknown key '{}' on line {}",
+                raw_key.trim(),
+                idx + 1
+            );
+            continue;
+        };
+        if LIVE_CONFIG_IGNORE_KEYS.contains(&env_key.as_str()) {
+            continue;
+        }
+        out.insert(env_key, value);
+    }
+    out
+}
+
+fn ensure_live_config_file(path: &Path, overrides: &[(String, String)]) {
+    let overrides: HashMap<String, String> = overrides
+        .iter()
+        .filter(|(key, _)| !LIVE_CONFIG_IGNORE_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let prefill: HashMap<String, String> = LIVE_CONFIG_PREFILL
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            eprintln!(
+                "live config: failed to create {}: {err}",
+                parent.display()
+            );
+            return;
+        }
+    }
+
+    let mut original = String::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut updated_keys: HashSet<String> = HashSet::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    if path.exists() {
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                original = contents.clone();
+                for line in contents.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty()
+                        || trimmed.starts_with('#')
+                        || trimmed.starts_with("//")
+                    {
+                        lines.push(line.to_string());
+                        continue;
+                    }
+                    let (raw_key, _) = split_live_config_line(trimmed);
+                    if let Some(raw_key) = raw_key {
+                        if let Some(env_key) = normalize_live_config_key(raw_key) {
+                            if let Some(value) = overrides.get(&env_key) {
+                                lines.push(format!("{env_key}={value}"));
+                                updated_keys.insert(env_key.clone());
+                                seen_keys.insert(env_key);
+                                continue;
+                            }
+                            if prefill.contains_key(&env_key) {
+                                seen_keys.insert(env_key);
+                            }
+                        }
+                    }
+                    lines.push(line.to_string());
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "live config: failed to read {}: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    if !overrides.is_empty() {
+        for (key, value) in overrides {
+            if updated_keys.contains(&key) || seen_keys.contains(&key) {
+                continue;
+            }
+            lines.push(format!("{key}={value}"));
+            seen_keys.insert(key.clone());
+        }
+    } else if lines.is_empty() && !path.exists() {
+        lines.push(String::new());
+    }
+    for (key, value) in prefill {
+        if seen_keys.contains(&key) {
+            continue;
+        }
+        lines.push(format!("{key}={value}"));
+        seen_keys.insert(key);
+    }
+
+    let next_contents = lines.join("\n");
+    if !path.exists() || next_contents != original {
+        if let Err(err) = fs::write(path, next_contents) {
+            eprintln!(
+                "live config: failed to write {}: {err}",
+                path.display()
+            );
+        } else {
+            eprintln!("live config: synced {}", path.display());
+        }
+    }
+}
+
+fn split_live_config_line(line: &str) -> (Option<&str>, Option<String>) {
+    if let Some((left, right)) = line.split_once('=') {
+        return (Some(left.trim()), Some(normalize_live_config_value(right)));
+    }
+    if let Some((left, right)) = line.split_once(':') {
+        return (Some(left.trim()), Some(normalize_live_config_value(right)));
+    }
+
+    let mut parts = line.split_whitespace();
+    let key = parts.next();
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        (key, None)
+    } else {
+        (key, Some(normalize_live_config_value(&rest.join(" "))))
+    }
+}
+
+fn normalize_live_config_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = trimmed
+        .strip_prefix('\u{feff}')
+        .unwrap_or(trimmed)
+        .trim();
+    if stripped.len() >= 2 {
+        let bytes = stripped.as_bytes();
+        if (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+        {
+            return stripped[1..stripped.len() - 1].to_string();
+        }
+    }
+    stripped.to_string()
+}
+
+fn normalize_live_config_key(raw: &str) -> Option<String> {
+    let mut key = raw.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = key.strip_prefix("--") {
+        key = stripped;
+    }
+    let candidate = key
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .replace(['-', '.', ' '], "_")
+        .to_ascii_uppercase();
+    if candidate.is_empty() {
+        return None;
+    }
+    if is_known_env_key(&candidate) || candidate.starts_with("CLIP_") {
+        return Some(candidate);
+    }
+    let prefixed = format!("CLIP_{candidate}");
+    if is_known_env_key(&prefixed) {
+        return Some(prefixed);
+    }
+    None
+}
+
+fn is_known_env_key(key: &str) -> bool {
+    ENV_SPECS.iter().any(|spec| spec.env == key)
+}
+
 fn resolve_mic_opts(
     page_url: String,
     phrase: Option<String>,
@@ -3003,6 +3466,12 @@ async fn main() -> Result<()> {
         env_overrides,
     } = parse_cli_args(&args[1..])?;
     apply_env_overrides(&env_overrides);
+    if let Ok(path) = std::env::var("CLIP_LIVE_CONFIG") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            ensure_live_config_file(Path::new(trimmed), &env_overrides);
+        }
+    }
 
     // Ensure CUDA backend is preferred when available; avoid falling back to CPU due to missing env.
     if std::env::var("WHISPER_CUBLAS").is_err() {
@@ -3652,8 +4121,9 @@ fn print_help(bin: &str) {
     println!("  CLIP_LAYOUT              Layout mode: stacked (default) or full");
     println!("  CLIP_FACE_RATIO          Height ratio reserved for face panel (default 0.40)");
     println!("  CLIP_FACE_CROP           Face crop expr w:h:x:y (optional, overrides detection/anchor)");
-    println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 3.0, max 6.0)");
+    println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 6.0)");
     println!("  CLIP_FACE_BOX            Normalized face box x:y:w:h (0..1) for auto-crop");
+    println!("  CLIP_FACE_REGION         Normalized face bounds x:y:w:h (0..1) for mid-shot framing");
     println!("  CLIP_FACE_ANCHOR         Anchor for default face crop (top-left default)");
     println!("  CLIP_GAME_CENTER         Normalized gameplay center x:y (0..1) for reticle centering");
     println!("  CLIP_FACE_MODEL          Face detector model path (default models/face_detection_yunet_2023mar.onnx)");
@@ -3661,12 +4131,18 @@ fn print_help(bin: &str) {
     println!("  CLIP_FACE_DUMP_DIR       Write face debug images with rectangles to this folder");
     println!("  CLIP_FACE_DUMP_RAW       Dump raw face candidates (no score filtering) when enabled");
     println!("  CLIP_FACE_PICK_RAW       Pick faces using raw detector score (default true)");
-    println!("  CLIP_FACE_SCORE          Face detection confidence threshold (default 0.5)");
+    println!("  CLIP_FACE_SCORE          Face detection confidence threshold (default 0.6)");
     println!("  CLIP_FACE_TRACK_STEP     Seconds between face tracking samples (default 2.0)");
     println!("  CLIP_AUDIO_NORM          Normalize clip audio loudness (default true)");
     println!("  CLIP_FACE_BUDGET_SECS    Override face detection time budget in seconds");
     println!("  CLIP_FACE_TILE_MIN_SCORE Tile search min score (default 0.60; set <= 0 to disable)");
     println!("  CLIP_FACE_TILE_MAX_DEPTH Max bisection depth for tile search (default 3)");
+    println!("  CLIP_FACE_FRAME_HEAD_TOP      Head top offset vs face box (default -0.18)");
+    println!("  CLIP_FACE_FRAME_HEAD_TOP_MIN  Min head top offset (default -0.6)");
+    println!("  CLIP_FACE_FRAME_HEAD_TOP_MAX  Max head top offset (default 0.2)");
+    println!("  CLIP_FACE_FRAME_EYE_TOP_RATIO Eye->top ratio for head estimate (default 0.40)");
+    println!("  CLIP_FACE_FRAME_EYE_CHIN_RATIO Eye->chin ratio for head estimate (default 0.60)");
+    println!("  CLIP_FACE_FRAME_SHOULDER_SCALE Shoulder width scale vs face (default 2.6)");
     println!("  CLIP_FACE_DEBUG          Log face detector outputs and best score");
     println!("  CLIP_FACE_TRACK          Track face across the full clip (default true)");
     println!("  CLIP_DETECT              Enable auto-detection for stacked layout (default true)");
@@ -3676,6 +4152,19 @@ fn print_help(bin: &str) {
     println!("  CLIP_DETECT_STEP         Seconds between detection samples (default 1.5)");
     println!("  CLIP_DETECT_FULL         Sample detection frames across the full clip (local files only)");
     println!("  CLIP_DETECT_BUDGET_SECS  Max seconds to spend analyzing detection samples");
+    println!("  CLIP_GAMEPLAY            Enable CLIP model usage (default true)");
+    println!("  CLIP_REGION_DETECT       Enable CLIP region detection (default true)");
+    println!("  CLIP_LIVE_CONFIG         Path to live config file for hot-reload overrides");
+    println!("  CLIP_LIVE_CONFIG_POLL_SECS   Live config poll interval in seconds (default 2)");
+    println!("  CLIP_GAMEPLAY_LABELS     CLIP gameplay positive labels");
+    println!("  CLIP_GAMEPLAY_NEG_LABELS CLIP gameplay negative labels");
+    println!("  CLIP_GAMEPLAY_SCORE      CLIP gameplay score threshold (default 0.12)");
+    println!("  CLIP_GAMEPLAY_TOPK       CLIP gameplay top-k patches (default 6)");
+    println!("  CLIP_CAM_LABELS          CLIP cam positive labels");
+    println!("  CLIP_CAM_NEG_LABELS      CLIP cam negative labels");
+    println!("  CLIP_CAM_SCORE           CLIP cam score threshold (default CLIP_GAMEPLAY_SCORE)");
+    println!("  CLIP_CAM_TOPK            CLIP cam top-k patches (default CLIP_GAMEPLAY_TOPK)");
+    println!("  CLIP_CAM_REGION_SCALE    Expand CLIP cam region bounds (default 1.6)");
     println!("  CLIP_TS_REALTIME         When set, read local TS files at realtime speed");
     println!("  M3U8_URL_OVERRIDE        Skip discovery; use this master URL directly");
     println!("  COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE / TWITCH_COOKIE   Cookies to send on discovery");
@@ -3693,6 +4182,7 @@ fn print_help(bin: &str) {
     println!("Notes:");
     println!("  - Main path: page URL -> HLS discovery (TikTok HTTP first, headless fallback) -> wake detection -> clip.");
     println!("  - Demo modes: buffer-only, HLS buffer demo, or mic wake demo for quick sanity checks.");
+    println!("  - Live config file supports KEY=VALUE, KEY: VALUE, or flag lines like clip-face-debug.");
 }
 
 
