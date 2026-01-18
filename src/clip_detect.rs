@@ -1677,7 +1677,7 @@ fn select_best_raw_candidate(
     }
     let mut observations = Vec::new();
     for sample in samples {
-        let mut best: Option<(f32, f32, FaceCandidate)> = None;
+        let mut best: Option<(f32, f32, f32, FaceCandidate)> = None;
         let has_landmarks = sample
             .candidates
             .iter()
@@ -1694,18 +1694,22 @@ fn select_best_raw_candidate(
             if !weighted.is_finite() {
                 continue;
             }
+            let area = rect_area(candidate.rect);
             let replace = match best {
                 None => true,
-                Some((best_weighted, best_raw, _)) => {
-                    weighted > best_weighted
-                        || (weighted == best_weighted && candidate.raw_score > best_raw)
+                Some((best_area, best_weighted, best_raw, _)) => {
+                    area > best_area
+                        || (area == best_area
+                            && (weighted > best_weighted
+                                || (weighted == best_weighted
+                                    && candidate.raw_score > best_raw)))
                 }
             };
             if replace {
-                best = Some((weighted, candidate.raw_score, *candidate));
+                best = Some((area, weighted, candidate.raw_score, *candidate));
             }
         }
-        if let Some((_weighted, raw, best)) = best {
+        if let Some((_area, _weighted, raw, best)) = best {
             observations.push(FaceObservation {
                 rect: best.rect,
                 score: raw,
@@ -1731,7 +1735,7 @@ fn select_best_candidate_for_pass(
     detector: &YunetDetector,
     pass: &FaceSelectionPass,
 ) -> Option<FaceCandidate> {
-    let mut best: Option<(i32, FaceCandidate)> = None;
+    let mut best: Option<(i32, f32, FaceCandidate)> = None;
     for candidate in &sample.candidates {
         if !candidate_passes(candidate, detector, pass) {
             continue;
@@ -1751,18 +1755,22 @@ fn select_best_candidate_for_pass(
         } else {
             2
         };
+        let area = rect_area(candidate.rect);
         let replace = match best {
             None => true,
-            Some((best_priority, best_candidate)) => {
+            Some((best_priority, best_area, best_candidate)) => {
                 priority > best_priority
-                    || (priority == best_priority && candidate.score > best_candidate.score)
+                    || (priority == best_priority
+                        && (area > best_area
+                            || (area == best_area
+                                && candidate.score > best_candidate.score)))
             }
         };
         if replace {
-            best = Some((priority, *candidate));
+            best = Some((priority, area, *candidate));
         }
     }
-    best.map(|(_, candidate)| candidate)
+    best.map(|(_, _, candidate)| candidate)
 }
 
 fn candidate_passes(
@@ -3899,6 +3907,14 @@ fn rect_center(rect: NormalizedRect) -> NormalizedPoint {
     }
 }
 
+fn rect_area(rect: NormalizedRect) -> f32 {
+    let area = rect.w * rect.h;
+    if !area.is_finite() {
+        return 0.0;
+    }
+    area.max(0.0)
+}
+
 fn expand_rect(rect: NormalizedRect, scale: f32) -> NormalizedRect {
     let scale = if scale.is_finite() { scale.max(1.0) } else { 1.0 };
     let center = rect_center(rect);
@@ -3945,8 +3961,11 @@ fn select_consensus_face(observations: &[FaceObservation]) -> Option<FaceConsens
         let take = match best_cluster {
             None => true,
             Some(best) => {
-                cluster.count > best.count
-                    || (cluster.count == best.count && cluster.score_sum > best.score_sum)
+                cluster.max_area > best.max_area
+                    || (cluster.max_area == best.max_area
+                        && (cluster.count > best.count
+                            || (cluster.count == best.count
+                                && cluster.score_sum > best.score_sum)))
             }
         };
         if take {
@@ -3960,6 +3979,7 @@ fn select_consensus_face(observations: &[FaceObservation]) -> Option<FaceConsens
 struct FaceCluster {
     score_sum: f32,
     count: usize,
+    max_area: f32,
     rect_sum_x: f32,
     rect_sum_y: f32,
     rect_sum_w: f32,
@@ -3976,9 +3996,11 @@ impl FaceCluster {
     fn new(obs: FaceObservation) -> Self {
         let center = rect_center(obs.rect);
         let weight = obs.score.max(0.0);
+        let area = rect_area(obs.rect);
         Self {
             score_sum: weight,
             count: 1,
+            max_area: area,
             rect_sum_x: obs.rect.x * weight,
             rect_sum_y: obs.rect.y * weight,
             rect_sum_w: obs.rect.w * weight,
@@ -3994,6 +4016,7 @@ impl FaceCluster {
 
     fn add(&mut self, obs: FaceObservation) {
         let center_before = self.center();
+        let area = rect_area(obs.rect);
         let weight = obs.score.max(0.0);
         if weight > 0.0 {
             self.score_sum += weight;
@@ -4014,7 +4037,10 @@ impl FaceCluster {
                 self.max_dist = dist;
             }
         }
-        if obs.score > self.best.score {
+        if area > self.max_area {
+            self.max_area = area;
+            self.best = obs;
+        } else if area == self.max_area && obs.score > self.best.score {
             self.best = obs;
         }
     }
@@ -4258,6 +4284,8 @@ mod tests {
             face_score_threshold: 0.5,
             scan_full_clip: true,
             track_face: true,
+            face_track_step_secs: None,
+            face_budget_override: None,
             analysis_budget: None,
         };
         let times = build_sample_times(&config, true, Some(10.0));

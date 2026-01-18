@@ -208,6 +208,9 @@ const DEFAULT_GAME_CENTER_X: f32 = 0.50;
 const DEFAULT_GAME_CENTER_Y: f32 = 0.50;
 const MIDSHOT_FACE_RATIO: f32 = 0.50;
 const MIN_CROP_RATIO: f32 = 0.20;
+const MIN_FACE_REFRAME_SECS: f32 = 6.0;
+const KALMAN_PROCESS_VAR: f32 = 0.0005;
+const KALMAN_MEASURE_VAR: f32 = 0.0025;
 
 pub fn read_clip_layout_config() -> ClipLayoutConfig {
     let mode = env::var("CLIP_LAYOUT")
@@ -450,6 +453,55 @@ pub fn build_full_frame_fill_filter_graph(
     FilterGraph::Vf(chain)
 }
 
+pub fn build_tracked_full_frame_fill_filter_graph(
+    out_w: u32,
+    out_h: u32,
+    track: &FaceTrack,
+) -> Option<FilterGraph> {
+    if track.points.len() < 2 {
+        return None;
+    }
+    let mut samples: Vec<TrackSample> = track
+        .points
+        .iter()
+        .map(|point| TrackSample {
+            time: point.time.max(0.0),
+            center: point.rect.center().clamp_unit(),
+            w: point.rect.w,
+            h: point.rect.h,
+        })
+        .collect();
+    samples.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+    let mut deduped: Vec<TrackSample> = Vec::with_capacity(samples.len());
+    for sample in samples {
+        if let Some(last) = deduped.last_mut() {
+            if (sample.time - last.time).abs() < 0.001 {
+                *last = sample;
+                continue;
+            }
+        }
+        deduped.push(sample);
+    }
+    if deduped.len() < 2 {
+        return None;
+    }
+
+    let smoothed = kalman_smooth_samples(&deduped);
+    let downsampled = downsample_track_samples(&smoothed, MIN_FACE_REFRAME_SECS);
+    if downsampled.len() < 2 {
+        return None;
+    }
+
+    let center_x_expr = piecewise_lerp_expr(&downsampled, |s| s.center.x);
+    let center_y_expr = piecewise_lerp_expr(&downsampled, |s| s.center.y);
+    let x_expr = axis_center_expr_expr("iw", out_w, &center_x_expr);
+    let y_expr = axis_center_expr_expr("ih", out_h, &center_y_expr);
+    let chain = format!(
+        "scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h}:{x_expr}:{y_expr},format=yuv420p"
+    );
+    Some(FilterGraph::Vf(chain))
+}
+
 struct TrackedFaceCrop {
     crop_expr: String,
 }
@@ -460,6 +512,124 @@ struct TrackSample {
     center: NormalizedPoint,
     w: f32,
     h: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Kalman1D {
+    x: f32,
+    v: f32,
+    p00: f32,
+    p01: f32,
+    p10: f32,
+    p11: f32,
+}
+
+impl Kalman1D {
+    fn new(value: f32) -> Self {
+        Self {
+            x: value,
+            v: 0.0,
+            p00: 1.0,
+            p01: 0.0,
+            p10: 0.0,
+            p11: 1.0,
+        }
+    }
+
+    fn update(&mut self, measurement: f32, dt: f32) -> f32 {
+        if !measurement.is_finite() {
+            return self.x;
+        }
+        let dt = dt.max(0.001);
+        self.x += self.v * dt;
+
+        let p00 = self.p00 + dt * (self.p10 + self.p01) + dt * dt * self.p11;
+        let p01 = self.p01 + dt * self.p11;
+        let p10 = self.p10 + dt * self.p11;
+        let p11 = self.p11;
+
+        let q00 = 0.25 * dt * dt * dt * dt * KALMAN_PROCESS_VAR;
+        let q01 = 0.5 * dt * dt * dt * KALMAN_PROCESS_VAR;
+        let q11 = dt * dt * KALMAN_PROCESS_VAR;
+
+        let p00 = p00 + q00;
+        let p01 = p01 + q01;
+        let p10 = p10 + q01;
+        let p11 = p11 + q11;
+
+        let s = p00 + KALMAN_MEASURE_VAR;
+        let k0 = p00 / s;
+        let k1 = p10 / s;
+        let y = measurement - self.x;
+
+        self.x += k0 * y;
+        self.v += k1 * y;
+        self.p00 = (1.0 - k0) * p00;
+        self.p01 = (1.0 - k0) * p01;
+        self.p10 = p10 - k1 * p00;
+        self.p11 = p11 - k1 * p01;
+
+        self.x
+    }
+}
+
+fn track_sample_area(sample: &TrackSample) -> f32 {
+    let area = sample.w * sample.h;
+    if !area.is_finite() {
+        return 0.0;
+    }
+    area.max(0.0)
+}
+
+fn kalman_smooth_samples(samples: &[TrackSample]) -> Vec<TrackSample> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(samples.len());
+    let mut kx = Kalman1D::new(samples[0].center.x);
+    let mut ky = Kalman1D::new(samples[0].center.y);
+    let mut kw = Kalman1D::new(samples[0].w);
+    let mut kh = Kalman1D::new(samples[0].h);
+    let mut last_time = samples[0].time;
+    out.push(samples[0]);
+    for sample in samples.iter().skip(1) {
+        let dt = (sample.time - last_time).max(0.001);
+        let x = kx.update(sample.center.x, dt);
+        let y = ky.update(sample.center.y, dt);
+        let w = kw.update(sample.w, dt);
+        let h = kh.update(sample.h, dt);
+        out.push(TrackSample {
+            time: sample.time,
+            center: NormalizedPoint {
+                x: clamp_unit(x),
+                y: clamp_unit(y),
+            },
+            w: w.clamp(MIN_CROP_RATIO, 1.0),
+            h: h.clamp(MIN_CROP_RATIO, 1.0),
+        });
+        last_time = sample.time;
+    }
+    out
+}
+
+fn downsample_track_samples(samples: &[TrackSample], min_interval: f32) -> Vec<TrackSample> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let min_interval = min_interval.max(0.0);
+    let mut out: Vec<TrackSample> = Vec::new();
+    for sample in samples {
+        if let Some(last) = out.last_mut() {
+            if sample.time - last.time < min_interval {
+                if track_sample_area(sample) > track_sample_area(last) {
+                    *last = *sample;
+                }
+                continue;
+            }
+        }
+        out.push(*sample);
+    }
+    out
 }
 
 fn build_tracked_face_crop(
@@ -514,10 +684,16 @@ fn build_tracked_face_crop(
         return None;
     }
 
-    let center_x_expr = piecewise_lerp_expr(&deduped, |s| s.center.x);
-    let center_y_expr = piecewise_lerp_expr(&deduped, |s| s.center.y);
-    let width_expr = clamp_ratio_expr(&piecewise_lerp_expr(&deduped, |s| s.w));
-    let height_expr = clamp_ratio_expr(&piecewise_lerp_expr(&deduped, |s| s.h));
+    let smoothed = kalman_smooth_samples(&deduped);
+    let downsampled = downsample_track_samples(&smoothed, MIN_FACE_REFRAME_SECS);
+    if downsampled.len() < 2 {
+        return None;
+    }
+
+    let center_x_expr = piecewise_lerp_expr(&downsampled, |s| s.center.x);
+    let center_y_expr = piecewise_lerp_expr(&downsampled, |s| s.center.y);
+    let width_expr = clamp_ratio_expr(&piecewise_lerp_expr(&downsampled, |s| s.w));
+    let height_expr = clamp_ratio_expr(&piecewise_lerp_expr(&downsampled, |s| s.h));
     let x_expr = axis_center_expr_ratio_expr("iw", &width_expr, &center_x_expr);
     let y_expr = axis_center_expr_ratio_expr("ih", &height_expr, &center_y_expr);
     let crop_expr = format!(
@@ -571,6 +747,15 @@ fn axis_center_expr_ratio_expr(axis: &str, ratio_expr: &str, center_expr: &str) 
     let half_expr = format!("{axis}*({ratio_expr})/2");
     let center_expr = format!("{axis}*({center_expr})");
     format!("max(min({center_expr}-{half_expr}\\, {axis}-{size_expr})\\, 0)")
+}
+
+fn axis_center_expr_expr(axis: &str, crop_dim: u32, center_expr: &str) -> String {
+    let half = crop_dim as f32 / 2.0;
+    let half_str = format!("{half:.1}");
+    let center_expr = format!("{axis}*({center_expr})");
+    format!(
+        "max(min({center_expr}-{half_str}\\, {axis}-{crop_dim})\\, 0)"
+    )
 }
 
 fn piecewise_lerp_expr(samples: &[TrackSample], getter: fn(&TrackSample) -> f32) -> String {
@@ -811,6 +996,50 @@ mod tests {
         assert!(
             graph.contains("crop=1080:840:max(min(iw*0.5000-540.0\\, iw-1080)\\, 0):max(min(ih*0.6000-420.0\\, ih-840)\\, 0)"),
             "game crop should center on the provided reticle hint"
+        );
+    }
+
+    #[test]
+    fn tracked_full_frame_fill_uses_dynamic_center() {
+        let track = FaceTrack {
+            points: vec![
+                FaceTrackPoint {
+                    time: 0.0,
+                    rect: NormalizedRect {
+                        x: 0.1,
+                        y: 0.2,
+                        w: 0.2,
+                        h: 0.2,
+                    },
+                },
+                FaceTrackPoint {
+                    time: 6.0,
+                    rect: NormalizedRect {
+                        x: 0.6,
+                        y: 0.4,
+                        w: 0.2,
+                        h: 0.2,
+                    },
+                },
+            ],
+        };
+        let FilterGraph::Vf(chain) =
+            build_tracked_full_frame_fill_filter_graph(1080, 1920, &track)
+                .expect("expected tracked full-frame graph")
+        else {
+            panic!("expected Vf filter graph");
+        };
+        assert!(
+            chain.contains("scale=1080:1920:force_original_aspect_ratio=increase"),
+            "expected full-frame scale"
+        );
+        assert!(
+            chain.contains("crop=1080:1920:"),
+            "expected full-frame crop"
+        );
+        assert!(
+            chain.contains("if(between(t"),
+            "expected dynamic center expression"
         );
     }
 }

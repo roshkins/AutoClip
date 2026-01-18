@@ -32,7 +32,8 @@ mod rolling_buffer;
 use clip_detect::{detect_layout_hints, read_clip_detect_config, run_face_threshold_sweep};
 use clip_gameplay::{read_clip_gameplay_config, ClipGameplayDetector};
 use clip_layout::{
-    build_face_only_filter_graph, build_full_frame_fill_filter_graph, build_stacked_filter_graph,
+    build_face_only_filter_graph, build_full_frame_fill_filter_graph,
+    build_stacked_filter_graph, build_tracked_full_frame_fill_filter_graph,
     read_clip_layout_config, read_clip_layout_hints, ClipLayoutMode, FilterGraph, NormalizedPoint,
 };
 use profile::profile_span;
@@ -2755,11 +2756,18 @@ async fn run_ffmpeg_internal(
     let mut layout_is_stacked = matches!(layout.mode, ClipLayoutMode::Stacked);
     let mut face_only = false;
     let mut fullscreen_fill = false;
+    let mut fullscreen_track = None;
+    let mut fullscreen_center_override = None;
+    let face_center = |rect: crate::clip_layout::NormalizedRect| NormalizedPoint {
+        x: (rect.x + rect.w / 2.0).clamp(0.0, 1.0),
+        y: (rect.y + rect.h / 2.0).clamp(0.0, 1.0),
+    };
     if layout_is_stacked {
         let detect_cfg = read_clip_detect_config();
         let need_face = layout.face_crop.is_none() && layout_hints.face_box.is_none();
-        let had_game_center = layout_hints.game_center.is_some();
-        if detect_cfg.enabled && need_face {
+        let user_game_center = layout_hints.game_center;
+        let need_gameplay = user_game_center.is_none();
+        if detect_cfg.enabled && (need_face || need_gameplay) {
             match detect_layout_hints(input, &detect_cfg).await {
                 Ok(detected) => {
                     if need_face {
@@ -2773,6 +2781,17 @@ async fn run_ffmpeg_internal(
                         if layout_hints.face_track.is_none() {
                             layout_hints.face_track = detected.face_track;
                         }
+                        if layout_hints.face_region.is_none() {
+                            layout_hints.face_region = detected.face_region;
+                        }
+                        if layout_hints.face_frame_spec.is_none() {
+                            layout_hints.face_frame_spec = detected.face_frame_spec;
+                        }
+                    }
+                    if need_gameplay && user_game_center.is_none() {
+                        layout_hints.game_center = detected.game_center;
+                    } else {
+                        layout_hints.game_center = user_game_center;
                     }
                 }
                 Err(err) => {
@@ -2780,27 +2799,43 @@ async fn run_ffmpeg_internal(
                 }
             }
         }
-        if !had_game_center {
-            layout_hints.game_center = None;
-        }
         let face_found = layout.face_crop.is_some()
             || layout_hints.face_box.is_some()
             || layout_hints.face_track.is_some();
-        if !face_found {
+        let gameplay_found = gameplay_enabled() && layout_hints.game_center.is_some();
+        if face_found && !gameplay_found {
+            layout_is_stacked = false;
+            if layout.face_crop.is_some() {
+                face_only = true;
+                eprintln!("clip layout: no gameplay detected; using face-only layout");
+            } else {
+                fullscreen_fill = true;
+                fullscreen_track = layout_hints.face_track.clone();
+                fullscreen_center_override = layout_hints
+                    .face_box
+                    .map(face_center)
+                    .or_else(|| {
+                        layout_hints
+                            .face_track
+                            .as_ref()
+                            .and_then(|track| track.points.first().map(|p| face_center(p.rect)))
+                    });
+                eprintln!("clip layout: no gameplay detected; using single-frame face layout");
+            }
+        } else if !face_found {
             layout_is_stacked = false;
             fullscreen_fill = true;
             eprintln!("clip layout: no streamer cam detected; using full-frame gameplay fill");
-        } else if !gameplay_enabled() {
-            layout_is_stacked = false;
-            face_only = true;
-            eprintln!("clip layout: gameplay disabled; using face-only layout");
         }
     }
     let hwaccel = std::env::var("FFMPEG_HWACCEL").unwrap_or_default();
     let hw_decode_cuda = is_nvenc && hwaccel.eq_ignore_ascii_case("cuda");
-    let fullscreen_center = layout_hints
+    let mut fullscreen_center = layout_hints
         .game_center
         .unwrap_or(NormalizedPoint { x: 0.5, y: 0.5 });
+    if let Some(center) = fullscreen_center_override {
+        fullscreen_center = center;
+    }
     let (vf_cpu, vf_gpu_sw, vf_gpu_hw) = build_ffmpeg_filters(out_w, out_h);
     let (_vf_fill_cpu, vf_fill_gpu_sw, vf_fill_gpu_hw) =
         build_ffmpeg_fill_filters(out_w, out_h, fullscreen_center);
@@ -2810,23 +2845,34 @@ async fn run_ffmpeg_internal(
     } else {
         vf_fill_gpu_sw.clone()
     };
+    let tracked_fullscreen = fullscreen_fill && fullscreen_track.is_some();
     let filter_cpu = if layout_is_stacked {
         build_stacked_filter_graph(out_w, out_h, &layout, &layout_hints)
     } else if face_only {
         build_face_only_filter_graph(out_w, out_h, &layout, &layout_hints)
     } else if fullscreen_fill {
-        build_full_frame_fill_filter_graph(out_w, out_h, fullscreen_center)
+        if let Some(track) = fullscreen_track.as_ref() {
+            build_tracked_full_frame_fill_filter_graph(out_w, out_h, track)
+                .unwrap_or_else(|| build_full_frame_fill_filter_graph(out_w, out_h, fullscreen_center))
+        } else {
+            build_full_frame_fill_filter_graph(out_w, out_h, fullscreen_center)
+        }
     } else {
         FilterGraph::Vf(vf_cpu)
     };
     let filter_gpu = if layout_is_stacked || face_only {
         filter_cpu.clone()
     } else if fullscreen_fill {
-        FilterGraph::Vf(vf_fill_gpu)
+        if tracked_fullscreen {
+            filter_cpu.clone()
+        } else {
+            FilterGraph::Vf(vf_fill_gpu)
+        }
     } else {
         FilterGraph::Vf(vf_gpu)
     };
-    let force_cpu_filters = (is_stream_unstable(input) && is_nvenc) || layout_is_stacked || face_only;
+    let force_cpu_filters =
+        (is_stream_unstable(input) && is_nvenc) || layout_is_stacked || face_only || tracked_fullscreen;
     if force_cpu_filters {
         if layout_is_stacked {
             if is_hw {
@@ -2835,6 +2881,10 @@ async fn run_ffmpeg_internal(
         } else if face_only {
             if is_hw {
                 eprintln!("ffmpeg: face-only layout uses CPU filters; disabling hwaccel decode");
+            }
+        } else if tracked_fullscreen {
+            if is_hw {
+                eprintln!("ffmpeg: tracked full-frame uses CPU filters; disabling hwaccel decode");
             }
         } else {
             eprintln!("ffmpeg: stream flagged as unstable; using CPU filters with NVENC");
