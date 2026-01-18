@@ -22,7 +22,7 @@ pub fn select_best_model_path() -> PathBuf {
 pub fn start_stream_wake_from_hls(
     _media_url: Arc<Mutex<Url>>,
     _model_path: &Path,
-    _wake_phrase: &str,
+    _wake_phrases: &[String],
     _log_raw: bool,
     _stop: Arc<AtomicBool>,
     _fired: Arc<AtomicBool>,
@@ -36,7 +36,7 @@ pub fn start_stream_wake_from_hls(
 pub fn detect_wake_in_file(
     _input_path: &Path,
     _model_path: &Path,
-    _wake_phrase: &str,
+    _wake_phrases: &[String],
     _log_raw: bool,
 ) -> Result<Option<f32>> {
     bail!("whisper support disabled; rebuild with `--features whisper`");
@@ -45,7 +45,7 @@ pub fn detect_wake_in_file(
 pub fn start_mic_wake_with_ffmpeg(
     _mic_device: Option<&str>,
     _model_path: &Path,
-    _wake_phrase: &str,
+    _wake_phrases: &[String],
     _log_raw: bool,
     _stop: Arc<AtomicBool>,
     _fired: Arc<AtomicBool>,

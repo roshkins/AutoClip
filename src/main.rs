@@ -27,6 +27,7 @@ mod clip_detect;
 mod clip_gameplay;
 mod clip_layout;
 mod loading;
+mod profile;
 mod rolling_buffer;
 use clip_detect::{detect_layout_hints, read_clip_detect_config, run_face_threshold_sweep};
 use clip_gameplay::{read_clip_gameplay_config, ClipGameplayDetector};
@@ -34,6 +35,7 @@ use clip_layout::{
     build_face_only_filter_graph, build_full_frame_fill_filter_graph, build_stacked_filter_graph,
     read_clip_layout_config, read_clip_layout_hints, ClipLayoutMode, FilterGraph, NormalizedPoint,
 };
+use profile::profile_span;
 use rolling_buffer::RollingBuffer;
 #[cfg(feature = "whisper")]
 mod stream_audio_wake;
@@ -50,6 +52,8 @@ pub struct Config {
     pub kick_url: String,
     /// Phrase to trigger the automatic clip.
     pub activation_phrase: String,
+    /// Optional explicit wake phrases (overrides env/default when set).
+    pub wake_phrases: Option<Vec<String>>,
     /// Amount of video (seconds) to keep on a rolling buffer before the trigger.
     pub before_buffer_length: u32,
     /// Amount of video (seconds) to keep after the trigger.
@@ -75,6 +79,7 @@ impl Config {
         Self {
             kick_url: "https://example.com/stream".to_string(),
             activation_phrase: "orange".to_string(),
+            wake_phrases: None,
             before_buffer_length: 50,
             after_buffer_length: 10,
             resolution: "1080x1920".to_string(),
@@ -265,6 +270,13 @@ impl AutoClip {
 
         // Start listening for the wake phrase, either from microphone or stream audio.
         let model_path = stream_audio_wake::select_best_model_path();
+        let wake_phrases =
+            resolve_wake_phrases(self.config.wake_phrases.as_deref(), &self.config.activation_phrase);
+        let wake_label = if wake_phrases.is_empty() {
+            self.config.activation_phrase.clone()
+        } else {
+            wake_phrases.join(", ")
+        };
         if self.config.use_mic_for_wake {
             let mic_device = self
                 .config
@@ -274,7 +286,7 @@ impl AutoClip {
             start_mic_wake_with_ffmpeg(
                 mic_device.as_deref(),
                 Path::new(&model_path),
-                &self.config.activation_phrase,
+                &wake_phrases,
                 self.config.log_raw_wake,
                 stop_for_audio,
                 fired.clone(),
@@ -283,15 +295,15 @@ impl AutoClip {
                 audio_ns.clone(),
             )?;
             println!(
-                "listening to microphone for wake phrase '{}' (model: {})",
-                self.config.activation_phrase,
+                "listening to microphone for wake phrase(s) '{}' (model: {})",
+                wake_label,
                 model_path.display(),
             );
         } else {
             start_stream_wake_from_hls(
                 media_url.clone(),
                 Path::new(&model_path),
-                &self.config.activation_phrase,
+                &wake_phrases,
                 self.config.log_raw_wake,
                 stop_for_audio,
                 fired.clone(),
@@ -300,8 +312,8 @@ impl AutoClip {
                 audio_ns.clone(),
             )?;
             println!(
-                "listening to stream audio for wake phrase '{}' (model: {})",
-                self.config.activation_phrase,
+                "listening to stream audio for wake phrase(s) '{}' (model: {})",
+                wake_label,
                 model_path.display()
             );
         }
@@ -1922,6 +1934,10 @@ fn auto_assign_gpus_for_tools() {
     let user_whisper = std::env::var("WHISPER_GPU")
         .ok()
         .filter(|v| !v.trim().is_empty());
+    #[cfg(feature = "ort")]
+    let user_face_backend = std::env::var("CLIP_FACE_BACKEND")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
 
     let gpus = detect_nvidia_gpus();
     if !gpus.is_empty() {
@@ -1939,6 +1955,11 @@ fn auto_assign_gpus_for_tools() {
         }
         if user_encoder.is_none() && ffmpeg_has_encoder("h264_nvenc") {
             std::env::set_var("FFMPEG_ENCODER", "h264_nvenc");
+        }
+        #[cfg(feature = "ort")]
+        if user_face_backend.is_none() {
+            std::env::set_var("CLIP_FACE_BACKEND", "ort");
+            eprintln!("auto GPU assign: face backend ort");
         }
         if user_hwaccel.is_none() {
             eprintln!("auto GPU assign for ffmpeg: {}", ffmpeg_gpu);
@@ -2678,6 +2699,7 @@ async fn run_ffmpeg_internal(
     force_ts_input: bool,
     progress: Option<ProgressSpec>,
 ) -> Result<()> {
+    let _span = profile_span("ffmpeg: encode");
     let (mut video_encoder, mut is_nvenc, mut is_hw, _encoder_forced) = ffmpeg_video_encoder();
     let scale_cuda_available = ffmpeg_scale_cuda_available();
     if is_hw && !scale_cuda_available {
@@ -2925,6 +2947,8 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_REGION_DETECT", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_LIVE_CONFIG", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_LIVE_CONFIG_POLL_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_WAKE_WORDS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_PROFILE", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_GAMEPLAY_MODEL_DIR", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_GAMEPLAY_TEXT_MODEL", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_GAMEPLAY_VISION_MODEL", mode: EnvValueMode::Required },
@@ -3006,7 +3030,12 @@ fn parse_cli_args(args: &[String]) -> Result<ParsedCli> {
             i += 1;
             continue;
         }
-        if arg == "--phrase" {
+        if let Some(rest) = arg.strip_prefix("--phrases=") {
+            override_phrase = Some(rest.to_string());
+            i += 1;
+            continue;
+        }
+        if arg == "--phrase" || arg == "--phrases" {
             i += 1;
             let Some(val) = args.get(i) else {
                 anyhow::bail!("--phrase expects a value");
@@ -3095,6 +3124,37 @@ fn apply_env_overrides(overrides: &[(String, String)]) {
     }
 }
 
+fn split_wake_phrases(raw: &str) -> Vec<String> {
+    raw.split(|c| matches!(c, ',' | '|' | ';' | '\n' | '\r'))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn resolve_wake_phrases(
+    override_phrases: Option<&[String]>,
+    fallback_phrase: &str,
+) -> Vec<String> {
+    if let Some(list) = override_phrases {
+        if !list.is_empty() {
+            return list.to_vec();
+        }
+    }
+    if let Ok(env) = std::env::var("CLIP_WAKE_WORDS") {
+        let parsed = split_wake_phrases(&env);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    let fallback = split_wake_phrases(fallback_phrase);
+    if fallback.is_empty() {
+        vec![fallback_phrase.to_string()]
+    } else {
+        fallback
+    }
+}
+
 const LIVE_CONFIG_IGNORE_KEYS: &[&str] = &["CLIP_LIVE_CONFIG", "CLIP_LIVE_CONFIG_POLL_SECS"];
 const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("CLIP_FACE_FRAME_HEAD_TOP", "-0.18"),
@@ -3103,6 +3163,8 @@ const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("CLIP_FACE_FRAME_EYE_TOP_RATIO", "0.40"),
     ("CLIP_FACE_FRAME_EYE_CHIN_RATIO", "0.60"),
     ("CLIP_FACE_FRAME_SHOULDER_SCALE", "2.6"),
+    ("CLIP_WAKE_WORDS", "orange"),
+    ("CLIP_PROFILE", "1"),
 ];
 
 struct LiveConfigState {
@@ -3466,6 +3528,10 @@ async fn main() -> Result<()> {
         env_overrides,
     } = parse_cli_args(&args[1..])?;
     apply_env_overrides(&env_overrides);
+    let wake_phrases_override = override_phrase
+        .as_deref()
+        .map(split_wake_phrases)
+        .filter(|v| !v.is_empty());
     if let Ok(path) = std::env::var("CLIP_LIVE_CONFIG") {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
@@ -3503,7 +3569,7 @@ async fn main() -> Result<()> {
         }
         if cmd.eq_ignore_ascii_case("demo-ts") || cmd.eq_ignore_ascii_case("demo-file") {
             let Some(path) = positionals.get(1) else {
-                eprintln!("usage: autoclip demo-ts <ts_path> [--phrase WORD] [--no-log-raw-wake]");
+                eprintln!("usage: autoclip demo-ts <ts_path> [--phrase WORDS] [--no-log-raw-wake]");
                 return Ok(());
             };
             return run_ts_wake_demo(path, override_phrase.clone(), log_raw_wake).await;
@@ -3544,7 +3610,7 @@ async fn main() -> Result<()> {
         }
         if cmd.eq_ignore_ascii_case("demo-wakeword-mic") {
             let Some(page_url) = positionals.get(1) else {
-                eprintln!("usage: autoclip demo-wakeword-mic <page_url> [--phrase NAME] [--log-raw-wake] [--mic-device DEVICE]");
+                eprintln!("usage: autoclip demo-wakeword-mic <page_url> [--phrase WORDS] [--log-raw-wake] [--mic-device DEVICE]");
                 return Ok(());
             };
             let page_url = normalize_page_url(page_url);
@@ -3566,10 +3632,11 @@ async fn main() -> Result<()> {
     if let Some(p) = override_phrase {
         config.activation_phrase = p;
     }
+    config.wake_phrases = wake_phrases_override;
     config.log_raw_wake = log_raw_wake;
 
     if page_url_arg.is_none() && std::env::var("CLIP_PAGE_URL").is_err() {
-        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-ts <ts_path> | autoclip reprocess-ts <ts_path> | autoclip check-gameplay-model [model_dir] | autoclip demo-wakeword-mic <page_url> [--phrase NAME] [--no-log-raw-wake] | autoclip face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
+        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-ts <ts_path> | autoclip reprocess-ts <ts_path> | autoclip check-gameplay-model [model_dir] | autoclip demo-wakeword-mic <page_url> [--phrase WORDS] [--no-log-raw-wake] | autoclip face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
         return Ok(());
     }
 
@@ -3686,6 +3753,10 @@ async fn run_wakeword_mic_demo(opts: MicOpts) -> Result<()> {
     cfg.kick_url = opts.page_url.clone();
     if let Some(p) = opts.phrase.clone() {
         cfg.activation_phrase = p;
+        let parsed = split_wake_phrases(&cfg.activation_phrase);
+        if !parsed.is_empty() {
+            cfg.wake_phrases = Some(parsed);
+        }
     }
     cfg.use_mic_for_wake = true;
     cfg.log_raw_wake = opts.log_raw_wake;
@@ -3706,21 +3777,33 @@ async fn run_ts_wake_demo(
     }
 
     let mut cfg = Config::example();
-    if let Some(p) = phrase {
-        cfg.activation_phrase = p;
-    }
+    let override_phrases = phrase.clone().map(|p| {
+        cfg.activation_phrase = p.clone();
+        split_wake_phrases(&p)
+    });
     cfg.log_raw_wake = log_raw_wake;
 
     let model_path = stream_audio_wake::select_best_model_path();
     let ts_path_buf = path.to_path_buf();
-    let wake_phrase = cfg.activation_phrase.clone();
+    let wake_phrases = resolve_wake_phrases(override_phrases.as_deref(), &cfg.activation_phrase);
+    let wake_phrases_for_detect = wake_phrases.clone();
     let detect = tokio::task::spawn_blocking(move || {
-        detect_wake_in_file(&ts_path_buf, Path::new(&model_path), &wake_phrase, log_raw_wake)
+        detect_wake_in_file(
+            &ts_path_buf,
+            Path::new(&model_path),
+            &wake_phrases_for_detect,
+            log_raw_wake,
+        )
     })
     .await??;
 
     let Some(detect_secs) = detect else {
-        eprintln!("wake phrase '{}' not detected in file", cfg.activation_phrase);
+        let label = if wake_phrases.is_empty() {
+            cfg.activation_phrase.clone()
+        } else {
+            wake_phrases.join(", ")
+        };
+        eprintln!("wake phrase(s) '{}' not detected in file", label);
         return Ok(());
     };
 
@@ -4097,15 +4180,15 @@ fn print_help(bin: &str) {
     println!("  {bin} <page_url> [options]  (scheme optional, e.g. kick.com/user)");
     println!("  {bin} demo-buffer");
     println!("  {bin} demo-hls-buffer <page_url>");
-    println!("  {bin} demo-ts <path_to_ts> [--phrase WORD] [--no-log-raw-wake]");
+    println!("  {bin} demo-ts <path_to_ts> [--phrase WORDS] [--no-log-raw-wake]");
     println!("  {bin} reprocess-ts <path_to_ts>");
     println!("  {bin} check-gameplay-model [model_dir]");
     println!("  {bin} demo-detect <media_path>");
     println!("  {bin} face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
-    println!("  {bin} demo-wakeword-mic <page_url> [--phrase WORD] [--log-raw-wake] [--mic-device NAME]");
+    println!("  {bin} demo-wakeword-mic <page_url> [--phrase WORDS] [--log-raw-wake] [--mic-device NAME]");
     println!("");
     println!("Options:");
-    println!("  --phrase WORD           Override wake phrase (default: 'orange')");
+    println!("  --phrase WORDS          Override wake phrase(s), comma/pipe separated (default: 'orange')");
     println!("  --log-raw-wake         Log raw/normalized transcripts (default on)");
     println!("  --no-log-raw-wake      Disable transcript logging");
     println!("  --mic-device NAME      Microphone device for mic wake mode");
@@ -4156,6 +4239,8 @@ fn print_help(bin: &str) {
     println!("  CLIP_REGION_DETECT       Enable CLIP region detection (default true)");
     println!("  CLIP_LIVE_CONFIG         Path to live config file for hot-reload overrides");
     println!("  CLIP_LIVE_CONFIG_POLL_SECS   Live config poll interval in seconds (default 2)");
+    println!("  CLIP_WAKE_WORDS          Wake phrase list (comma/pipe separated) for clip trigger");
+    println!("  CLIP_PROFILE             Enable timing logs for hotspots (default false)");
     println!("  CLIP_GAMEPLAY_LABELS     CLIP gameplay positive labels");
     println!("  CLIP_GAMEPLAY_NEG_LABELS CLIP gameplay negative labels");
     println!("  CLIP_GAMEPLAY_SCORE      CLIP gameplay score threshold (default 0.12)");

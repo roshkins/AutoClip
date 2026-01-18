@@ -6,6 +6,7 @@ use tract_onnx::prelude::*;
 
 use crate::clip_layout::{NormalizedPoint, NormalizedRect};
 use crate::loading::LoadingTicker;
+use crate::profile::profile_span;
 
 const DEFAULT_MODEL_DIR: &str = "models/clip-vit-base-patch32-xenova";
 const FALLBACK_MODEL_DIR: &str = "models/clip-vit-base-patch32";
@@ -399,6 +400,7 @@ impl ClipGameplayDetector {
         positive: &[Vec<f32>],
         negative: &[Vec<f32>],
     ) -> Option<Vec<PatchScore>> {
+        let _span = profile_span("clip gameplay: score patches");
         let stride = self.stride.max(1) as usize;
         let patch = PATCH_SIZE;
         let mut scores: Vec<PatchScore> = Vec::new();

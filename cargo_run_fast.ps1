@@ -2,22 +2,51 @@
 param(
     [switch]$KillLocks,
     [switch]$SkipBindgen,
+    [switch]$NoNinja,
+    [string]$CudaArch,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Args = @()
 )
 
 $ErrorActionPreference = "Stop"
 
+$originalPath = $env:Path
+$cargoPath = (Get-Command cargo -ErrorAction SilentlyContinue).Source
+$cargoDir = if ($cargoPath) { Split-Path $cargoPath } else { $null }
+
 if (-not $PSBoundParameters.ContainsKey('KillLocks')) {
     $KillLocks = $true
 }
 
+function Get-BasePath {
+    param([string]$ExtraPath)
+    $parts = @()
+    foreach ($p in @(
+        [Environment]::GetEnvironmentVariable("Path", "Machine"),
+        [Environment]::GetEnvironmentVariable("Path", "User"),
+        $ExtraPath
+    )) {
+        if (-not $p) { continue }
+        $parts += ($p -split ';') | Where-Object { $_ }
+    }
+    $parts = $parts | Select-Object -Unique
+    if ($parts.Count -eq 0) { return $null }
+    return [string]::Join(';', $parts)
+}
+
 function Import-VsDevEnv {
+    param([string]$FallbackPath)
     $vsDevCmd = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat"
     if (-not (Test-Path $vsDevCmd)) {
         return $false
     }
-    $output = & cmd /c "`"$vsDevCmd`" -arch=x64 -host_arch=x64 && set"
+    $cmdLine = "`"$vsDevCmd`" -arch=x64 -host_arch=x64 && set"
+    $output = & cmd /c $cmdLine 2>&1
+    $needsFallback = ($LASTEXITCODE -ne 0) -or ($output | Select-String -SimpleMatch -Pattern "input line is too long" -Quiet)
+    if ($needsFallback -and $FallbackPath) {
+        $cmdLine = "set `"PATH=$FallbackPath`" && `"$vsDevCmd`" -arch=x64 -host_arch=x64 && set"
+        $output = & cmd /c $cmdLine 2>&1
+    }
     if ($LASTEXITCODE -ne 0) {
         return $false
     }
@@ -67,10 +96,21 @@ function Set-EnvIfEmpty {
     return $false
 }
 
+function Add-ToPathIfMissing {
+    param([string]$Dir)
+    if (-not $Dir) { return $false }
+    if (-not (Test-Path $Dir)) { return $false }
+    $parts = $env:Path -split ';'
+    if ($parts -contains $Dir) { return $false }
+    $env:Path = ($env:Path.TrimEnd(';') + ';' + $Dir)
+    return $true
+}
+
 $cpu = [Environment]::ProcessorCount
 if ($cpu -lt 1) { $cpu = 1 }
 
-$loadedVs = Import-VsDevEnv
+$fallbackPath = Get-BasePath -ExtraPath $cargoDir
+$loadedVs = Import-VsDevEnv -FallbackPath $fallbackPath
 if ($loadedVs) {
     Write-Host "Loaded Visual Studio developer environment." -ForegroundColor Yellow
 }
@@ -98,6 +138,16 @@ function Set-LibClangEnv {
 $setLibclang = Set-LibClangEnv
 if ($setLibclang) {
     Write-Host "Using libclang from $env:LIBCLANG_PATH" -ForegroundColor Yellow
+}
+
+$cudaPath = $env:CUDA_PATH
+if ($cudaPath) {
+    $addedCuda = $false
+    $addedCuda = (Add-ToPathIfMissing -Dir (Join-Path $cudaPath "bin")) -or $addedCuda
+    $addedCuda = (Add-ToPathIfMissing -Dir (Join-Path $cudaPath "bin\\x64")) -or $addedCuda
+    if ($addedCuda) {
+        Write-Host "Added CUDA runtime paths to PATH." -ForegroundColor Yellow
+    }
 }
 
 if (-not $env:BINDGEN_EXTRA_CLANG_ARGS) {
@@ -164,7 +214,10 @@ if ($SkipBindgen) {
 
 $ninja = Get-Command ninja -ErrorAction SilentlyContinue
 $setNinja = $false
-if ($ninja) {
+if ($NoNinja -or $env:WHISPER_NO_NINJA) {
+    Remove-Item Env:WHISPER_CMAKE_GENERATOR -ErrorAction SilentlyContinue
+    Remove-Item Env:WHISPER_CMAKE_MAKE_PROGRAM -ErrorAction SilentlyContinue
+} elseif ($ninja) {
     $setNinja = Set-EnvIfEmpty -Name "WHISPER_CMAKE_GENERATOR" -Value "Ninja"
     $setNinja = (Set-EnvIfEmpty -Name "WHISPER_CMAKE_MAKE_PROGRAM" -Value $ninja.Source) -or $setNinja
 }
@@ -179,7 +232,14 @@ if ($sccache) {
 }
 
 $setArch = $false
-if (-not $env:GGML_CUDA_ARCHITECTURES) {
+if ($CudaArch) {
+    $archList = $CudaArch.Trim()
+    if ($archList) {
+        $setArch = Set-EnvIfEmpty -Name "GGML_CUDA_ARCHITECTURES" -Value $archList
+        $setArch = (Set-EnvIfEmpty -Name "CMAKE_CUDA_ARCHITECTURES" -Value $archList) -or $setArch
+        $setArch = (Set-EnvIfEmpty -Name "CUDAARCHS" -Value $archList) -or $setArch
+    }
+} elseif (-not $env:GGML_CUDA_ARCHITECTURES) {
     $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if ($smi) {
         try {
@@ -188,11 +248,18 @@ if (-not $env:GGML_CUDA_ARCHITECTURES) {
             if ($caps.Count -gt 0) {
                 $archs = $caps | ForEach-Object { $_ -replace '\.', '' } |
                     Where-Object { $_ -match '^[0-9]+$' } |
+                    ForEach-Object { [int]$_ } |
+                    Select-Object -Unique
+                $archs = $archs | Where-Object { $_ -ge 50 -and $_ -le 90 } |
+                    ForEach-Object { $_.ToString() } |
                     Select-Object -Unique
                 if ($archs.Count -gt 0) {
                     $archList = ($archs -join ';')
                     $setArch = Set-EnvIfEmpty -Name "GGML_CUDA_ARCHITECTURES" -Value $archList
                     $setArch = (Set-EnvIfEmpty -Name "CMAKE_CUDA_ARCHITECTURES" -Value $archList) -or $setArch
+                    $setArch = (Set-EnvIfEmpty -Name "CUDAARCHS" -Value $archList) -or $setArch
+                } else {
+                    Write-Host "Warning: skipping GGML_CUDA_ARCHITECTURES auto-set (unsupported or unknown compute capability)." -ForegroundColor Yellow
                 }
             }
         } catch {

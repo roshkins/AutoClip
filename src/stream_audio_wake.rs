@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use url::Url;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+use crate::profile::profile_span;
+
 const SAMPLE_RATE: usize = 16_000;
 const CHUNK_MS: usize = 500; // read cadence for responsiveness
 const WINDOW_MS: usize = 6_000; // transcription window length (shorter to cut through noise)
@@ -24,6 +26,29 @@ const GGML_LOG_LEVEL_DEBUG: c_int = 5;
 
 static WHISPER_LOG_ONCE: Once = Once::new();
 static WHISPER_LOG_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Debug)]
+struct WordTiming {
+    text: String,
+    norm: String,
+    t0: f32,
+    t1: f32,
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptWindow {
+    text: String,
+    seg_t0: f32,
+    seg_t1: f32,
+    words: Vec<WordTiming>,
+}
+
+#[derive(Clone, Debug)]
+struct WakePhrase {
+    raw: String,
+    norm: String,
+    words: Vec<String>,
+}
 
 struct WhisperHandle {
     model_path: PathBuf,
@@ -57,7 +82,10 @@ impl WhisperHandle {
         })
     }
 
-    fn transcribe_with_fallback(&mut self, audio: &[f32]) -> Result<Option<(String, f32, f32)>> {
+    fn transcribe_with_fallback(
+        &mut self,
+        audio: &[f32],
+    ) -> Result<Option<TranscriptWindow>> {
         match transcribe_window(&mut self.state, audio) {
             Ok(out) => Ok(out),
             Err(err) if self.use_gpu => {
@@ -143,7 +171,7 @@ fn create_whisper_context(
 fn run_wake_loop_with_spawn<Spawn>(
     mut spawn_pcm: Spawn,
     model_path: &Path,
-    wake_norm: &str,
+    wake_phrases: Vec<WakePhrase>,
     log_raw: bool,
     stop: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
@@ -154,6 +182,9 @@ fn run_wake_loop_with_spawn<Spawn>(
 where
     Spawn: FnMut() -> Result<(Child, Box<dyn Read + Send>)> + Send + 'static,
 {
+    if wake_phrases.is_empty() {
+        anyhow::bail!("no wake phrases provided");
+    }
     let mut whisper = WhisperHandle::new(model_path)?;
     log_whisper_backend();
 
@@ -219,28 +250,55 @@ where
             }
             last_run = Instant::now();
 
-            if let Some((text, seg_t0_secs, seg_t1_secs)) =
-                whisper.transcribe_with_fallback(&pcm)?
-            {
-                let window_start_secs = (total_samples.saturating_sub(pcm.len() as u64) as f32) / SAMPLE_RATE as f32;
-                let norm = normalize(&text);
+            if let Some(window) = whisper.transcribe_with_fallback(&pcm)? {
+                let window_start_secs =
+                    (total_samples.saturating_sub(pcm.len() as u64) as f32) / SAMPLE_RATE as f32;
+                let norm = normalize(&window.text);
                 if log_raw && !norm.is_empty() {
-                    println!("stream raw: {}", text.trim());
+                    println!("stream raw: {}", window.text.trim());
                 }
-                if norm.contains(wake_norm) {
-                    let match_pos = norm.find(wake_norm).unwrap_or(0);
-                    let seg_span = (seg_t1_secs - seg_t0_secs).max(0.0);
-                    let frac = if !norm.is_empty() { (match_pos as f32 / norm.len() as f32).clamp(0.0, 1.0) } else { 0.0 };
-                    let phrase_start_secs = (seg_t0_secs + frac * seg_span).max(0.0);
+                if log_raw && !window.words.is_empty() {
+                    for word in &window.words {
+                        println!(
+                            "stream word: {:.2}-{:.2} {}",
+                            word.t0, word.t1, word.text
+                        );
+                    }
+                }
+                let mut phrase_start_secs = None;
+                let mut matched_phrase: Option<&WakePhrase> = None;
+                if !window.words.is_empty() {
+                    if let Some((idx, phrase)) = match_wake_words(&window.words, &wake_phrases) {
+                        phrase_start_secs = Some(window.words[idx].t0.max(0.0));
+                        matched_phrase = Some(phrase);
+                    }
+                }
+                if phrase_start_secs.is_none() && !norm.is_empty() {
+                    if let Some((pos, phrase)) = match_wake_text(&norm, &wake_phrases) {
+                        let seg_span = (window.seg_t1 - window.seg_t0).max(0.0);
+                        let frac = (pos as f32 / norm.len() as f32).clamp(0.0, 1.0);
+                        phrase_start_secs = Some((window.seg_t0 + frac * seg_span).max(0.0));
+                        matched_phrase = Some(phrase);
+                    }
+                }
+                if let Some(phrase_start_secs) = phrase_start_secs {
                     let abs_t0_secs = (window_start_secs + phrase_start_secs).max(0.0);
                     let nanos_f = (abs_t0_secs as f64 * 1_000_000_000.0).round();
                     let nanos = nanos_f
                         .max(0.0)
                         .min((NO_DETECT - 1) as f64) as u64;
-                    let _ = detect_ns.compare_exchange(NO_DETECT, nanos, Ordering::Relaxed, Ordering::Relaxed);
+                    let _ = detect_ns.compare_exchange(
+                        NO_DETECT,
+                        nanos,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
                     let already = fired.swap(true, Ordering::Relaxed);
                     if !already {
-                        eprintln!("wake phrase detected via stream audio: {norm}");
+                        let matched = matched_phrase
+                            .map(|p| p.raw.as_str())
+                            .unwrap_or("unknown");
+                        eprintln!("wake phrase detected via stream audio: {matched}");
                     }
                 }
             }
@@ -368,7 +426,7 @@ fn benchmark_model_rt(path: &Path) -> Option<f32> {
 pub fn start_stream_wake_from_hls(
     media_url: Arc<Mutex<Url>>,
     model_path: &Path,
-    wake_phrase: &str,
+    wake_phrases: &[String],
     log_raw: bool,
     stop: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
@@ -378,7 +436,10 @@ pub fn start_stream_wake_from_hls(
 ) -> Result<()> {
     let media_url = media_url.clone();
     let model_path = model_path.to_path_buf();
-    let wake = normalize(wake_phrase);
+    let wake_phrases = build_wake_phrases(wake_phrases);
+    if wake_phrases.is_empty() {
+        anyhow::bail!("no wake phrases provided");
+    }
     std::thread::spawn(move || {
         if let Err(err) = run_wake_loop_with_spawn(
             move || {
@@ -391,7 +452,7 @@ pub fn start_stream_wake_from_hls(
                 spawn_ffmpeg_pcm(&url)
             },
             &model_path,
-            &wake,
+            wake_phrases,
             log_raw,
             stop,
             fired,
@@ -409,15 +470,18 @@ pub fn start_stream_wake_from_hls(
 pub fn detect_wake_in_file(
     input_path: &Path,
     model_path: &Path,
-    wake_phrase: &str,
+    wake_phrases: &[String],
     log_raw: bool,
 ) -> Result<Option<f32>> {
-    let wake = normalize(wake_phrase);
+    let wake_phrases = build_wake_phrases(wake_phrases);
+    if wake_phrases.is_empty() {
+        anyhow::bail!("no wake phrases provided");
+    }
     let mut whisper = WhisperHandle::new(model_path)?;
     log_whisper_backend();
 
     let (mut ffmpeg, mut pcm_reader) = spawn_ffmpeg_pcm_file(input_path)?;
-    let result = run_wake_loop_file(&mut whisper, &mut *pcm_reader, &wake, log_raw);
+    let result = run_wake_loop_file(&mut whisper, &mut *pcm_reader, &wake_phrases, log_raw);
     let _ = ffmpeg.kill();
     result
 }
@@ -426,7 +490,7 @@ pub fn detect_wake_in_file(
 pub fn start_mic_wake_with_ffmpeg(
     mic_device: Option<&str>,
     model_path: &Path,
-    wake_phrase: &str,
+    wake_phrases: &[String],
     log_raw: bool,
     stop: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
@@ -436,12 +500,15 @@ pub fn start_mic_wake_with_ffmpeg(
 ) -> Result<()> {
     let mic = mic_device.map(|s| s.to_string());
     let model_path = model_path.to_path_buf();
-    let wake = normalize(wake_phrase);
+    let wake_phrases = build_wake_phrases(wake_phrases);
+    if wake_phrases.is_empty() {
+        anyhow::bail!("no wake phrases provided");
+    }
     std::thread::spawn(move || {
         if let Err(err) = run_wake_loop_with_spawn(
             move || spawn_ffmpeg_pcm_mic(mic.as_deref()),
             &model_path,
-            &wake,
+            wake_phrases,
             log_raw,
             stop,
             fired,
@@ -455,39 +522,96 @@ pub fn start_mic_wake_with_ffmpeg(
     Ok(())
 }
 
-fn transcribe_window(state: &mut whisper_rs::WhisperState, audio: &[f32]) -> Result<Option<(String, f32, f32)>> {
+fn transcribe_window(
+    state: &mut whisper_rs::WhisperState,
+    audio: &[f32],
+) -> Result<Option<TranscriptWindow>> {
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_special(false);
     params.set_translate(false);
-    params.set_no_timestamps(true);
+    params.set_no_timestamps(false);
+    params.set_token_timestamps(true);
+    params.set_split_on_word(true);
     params.set_single_segment(true);
     params.set_language(Some("en"));
     params.set_no_speech_thold(0.6);
 
+    let _span = profile_span("whisper: transcribe window");
     state.full(params, audio).context("running whisper")?;
     let num_segments = state.full_n_segments();
+    let mut text = String::new();
+    let mut seg_t0 = 0.0f32;
+    let mut seg_t1 = 0.0f32;
+    let mut seg_set = false;
+    let mut words: Vec<WordTiming> = Vec::new();
     for i in 0..num_segments {
         let segment = match state.get_segment(i) {
             Some(segment) => segment,
             None => continue,
         };
-        let text = segment.to_str().context("segment text")?;
-        let t0_secs = segment.start_timestamp() as f32 * 0.01;
-        let t1_secs = segment.end_timestamp() as f32 * 0.01;
-        let trimmed = text.trim();
+        let segment_text = segment.to_str().context("segment text")?;
+        let trimmed = segment_text.trim();
         if !trimmed.is_empty() {
-            return Ok(Some((trimmed.to_string(), t0_secs, t1_secs)));
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(trimmed);
+            if !seg_set {
+                seg_t0 = segment.start_timestamp() as f32 * 0.01;
+                seg_t1 = segment.end_timestamp() as f32 * 0.01;
+                seg_set = true;
+            }
+        }
+        let token_count = segment.n_tokens();
+        for token_idx in 0..token_count {
+            let Some(token) = segment.get_token(token_idx) else {
+                continue;
+            };
+            let token_text = match token.to_str_lossy() {
+                Ok(val) => val,
+                Err(_) => continue,
+            };
+            let token_text = token_text.trim();
+            let norm = normalize(token_text);
+            if norm.is_empty() {
+                continue;
+            }
+            let data = token.token_data();
+            let t0 = (data.t0.max(0) as f32) * 0.01;
+            let t1 = (data.t1.max(data.t0) as f32) * 0.01;
+            words.push(WordTiming {
+                text: token_text.to_string(),
+                norm,
+                t0,
+                t1,
+            });
         }
     }
-    Ok(None)
+    if text.is_empty() && words.is_empty() {
+        return Ok(None);
+    }
+    if !seg_set {
+        if let Some(first) = words.first() {
+            seg_t0 = first.t0;
+        }
+        if let Some(last) = words.last() {
+            seg_t1 = last.t1;
+        }
+    }
+    Ok(Some(TranscriptWindow {
+        text,
+        seg_t0,
+        seg_t1,
+        words,
+    }))
 }
 
 fn run_wake_loop_file(
     whisper: &mut WhisperHandle,
     pcm_reader: &mut dyn Read,
-    wake_norm: &str,
+    wake_phrases: &[WakePhrase],
     log_raw: bool,
 ) -> Result<Option<f32>> {
     let chunk_samples = SAMPLE_RATE * CHUNK_MS / 1000;
@@ -525,26 +649,43 @@ fn run_wake_loop_file(
         }
         last_run = Instant::now();
 
-        if let Some((text, seg_t0_secs, seg_t1_secs)) =
-            whisper.transcribe_with_fallback(&pcm)?
-        {
-            let window_start_secs = (total_samples.saturating_sub(pcm.len() as u64) as f32)
-                / SAMPLE_RATE as f32;
-            let norm = normalize(&text);
+        if let Some(window) = whisper.transcribe_with_fallback(&pcm)? {
+            let window_start_secs =
+                (total_samples.saturating_sub(pcm.len() as u64) as f32) / SAMPLE_RATE as f32;
+            let norm = normalize(&window.text);
             if log_raw && !norm.is_empty() {
-                println!("file raw: {}", text.trim());
+                println!("file raw: {}", window.text.trim());
             }
-            if norm.contains(wake_norm) {
-                let match_pos = norm.find(wake_norm).unwrap_or(0);
-                let seg_span = (seg_t1_secs - seg_t0_secs).max(0.0);
-                let frac = if !norm.is_empty() {
-                    (match_pos as f32 / norm.len() as f32).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let phrase_start_secs = (seg_t0_secs + frac * seg_span).max(0.0);
+            if log_raw && !window.words.is_empty() {
+                for word in &window.words {
+                    println!(
+                        "file word: {:.2}-{:.2} {}",
+                        word.t0, word.t1, word.text
+                    );
+                }
+            }
+            let mut phrase_start_secs = None;
+            let mut matched_phrase: Option<&WakePhrase> = None;
+            if !window.words.is_empty() {
+                if let Some((idx, phrase)) = match_wake_words(&window.words, wake_phrases) {
+                    phrase_start_secs = Some(window.words[idx].t0.max(0.0));
+                    matched_phrase = Some(phrase);
+                }
+            }
+            if phrase_start_secs.is_none() && !norm.is_empty() {
+                if let Some((pos, phrase)) = match_wake_text(&norm, wake_phrases) {
+                    let seg_span = (window.seg_t1 - window.seg_t0).max(0.0);
+                    let frac = (pos as f32 / norm.len() as f32).clamp(0.0, 1.0);
+                    phrase_start_secs = Some((window.seg_t0 + frac * seg_span).max(0.0));
+                    matched_phrase = Some(phrase);
+                }
+            }
+            if let Some(phrase_start_secs) = phrase_start_secs {
                 let abs_t0_secs = (window_start_secs + phrase_start_secs).max(0.0);
-                eprintln!("wake phrase detected in file audio: {norm}");
+                let matched = matched_phrase
+                    .map(|p| p.raw.as_str())
+                    .unwrap_or("unknown");
+                eprintln!("wake phrase detected in file audio: {matched}");
                 return Ok(Some(abs_t0_secs));
             }
         }
@@ -816,6 +957,76 @@ fn normalize(s: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+fn build_wake_phrases(raw: &[String]) -> Vec<WakePhrase> {
+    let mut out = Vec::new();
+    for phrase in raw {
+        let norm = normalize(phrase);
+        if norm.is_empty() {
+            continue;
+        }
+        let words: Vec<String> = norm
+            .split_whitespace()
+            .map(|w| w.to_string())
+            .collect();
+        if words.is_empty() {
+            continue;
+        }
+        out.push(WakePhrase {
+            raw: phrase.clone(),
+            norm,
+            words,
+        });
+    }
+    out
+}
+
+fn match_wake_words<'a>(
+    words: &[WordTiming],
+    phrases: &'a [WakePhrase],
+) -> Option<(usize, &'a WakePhrase)> {
+    let mut best: Option<(usize, &WakePhrase)> = None;
+    for phrase in phrases {
+        let count = phrase.words.len();
+        if count == 0 || words.len() < count {
+            continue;
+        }
+        for start in 0..=words.len().saturating_sub(count) {
+            if phrase
+                .words
+                .iter()
+                .enumerate()
+                .all(|(idx, w)| words[start + idx].norm == *w)
+            {
+                let replace = best.map(|(best_start, _)| start < best_start).unwrap_or(true);
+                if replace {
+                    best = Some((start, phrase));
+                }
+                break;
+            }
+        }
+    }
+    best
+}
+
+fn match_wake_text<'a>(
+    transcript: &str,
+    phrases: &'a [WakePhrase],
+) -> Option<(usize, &'a WakePhrase)> {
+    let mut best: Option<(usize, &WakePhrase)> = None;
+    for phrase in phrases {
+        if phrase.norm.is_empty() {
+            continue;
+        }
+        if let Some(pos) = transcript.find(&phrase.norm) {
+            let replace = best.map(|(best_pos, _)| pos < best_pos).unwrap_or(true);
+            if replace {
+                best = Some((pos, phrase));
+            }
+        }
+    }
+    best
 }
 
 fn log_whisper_backend() {

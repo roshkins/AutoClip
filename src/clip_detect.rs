@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::cmp::{max, min};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tract_onnx::prelude::*;
@@ -13,6 +15,7 @@ use crate::clip_gameplay::{
 };
 use crate::clip_layout::{ClipLayoutHints, FaceFrameSpec, NormalizedPoint, NormalizedRect};
 use crate::loading::LoadingTicker;
+use crate::profile::profile_span;
 
 #[cfg(feature = "ort")]
 use ort::ep;
@@ -462,6 +465,7 @@ async fn build_face_sweep_inputs(
             eprintln!("face sweep: missing input {}", path.display());
             continue;
         }
+        let mut face_frame_cache = FaceFrameCache::new(64);
         let source_dims = probe_media_dimensions(input).await;
         let sample_times = build_sample_times(config, true, None);
         let total_samples = sample_times.len();
@@ -471,8 +475,15 @@ async fn build_face_sweep_inputs(
         let mut face_samples: Vec<FaceSample> = Vec::new();
         for seek in sample_times {
             let seek_arg = if seek > 0.0 { Some(seek) } else { None };
-            let candidates =
-                detect_face_candidates(input, seek_arg, detector, source_dims, None).await;
+            let candidates = detect_face_candidates(
+                input,
+                seek_arg,
+                detector,
+                source_dims,
+                None,
+                &mut face_frame_cache,
+            )
+            .await;
             if !candidates.is_empty() {
                 face_samples.push(FaceSample {
                     time: seek,
@@ -509,10 +520,14 @@ pub async fn detect_layout_hints(
     input: &str,
     config: &ClipDetectConfig,
 ) -> Result<ClipLayoutHints> {
+    let _span = profile_span("clip detect: layout hints");
     let mut hints = ClipLayoutHints::default();
     if !config.enabled {
         return Ok(hints);
     }
+
+    let mut frame_cache = FrameCache::new(32);
+    let mut face_frame_cache = FaceFrameCache::new(64);
 
     let is_local = Path::new(input).exists();
     let duration_secs = if is_local && config.scan_full_clip {
@@ -638,7 +653,15 @@ pub async fn detect_layout_hints(
                 .map(|cfg| (cfg.frame_width, cfg.frame_height))
                 .unwrap_or((config.frame_width, config.frame_height));
             let seek_arg = if cam_seek > 0.0 { Some(cam_seek) } else { None };
-            match extract_frame_rgb(input, seek_arg, cam_w, cam_h).await {
+            match extract_frame_rgb_cached(
+                Some(&mut frame_cache),
+                input,
+                seek_arg,
+                cam_w,
+                cam_h,
+            )
+            .await
+            {
                 Ok(frame) => {
                     if let Some(obs) = detector.detect_region(
                         frame.as_slice(),
@@ -696,6 +719,7 @@ pub async fn detect_layout_hints(
                     detector,
                     source_dims,
                     hints.face_region,
+                    &mut face_frame_cache,
                 )
                 .await;
                 face_samples_attempted += 1;
@@ -779,7 +803,8 @@ pub async fn detect_layout_hints(
                     seek
                 );
                 let seek_arg = if seek > 0.0 { Some(seek) } else { None };
-                let frame = match extract_frame_rgb(
+                let frame = match extract_frame_rgb_cached(
+                    Some(&mut frame_cache),
                     input,
                     seek_arg,
                     config.frame_width,
@@ -813,7 +838,8 @@ pub async fn detect_layout_hints(
                     {
                         None
                     } else {
-                        match extract_frame_rgb(
+                        match extract_frame_rgb_cached(
+                            Some(&mut frame_cache),
                             input,
                             seek_arg,
                             cfg.frame_width,
@@ -1128,6 +1154,7 @@ async fn detect_face_candidates(
     detector: &YunetDetector,
     source_dims: Option<(u32, u32)>,
     preferred_region: Option<NormalizedRect>,
+    frame_cache: &mut FaceFrameCache,
 ) -> Vec<FaceCandidate> {
     let regions = build_face_scan_regions();
     let full_region = regions
@@ -1145,7 +1172,16 @@ async fn detect_face_candidates(
     let dump_raw = face_dump_raw_enabled();
     if let Some(region) = preferred_region {
         if region.w > 0.0 && region.h > 0.0 {
-            match detect_faces_in_region(input, seek, detector, region, source_dims).await {
+            match detect_faces_in_region(
+                input,
+                seek,
+                detector,
+                region,
+                source_dims,
+                frame_cache,
+            )
+            .await
+            {
                 Ok(mut candidates) => {
                     if face_debug_enabled() {
                         eprintln!(
@@ -1160,7 +1196,16 @@ async fn detect_face_candidates(
                 }
             }
             if dump_raw {
-                match detect_faces_in_region_raw(input, seek, detector, region, source_dims).await {
+                match detect_faces_in_region_raw(
+                    input,
+                    seek,
+                    detector,
+                    region,
+                    source_dims,
+                    frame_cache,
+                )
+                .await
+                {
                     Ok(raw_candidates) => {
                         maybe_dump_face_candidates(input, seek, &raw_candidates, "faces_cam_raw")
                             .await;
@@ -1178,6 +1223,7 @@ async fn detect_face_candidates(
         detector,
         full_region,
         source_dims,
+        frame_cache,
     )
     .await
     {
@@ -1200,6 +1246,7 @@ async fn detect_face_candidates(
             detector,
             full_region,
             source_dims,
+            frame_cache,
         )
         .await
         {
@@ -1257,6 +1304,7 @@ async fn detect_face_candidates(
             detector,
             source_dims,
             all_candidates,
+            frame_cache,
         )
         .await;
         maybe_dump_face_candidates(input, seek, &all_candidates, "faces").await;
@@ -1276,7 +1324,16 @@ async fn detect_face_candidates(
     }
 
     for (label, region) in extra_regions {
-        match detect_faces_in_region(input, seek, detector, region, source_dims).await {
+        match detect_faces_in_region(
+            input,
+            seek,
+            detector,
+            region,
+            source_dims,
+            frame_cache,
+        )
+        .await
+        {
             Ok(mut candidates) => {
                 if face_debug_enabled() {
                     eprintln!(
@@ -1302,6 +1359,7 @@ async fn detect_face_candidates(
         detector,
         source_dims,
         all_candidates,
+        frame_cache,
     )
     .await;
     maybe_dump_face_candidates(input, seek, &all_candidates, "faces").await;
@@ -1314,6 +1372,7 @@ async fn apply_face_tile_search(
     detector: &YunetDetector,
     source_dims: Option<(u32, u32)>,
     mut candidates: Vec<FaceCandidate>,
+    frame_cache: &mut FaceFrameCache,
 ) -> Vec<FaceCandidate> {
     let Some(tile_config) = face_tile_config() else {
         return candidates;
@@ -1340,6 +1399,7 @@ async fn apply_face_tile_search(
                 detector,
                 region,
                 Some(source_dims),
+                frame_cache,
             )
             .await
             {
@@ -1463,8 +1523,10 @@ async fn detect_faces_in_region(
     detector: &YunetDetector,
     region: NormalizedRect,
     source_dims: Option<(u32, u32)>,
+    frame_cache: &mut FaceFrameCache,
 ) -> Result<Vec<FaceCandidate>> {
-    let frame = extract_face_frame_rgb(
+    let frame = extract_face_frame_rgb_cached(
+        Some(frame_cache),
         input,
         seek,
         detector.input_w,
@@ -1473,7 +1535,7 @@ async fn detect_faces_in_region(
         source_dims,
     )
     .await?;
-    Ok(detector.detect_faces(&frame))
+    Ok(detector.detect_faces(frame.as_ref()))
 }
 
 async fn detect_faces_in_region_raw(
@@ -1482,8 +1544,10 @@ async fn detect_faces_in_region_raw(
     detector: &YunetDetector,
     region: NormalizedRect,
     source_dims: Option<(u32, u32)>,
+    frame_cache: &mut FaceFrameCache,
 ) -> Result<Vec<FaceCandidate>> {
-    let frame = extract_face_frame_rgb(
+    let frame = extract_face_frame_rgb_cached(
+        Some(frame_cache),
         input,
         seek,
         detector.input_w,
@@ -1492,7 +1556,7 @@ async fn detect_faces_in_region_raw(
         source_dims,
     )
     .await?;
-    Ok(detector.detect_faces_raw(&frame))
+    Ok(detector.detect_faces_raw(frame.as_ref()))
 }
 
 fn face_size_status(rect: NormalizedRect, model_w: u32, model_h: u32) -> FaceSizeStatus {
@@ -3172,12 +3236,166 @@ fn face_candidate_weighted_score(rect: NormalizedRect, score: f32) -> f32 {
     score * weight
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct FrameKey {
+    seek_ms: i64,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct FaceFrameKey {
+    seek_ms: i64,
+    model_w: u32,
+    model_h: u32,
+    region_x: u16,
+    region_y: u16,
+    region_w: u16,
+    region_h: u16,
+    src_w: u32,
+    src_h: u32,
+}
+
+struct FrameCache {
+    max_entries: usize,
+    order: VecDeque<FrameKey>,
+    entries: HashMap<FrameKey, Arc<Vec<u8>>>,
+}
+
+impl FrameCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&self, key: &FrameKey) -> Option<Arc<Vec<u8>>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: FrameKey, value: Arc<Vec<u8>>) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        self.entries.insert(key, value);
+        self.order.push_back(key);
+        self.evict_if_needed();
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > self.max_entries {
+            if let Some(key) = self.order.pop_front() {
+                self.entries.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+struct FaceFrameCache {
+    max_entries: usize,
+    order: VecDeque<FaceFrameKey>,
+    entries: HashMap<FaceFrameKey, Arc<FaceFrame>>,
+}
+
+impl FaceFrameCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&self, key: &FaceFrameKey) -> Option<Arc<FaceFrame>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: FaceFrameKey, value: Arc<FaceFrame>) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        self.entries.insert(key, value);
+        self.order.push_back(key);
+        self.evict_if_needed();
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > self.max_entries {
+            if let Some(key) = self.order.pop_front() {
+                self.entries.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn seek_to_ms(seek: Option<f32>) -> i64 {
+    seek.map(|s| (s.max(0.0) * 1000.0).round() as i64)
+        .unwrap_or(-1)
+}
+
+fn quantize_unit(value: f32) -> u16 {
+    let clamped = value.clamp(0.0, 1.0);
+    (clamped * 10_000.0).round().clamp(0.0, 10_000.0) as u16
+}
+
+fn face_frame_key(
+    seek: Option<f32>,
+    model_w: u32,
+    model_h: u32,
+    region: NormalizedRect,
+    source_dims: Option<(u32, u32)>,
+) -> FaceFrameKey {
+    let (src_w, src_h) = source_dims.unwrap_or((0, 0));
+    FaceFrameKey {
+        seek_ms: seek_to_ms(seek),
+        model_w,
+        model_h,
+        region_x: quantize_unit(region.x),
+        region_y: quantize_unit(region.y),
+        region_w: quantize_unit(region.w),
+        region_h: quantize_unit(region.h),
+        src_w,
+        src_h,
+    }
+}
+
+async fn extract_frame_rgb_cached(
+    mut cache: Option<&mut FrameCache>,
+    input: &str,
+    seek_secs: Option<f32>,
+    width: u32,
+    height: u32,
+) -> Result<Arc<Vec<u8>>> {
+    let key = FrameKey {
+        seek_ms: seek_to_ms(seek_secs),
+        width,
+        height,
+    };
+    if let Some(cache) = cache.as_deref_mut() {
+        if let Some(frame) = cache.get(&key) {
+            return Ok(frame);
+        }
+    }
+    let data = Arc::new(extract_frame_rgb(input, seek_secs, width, height).await?);
+    if let Some(cache) = cache.as_deref_mut() {
+        cache.insert(key, data.clone());
+    }
+    Ok(data)
+}
+
 async fn extract_frame_rgb(
     input: &str,
     seek_secs: Option<f32>,
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>> {
+    let _span = profile_span("clip detect: extract frame");
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-hide_banner").arg("-loglevel").arg("error");
     cmd.arg("-nostdin");
@@ -3390,6 +3608,7 @@ async fn extract_face_frame_rgb(
     region: NormalizedRect,
     source_dims: Option<(u32, u32)>,
 ) -> Result<FaceFrame> {
+    let _span = profile_span("clip detect: extract face frame");
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-hide_banner").arg("-loglevel").arg("error");
     cmd.arg("-nostdin");
@@ -3430,6 +3649,30 @@ async fn extract_face_frame_rgb(
         mapping,
         region,
     })
+}
+
+async fn extract_face_frame_rgb_cached(
+    mut cache: Option<&mut FaceFrameCache>,
+    input: &str,
+    seek_secs: Option<f32>,
+    model_w: u32,
+    model_h: u32,
+    region: NormalizedRect,
+    source_dims: Option<(u32, u32)>,
+) -> Result<Arc<FaceFrame>> {
+    let key = face_frame_key(seek_secs, model_w, model_h, region, source_dims);
+    if let Some(cache) = cache.as_deref_mut() {
+        if let Some(frame) = cache.get(&key) {
+            return Ok(frame);
+        }
+    }
+    let frame = Arc::new(
+        extract_face_frame_rgb(input, seek_secs, model_w, model_h, region, source_dims).await?,
+    );
+    if let Some(cache) = cache.as_deref_mut() {
+        cache.insert(key, frame.clone());
+    }
+    Ok(frame)
 }
 
 async fn probe_media_duration_secs(path: &Path) -> Option<f32> {
