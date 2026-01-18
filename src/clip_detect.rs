@@ -3389,6 +3389,41 @@ async fn extract_frame_rgb_cached(
     Ok(data)
 }
 
+async fn run_ffmpeg_rgb_frame(
+    input: &str,
+    seek_secs: Option<f32>,
+    filter: &str,
+    seek_after_input: bool,
+    context: &'static str,
+) -> Result<Vec<u8>> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner").arg("-loglevel").arg("error");
+    cmd.arg("-nostdin");
+    if !seek_after_input {
+        if let Some(seek) = seek_secs {
+            cmd.arg("-ss").arg(format!("{seek:.3}"));
+        }
+    }
+    cmd.arg("-i").arg(input);
+    if seek_after_input {
+        if let Some(seek) = seek_secs {
+            cmd.arg("-ss").arg(format!("{seek:.3}"));
+        }
+    }
+    cmd.arg("-frames:v").arg("1");
+    cmd.arg("-vf").arg(filter);
+    cmd.arg("-pix_fmt").arg("rgb24");
+    cmd.arg("-f").arg("rawvideo");
+    cmd.arg("-");
+
+    let output = cmd.output().await.context(context)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffmpeg frame extract failed: {}", stderr.trim());
+    }
+    Ok(output.stdout)
+}
+
 async fn extract_frame_rgb(
     input: &str,
     seek_secs: Option<f32>,
@@ -3396,35 +3431,35 @@ async fn extract_frame_rgb(
     height: u32,
 ) -> Result<Vec<u8>> {
     let _span = profile_span("clip detect: extract frame");
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-hide_banner").arg("-loglevel").arg("error");
-    cmd.arg("-nostdin");
-    if let Some(seek) = seek_secs {
-        cmd.arg("-ss").arg(format!("{seek:.3}"));
-    }
-    cmd.arg("-i").arg(input);
-    cmd.arg("-frames:v").arg("1");
-    cmd.arg("-vf")
-        .arg(format!("scale={width}:{height}:flags=bicubic"));
-    cmd.arg("-pix_fmt").arg("rgb24");
-    cmd.arg("-f").arg("rawvideo");
-    cmd.arg("-");
-
-    let output = cmd.output().await.context("running ffmpeg for detection frame")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("ffmpeg frame extract failed: {}", stderr.trim());
-    }
-
+    let filter = format!("scale={width}:{height}:flags=bicubic");
+    let mut data = run_ffmpeg_rgb_frame(
+        input,
+        seek_secs,
+        &filter,
+        false,
+        "running ffmpeg for detection frame",
+    )
+    .await?;
     let expected = (width * height * 3) as usize;
-    if output.stdout.len() < expected {
-        anyhow::bail!(
-            "ffmpeg frame extract returned {} bytes, expected {}",
-            output.stdout.len(),
-            expected
-        );
+    if data.len() < expected {
+        if seek_secs.is_some() {
+            data = run_ffmpeg_rgb_frame(
+                input,
+                seek_secs,
+                &filter,
+                true,
+                "running ffmpeg for detection frame (accurate seek)",
+            )
+            .await?;
+        }
+        if data.len() < expected {
+            anyhow::bail!(
+                "ffmpeg frame extract returned {} bytes, expected {}",
+                data.len(),
+                expected
+            );
+        }
     }
-    let mut data = output.stdout;
     data.truncate(expected);
     Ok(data)
 }
@@ -3609,35 +3644,46 @@ async fn extract_face_frame_rgb(
     source_dims: Option<(u32, u32)>,
 ) -> Result<FaceFrame> {
     let _span = profile_span("clip detect: extract face frame");
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-hide_banner").arg("-loglevel").arg("error");
-    cmd.arg("-nostdin");
-    if let Some(seek) = seek_secs {
-        cmd.arg("-ss").arg(format!("{seek:.3}"));
-    }
-    cmd.arg("-i").arg(input);
-    cmd.arg("-frames:v").arg("1");
     let filter = build_face_filter(model_w, model_h, region);
-    cmd.arg("-vf").arg(filter);
-    cmd.arg("-pix_fmt").arg("rgb24");
-    cmd.arg("-f").arg("rawvideo");
-    cmd.arg("-");
-
-    let output = cmd.output().await.context("running ffmpeg for face frame")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("ffmpeg face frame extract failed: {}", stderr.trim());
-    }
-
+    let mut data = run_ffmpeg_rgb_frame(
+        input,
+        seek_secs,
+        &filter,
+        false,
+        "running ffmpeg for face frame",
+    )
+    .await?;
     let expected = (model_w * model_h * 3) as usize;
-    if output.stdout.len() < expected {
-        anyhow::bail!(
-            "ffmpeg face frame extract returned {} bytes, expected {}",
-            output.stdout.len(),
-            expected
-        );
+    if data.len() < expected {
+        if let Some(seek) = seek_secs {
+            data = run_ffmpeg_rgb_frame(
+                input,
+                seek_secs,
+                &filter,
+                true,
+                "running ffmpeg for face frame (accurate seek)",
+            )
+            .await?;
+            if data.len() < expected && seek > 0.25 {
+                let retry_seek = (seek - 0.25).max(0.0);
+                data = run_ffmpeg_rgb_frame(
+                    input,
+                    Some(retry_seek),
+                    &filter,
+                    true,
+                    "running ffmpeg for face frame (fallback seek)",
+                )
+                .await?;
+            }
+        }
+        if data.len() < expected {
+            anyhow::bail!(
+                "ffmpeg face frame extract returned {} bytes, expected {}",
+                data.len(),
+                expected
+            );
+        }
     }
-    let mut data = output.stdout;
     data.truncate(expected);
 
     let mapping = source_dims.map(|(src_w, src_h)| {

@@ -175,6 +175,7 @@ impl AutoClip {
         let before = Duration::from_secs(50);
         let after_tail = Duration::from_secs(10);
         let clip_window = before + after_tail;
+        ensure_live_detect_budgets();
         let latency_headroom = std::env::var("WAKE_BUFFER_HEADROOM_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -2469,6 +2470,47 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+fn ensure_live_detect_budgets() {
+    let mut face_secs = std::env::var("CLIP_FACE_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0);
+    let mut total_secs = std::env::var("CLIP_DETECT_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0);
+
+    let mut set_face = false;
+    let mut set_total = false;
+
+    if face_secs.is_none() {
+        face_secs = Some(20.0);
+        set_face = true;
+    }
+    if total_secs.is_none() {
+        let base = face_secs.unwrap_or(20.0);
+        total_secs = Some(base * 2.0);
+        set_total = true;
+    }
+
+    if set_face {
+        std::env::set_var("CLIP_FACE_BUDGET_SECS", format!("{:.0}", face_secs.unwrap()));
+    }
+    if set_total {
+        std::env::set_var("CLIP_DETECT_BUDGET_SECS", format!("{:.0}", total_secs.unwrap()));
+    }
+
+    if set_face || set_total {
+        let face = face_secs.unwrap_or(20.0);
+        let total = total_secs.unwrap_or(face * 2.0);
+        let gameplay = (total - face).max(0.0);
+        eprintln!(
+            "clip detect: live budgets face={:.0}s gameplay={:.0}s (total {:.0}s)",
+            face, gameplay, total
+        );
+    }
+}
+
 fn gameplay_enabled() -> bool {
     std::env::var("CLIP_GAMEPLAY")
         .ok()
@@ -3314,6 +3356,9 @@ fn parse_live_config(contents: &str) -> HashMap<String, String> {
         let (raw_key, raw_value) = split_live_config_line(line);
         let Some(raw_key) = raw_key else { continue };
         let value = raw_value.unwrap_or_else(|| "1".to_string());
+        if value.trim().is_empty() {
+            continue;
+        }
         let Some(env_key) = normalize_live_config_key(raw_key) else {
             eprintln!(
                 "live config: unknown key '{}' on line {}",
@@ -3336,7 +3381,7 @@ fn ensure_live_config_file(path: &Path, overrides: &[(String, String)]) {
         .filter(|(key, _)| !LIVE_CONFIG_IGNORE_KEYS.contains(&key.as_str()))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    let prefill: HashMap<String, String> = LIVE_CONFIG_PREFILL
+    let defaults: HashMap<String, String> = LIVE_CONFIG_PREFILL
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
@@ -3352,9 +3397,7 @@ fn ensure_live_config_file(path: &Path, overrides: &[(String, String)]) {
     }
 
     let mut original = String::new();
-    let mut lines: Vec<String> = Vec::new();
-    let mut updated_keys: HashSet<String> = HashSet::new();
-    let mut seen_keys: HashSet<String> = HashSet::new();
+    let mut existing_values: HashMap<String, String> = HashMap::new();
     if path.exists() {
         match fs::read_to_string(path) {
             Ok(contents) => {
@@ -3365,24 +3408,16 @@ fn ensure_live_config_file(path: &Path, overrides: &[(String, String)]) {
                         || trimmed.starts_with('#')
                         || trimmed.starts_with("//")
                     {
-                        lines.push(line.to_string());
                         continue;
                     }
-                    let (raw_key, _) = split_live_config_line(trimmed);
-                    if let Some(raw_key) = raw_key {
-                        if let Some(env_key) = normalize_live_config_key(raw_key) {
-                            if let Some(value) = overrides.get(&env_key) {
-                                lines.push(format!("{env_key}={value}"));
-                                updated_keys.insert(env_key.clone());
-                                seen_keys.insert(env_key);
-                                continue;
-                            }
-                            if prefill.contains_key(&env_key) {
-                                seen_keys.insert(env_key);
-                            }
-                        }
+                    let (raw_key, raw_value) = split_live_config_line(trimmed);
+                    let Some(raw_key) = raw_key else { continue };
+                    let Some(env_key) = normalize_live_config_key(raw_key) else { continue };
+                    if !is_known_env_key(&env_key) {
+                        continue;
                     }
-                    lines.push(line.to_string());
+                    let value = raw_value.unwrap_or_else(|| "".to_string());
+                    existing_values.insert(env_key, value);
                 }
             }
             Err(err) => {
@@ -3394,23 +3429,51 @@ fn ensure_live_config_file(path: &Path, overrides: &[(String, String)]) {
         }
     }
 
-    if !overrides.is_empty() {
-        for (key, value) in overrides {
-            if updated_keys.contains(&key) || seen_keys.contains(&key) {
-                continue;
+    let mut values: HashMap<String, String> = HashMap::new();
+    for spec in ENV_SPECS {
+        let key = spec.env.to_string();
+        if let Some(value) = defaults.get(&key) {
+            values.insert(key.clone(), value.clone());
+        } else if let Ok(value) = std::env::var(&key) {
+            if !value.trim().is_empty() {
+                values.insert(key.clone(), value);
             }
-            lines.push(format!("{key}={value}"));
-            seen_keys.insert(key.clone());
+        } else {
+            values.insert(key.clone(), String::new());
         }
-    } else if lines.is_empty() && !path.exists() {
-        lines.push(String::new());
     }
-    for (key, value) in prefill {
-        if seen_keys.contains(&key) {
+    for (key, value) in existing_values {
+        if overrides.contains_key(&key) {
             continue;
         }
+        values.insert(key, value);
+    }
+    for (key, value) in overrides {
+        values.insert(key, value);
+    }
+
+    let mut keys: Vec<String> = ENV_SPECS.iter().map(|spec| spec.env.to_string()).collect();
+    keys.sort_by(|a, b| {
+        let (ga, la) = live_config_group(a);
+        let (gb, lb) = live_config_group(b);
+        ga.cmp(&gb).then_with(|| la.cmp(&lb))
+    });
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("# AutoClip live config (hot-reload).".to_string());
+    lines.push("# Edit values and save; changes apply while running.".to_string());
+    lines.push("# Blank values are placeholders and are ignored until set.".to_string());
+
+    let mut last_group: Option<usize> = None;
+    for key in keys {
+        let (group, label) = live_config_group(&key);
+        if last_group != Some(group) {
+            lines.push(String::new());
+            lines.push(format!("# {label}"));
+            last_group = Some(group);
+        }
+        let value = values.get(&key).cloned().unwrap_or_default();
         lines.push(format!("{key}={value}"));
-        seen_keys.insert(key);
     }
 
     let next_contents = lines.join("\n");
@@ -3485,11 +3548,57 @@ fn normalize_live_config_key(raw: &str) -> Option<String> {
     if is_known_env_key(&prefixed) {
         return Some(prefixed);
     }
+    if candidate
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Some(candidate);
+    }
     None
 }
 
 fn is_known_env_key(key: &str) -> bool {
     ENV_SPECS.iter().any(|spec| spec.env == key)
+}
+
+fn live_config_group(key: &str) -> (usize, &'static str) {
+    if key.starts_with("CLIP_") {
+        return (0, "Clip");
+    }
+    if key.starts_with("WAKE_") {
+        return (1, "Wake");
+    }
+    if key.starts_with("WHISPER_") {
+        return (2, "Whisper");
+    }
+    if key.starts_with("GGML_") {
+        return (3, "GGML");
+    }
+    if key.starts_with("FFMPEG_") {
+        return (4, "FFmpeg");
+    }
+    if key.starts_with("M3U8_") {
+        return (5, "M3U8");
+    }
+    if key.starts_with("HEADLESS_") {
+        return (6, "Headless");
+    }
+    if key.starts_with("TWITCH_") {
+        return (7, "Twitch");
+    }
+    if key.starts_with("KICK_") {
+        return (8, "Kick");
+    }
+    if key.starts_with("TIKTOK_") {
+        return (9, "TikTok");
+    }
+    if key.starts_with("COOKIE_") {
+        return (10, "Cookies");
+    }
+    if key.starts_with("MIC_") {
+        return (11, "Mic");
+    }
+    (12, "Other")
 }
 
 fn resolve_mic_opts(
@@ -3532,12 +3641,17 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(split_wake_phrases)
         .filter(|v| !v.is_empty());
-    if let Ok(path) = std::env::var("CLIP_LIVE_CONFIG") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            ensure_live_config_file(Path::new(trimmed), &env_overrides);
+    let live_config_path = match std::env::var("CLIP_LIVE_CONFIG") {
+        Ok(path) if !path.trim().is_empty() => PathBuf::from(path.trim()),
+        _ => {
+            let cwd = std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."));
+            let path = cwd.join("config.env");
+            std::env::set_var("CLIP_LIVE_CONFIG", path.to_string_lossy().as_ref());
+            path
         }
-    }
+    };
+    ensure_live_config_file(&live_config_path, &env_overrides);
 
     // Ensure CUDA backend is preferred when available; avoid falling back to CPU due to missing env.
     if std::env::var("WHISPER_CUBLAS").is_err() {
