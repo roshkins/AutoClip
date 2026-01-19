@@ -193,12 +193,19 @@ pub struct ClipLayoutHints {
     pub face_region: Option<NormalizedRect>,
     pub face_frame_spec: Option<FaceFrameSpec>,
     pub game_center: Option<NormalizedPoint>,
+    pub game_region: Option<NormalizedRect>,
 }
 
 #[derive(Clone, Debug)]
 pub enum FilterGraph {
     Vf(String),
     Complex { graph: String, output: String },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StackedLayoutDims {
+    pub face_h: u32,
+    pub game_h: u32,
 }
 
 const DEFAULT_FACE_RATIO: f32 = 0.40;
@@ -268,6 +275,7 @@ pub fn read_clip_layout_hints() -> ClipLayoutHints {
     let face_box = env::var("CLIP_FACE_BOX").ok().and_then(|v| parse_rect(&v));
     let face_region = env::var("CLIP_FACE_REGION").ok().and_then(|v| parse_rect(&v));
     let game_center = env::var("CLIP_GAME_CENTER").ok().and_then(|v| parse_point(&v));
+    let game_region = env::var("CLIP_GAME_REGION").ok().and_then(|v| parse_rect(&v));
 
     ClipLayoutHints {
         face_box,
@@ -275,6 +283,7 @@ pub fn read_clip_layout_hints() -> ClipLayoutHints {
         face_region,
         face_frame_spec: None,
         game_center,
+        game_region,
     }
 }
 
@@ -295,6 +304,36 @@ pub fn resolve_layout_heights(out_h: u32, face_ratio: f32) -> (u32, u32) {
         face_h = out_h.saturating_sub(game_h);
     }
     (face_h.max(2), game_h.max(2))
+}
+
+pub fn resolve_stacked_layout_dims(
+    out_w: u32,
+    out_h: u32,
+    layout: &ClipLayoutConfig,
+    hints: &ClipLayoutHints,
+) -> StackedLayoutDims {
+    let base_face_h = resolve_layout_heights(out_h, layout.face_ratio).0;
+    let base_aspect = out_w as f32 / base_face_h as f32;
+    let face_rect = face_crop_rect(layout, hints, base_aspect);
+    let tracked_max = tracked_face_max_rect(layout, hints, base_aspect);
+    let force_half = layout.face_context_scale > FORCE_HALF_FACE_CONTEXT
+        && (tracked_max.is_some() || face_rect.is_some());
+    let mut face_ratio = if hints.face_frame_spec.is_some() {
+        layout.face_ratio
+    } else {
+        tracked_max
+            .and_then(|rect| face_ratio_from_rect(rect, out_w, out_h))
+            .or_else(|| face_rect.and_then(|rect| face_ratio_from_rect(rect, out_w, out_h)))
+            .unwrap_or(layout.face_ratio)
+    };
+    if force_half {
+        face_ratio = MIDSHOT_FACE_RATIO;
+    }
+    let (face_h, game_h) = resolve_layout_heights(out_h, face_ratio);
+    StackedLayoutDims {
+        face_h,
+        game_h,
+    }
 }
 
 fn default_face_crop_expr(anchor: FaceAnchor) -> String {
@@ -373,24 +412,9 @@ pub fn build_stacked_filter_graph(
     layout: &ClipLayoutConfig,
     hints: &ClipLayoutHints,
 ) -> FilterGraph {
-    let base_face_h = resolve_layout_heights(out_h, layout.face_ratio).0;
-    let base_aspect = out_w as f32 / base_face_h as f32;
-    let face_rect = face_crop_rect(layout, hints, base_aspect);
-    let tracked_max = tracked_face_max_rect(layout, hints, base_aspect);
-    let force_half = layout.face_context_scale > FORCE_HALF_FACE_CONTEXT
-        && (tracked_max.is_some() || face_rect.is_some());
-    let mut face_ratio = if hints.face_frame_spec.is_some() {
-        layout.face_ratio
-    } else {
-        tracked_max
-            .and_then(|rect| face_ratio_from_rect(rect, out_w, out_h))
-            .or_else(|| face_rect.and_then(|rect| face_ratio_from_rect(rect, out_w, out_h)))
-            .unwrap_or(layout.face_ratio)
-    };
-    if force_half {
-        face_ratio = MIDSHOT_FACE_RATIO;
-    }
-    let (face_h, game_h) = resolve_layout_heights(out_h, face_ratio);
+    let dims = resolve_stacked_layout_dims(out_w, out_h, layout, hints);
+    let face_h = dims.face_h;
+    let game_h = dims.game_h;
     let target_aspect = out_w as f32 / face_h as f32;
     let face_rect = face_crop_rect(layout, hints, target_aspect);
     let face_rect = face_rect.map(|rect| expand_rect_width_to_aspect(rect, target_aspect));
@@ -982,6 +1006,7 @@ mod tests {
             face_region: None,
             face_frame_spec: None,
             game_center: Some(NormalizedPoint { x: 0.5, y: 0.6 }),
+            game_region: None,
         };
         let FilterGraph::Complex { graph, output } =
             build_stacked_filter_graph(1080, 1920, &layout, &hints)

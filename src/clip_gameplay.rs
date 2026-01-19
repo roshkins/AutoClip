@@ -10,9 +10,9 @@ use crate::profile::profile_span;
 
 const DEFAULT_MODEL_DIR: &str = "models/clip-vit-base-patch32-xenova";
 const FALLBACK_MODEL_DIR: &str = "models/clip-vit-base-patch32";
-const DEFAULT_STRIDE: u32 = 112;
-const DEFAULT_TOP_K: usize = 6;
-const DEFAULT_SCORE_MIN: f32 = 0.12;
+const DEFAULT_STRIDE: u32 = 80;
+const DEFAULT_TOP_K: usize = 12;
+const DEFAULT_SCORE_MIN: f32 = 0.08;
 const PATCH_SIZE: usize = 224;
 const SEQ_LEN: usize = 77;
 

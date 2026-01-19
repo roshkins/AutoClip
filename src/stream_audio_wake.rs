@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::ffi::CStr;
 use std::io::{ErrorKind, Read};
 use std::os::raw::{c_char, c_int, c_void};
@@ -13,6 +14,7 @@ use anyhow::{Context, Result};
 use url::Url;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+use crate::gpu;
 use crate::profile::profile_span;
 
 const SAMPLE_RATE: usize = 16_000;
@@ -20,6 +22,8 @@ const CHUNK_MS: usize = 500; // read cadence for responsiveness
 const WINDOW_MS: usize = 6_000; // transcription window length (shorter to cut through noise)
 const STEP_MS: usize = 1_000; // inference cadence
 const DEFAULT_RT_TARGET: f32 = 0.9;
+const DEFAULT_EMOTION_WORDS: &str =
+    "omg,oh my god,wow,no way,lets go,holy,insane,unbelievable,wtf";
 
 const NO_DETECT: u64 = u64::MAX;
 const GGML_LOG_LEVEL_DEBUG: c_int = 5;
@@ -28,11 +32,129 @@ static WHISPER_LOG_ONCE: Once = Once::new();
 static WHISPER_LOG_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
-struct WordTiming {
-    text: String,
-    norm: String,
-    t0: f32,
-    t1: f32,
+struct EmotionConfig {
+    audio_enabled: bool,
+    threshold: f32,
+    audio_rms: f32,
+    audio_peak: f32,
+    audio_weight: f32,
+    text_weight: f32,
+    refractory: Duration,
+    phrases: Vec<WakePhrase>,
+    debug: bool,
+}
+
+impl EmotionConfig {
+    fn from_env() -> Option<Self> {
+        let enabled = env::var("CLIP_EMOTION_ENABLE")
+            .ok()
+            .and_then(|v| parse_bool_env(&v))
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let audio_enabled = env::var("CLIP_EMOTION_AUDIO")
+            .ok()
+            .and_then(|v| parse_bool_env(&v))
+            .unwrap_or(true);
+        let threshold = env::var("CLIP_EMOTION_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.5);
+        let audio_rms = env::var("CLIP_EMOTION_AUDIO_RMS")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.08);
+        let audio_peak = env::var("CLIP_EMOTION_AUDIO_PEAK")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.35);
+        let audio_weight = env::var("CLIP_EMOTION_AUDIO_WEIGHT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        let text_weight = env::var("CLIP_EMOTION_TEXT_WEIGHT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        let refractory = env::var("CLIP_EMOTION_REFRACTORY_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(8));
+        let debug = env::var("CLIP_EMOTION_DEBUG")
+            .ok()
+            .and_then(|v| parse_bool_env(&v))
+            .unwrap_or(false);
+        let raw_words = env::var("CLIP_EMOTION_WORDS")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_EMOTION_WORDS.to_string());
+        let phrases = build_wake_phrases(&split_emotion_phrases(&raw_words));
+
+        Some(Self {
+            audio_enabled,
+            threshold,
+            audio_rms,
+            audio_peak,
+            audio_weight,
+            text_weight,
+            refractory,
+            phrases,
+            debug,
+        })
+    }
+
+    fn text_enabled(&self) -> bool {
+        !self.phrases.is_empty()
+    }
+}
+
+fn parse_bool_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn split_emotion_phrases(raw: &str) -> Vec<String> {
+    raw.split(|c| matches!(c, ',' | '|' | ';' | '\n' | '\r'))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn audio_stats(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sum_sq = 0.0f32;
+    let mut peak = 0.0f32;
+    for &s in samples {
+        let v = s.abs();
+        sum_sq += v * v;
+        if v > peak {
+            peak = v;
+        }
+    }
+    let rms = (sum_sq / samples.len() as f32).sqrt();
+    (rms, peak)
+}
+
+#[derive(Clone, Debug)]
+pub struct WordTiming {
+    pub text: String,
+    pub norm: String,
+    pub t0: f32,
+    pub t1: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct TranscriptPayload {
+    pub text: String,
+    pub words: Vec<WordTiming>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,16 +174,24 @@ struct WakePhrase {
 
 struct WhisperHandle {
     model_path: PathBuf,
-    ctx: &'static WhisperContext,
     state: whisper_rs::WhisperState,
     use_gpu: bool,
+    cpu_ctx: Option<&'static WhisperContext>,
+    cpu_state: Option<whisper_rs::WhisperState>,
 }
 
 impl WhisperHandle {
     fn new(model_path: &Path) -> Result<Self> {
+        Self::new_with_gpu(model_path, whisper_prefers_gpu())
+    }
+
+    fn new_with_gpu(model_path: &Path, prefer_gpu: bool) -> Result<Self> {
         install_whisper_log_filter();
         let model_path = model_path.to_path_buf();
-        let prefer_gpu = whisper_prefers_gpu();
+        let mut prefer_gpu = prefer_gpu;
+        if prefer_gpu && !whisper_gpu_allowed("whisper") {
+            prefer_gpu = false;
+        }
         let (ctx, use_gpu) = create_whisper_context(&model_path, prefer_gpu)
             .or_else(|err| {
                 if prefer_gpu {
@@ -76,31 +206,66 @@ impl WhisperHandle {
         eprintln!("whisper: state created (use_gpu={use_gpu})");
         Ok(Self {
             model_path,
-            ctx,
             state,
             use_gpu,
+            cpu_ctx: None,
+            cpu_state: None,
         })
     }
 
-    fn transcribe_with_fallback(
+    fn ensure_cpu_state(&mut self) -> Result<&mut whisper_rs::WhisperState> {
+        if self.cpu_state.is_none() {
+            let (ctx, _) = create_whisper_context(&self.model_path, false)?;
+            eprintln!("whisper: creating CPU state for fallback");
+            let state = ctx.create_state().context("creating whisper CPU state")?;
+            self.cpu_ctx = Some(ctx);
+            self.cpu_state = Some(state);
+        }
+        Ok(self
+            .cpu_state
+            .as_mut()
+            .expect("cpu state set when needed"))
+    }
+
+    fn transcribe_with_mode(
         &mut self,
         audio: &[f32],
+        single_segment: bool,
     ) -> Result<Option<TranscriptWindow>> {
-        match transcribe_window(&mut self.state, audio) {
-            Ok(out) => Ok(out),
-            Err(err) if self.use_gpu => {
-                eprintln!("whisper GPU path failed during inference: {err:#}; retrying on CPU");
-                let (ctx, _) = create_whisper_context(&self.model_path, false)?;
-                eprintln!("whisper: creating CPU state after GPU failure");
-                let state = ctx.create_state().context("creating whisper state")?;
-                eprintln!("whisper: CPU state created after GPU failure");
-                self.ctx = ctx;
-                self.state = state;
-                self.use_gpu = false;
-                transcribe_window(&mut self.state, audio)
+        if self.use_gpu {
+            if !whisper_gpu_allowed("whisper") {
+                let state = self.ensure_cpu_state()?;
+                return transcribe_audio(state, audio, single_segment);
             }
-            Err(err) => Err(err),
+            let _lease = match gpu::try_acquire_gpu_lease("whisper") {
+                Some(lease) => lease,
+                None => {
+                    let state = self.ensure_cpu_state()?;
+                    return transcribe_audio(state, audio, single_segment);
+                }
+            };
+            match transcribe_audio(&mut self.state, audio, single_segment) {
+                Ok(out) => return Ok(out),
+                Err(err) => {
+                    eprintln!(
+                        "whisper GPU path failed during inference: {err:#}; retrying on CPU"
+                    );
+                    self.use_gpu = false;
+                    let state = self.ensure_cpu_state()?;
+                    return transcribe_audio(state, audio, single_segment);
+                }
+            }
         }
+        let state = self.ensure_cpu_state()?;
+        transcribe_audio(state, audio, single_segment)
+    }
+
+    fn transcribe_with_fallback(&mut self, audio: &[f32]) -> Result<Option<TranscriptWindow>> {
+        self.transcribe_with_mode(audio, true)
+    }
+
+    fn transcribe_full_with_fallback(&mut self, audio: &[f32]) -> Result<Option<TranscriptWindow>> {
+        self.transcribe_with_mode(audio, false)
     }
 }
 
@@ -146,6 +311,34 @@ fn whisper_prefers_gpu() -> bool {
     }
 }
 
+fn whisper_clip_prefers_gpu() -> bool {
+    let prefer = match env::var("WHISPER_CLIP_GPU") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            !(trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("0")
+                || trimmed.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    };
+    if !prefer {
+        return false;
+    }
+    whisper_gpu_allowed("whisper clip")
+}
+
+fn whisper_min_free_vram_mb() -> u64 {
+    env::var("WHISPER_MIN_FREE_VRAM_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2048)
+}
+
+fn whisper_gpu_allowed(label: &str) -> bool {
+    let min_free = whisper_min_free_vram_mb();
+    gpu::gpu_vram_allows(min_free, None, label)
+}
+
 fn create_whisper_context(
     model_path: &Path,
     use_gpu: bool,
@@ -178,6 +371,7 @@ fn run_wake_loop_with_spawn<Spawn>(
     _start_instant: Instant,
     detect_ns: Arc<AtomicU64>,
     audio_ns: Arc<AtomicU64>,
+    last_word_ns: Arc<AtomicU64>,
 ) -> Result<()>
 where
     Spawn: FnMut() -> Result<(Child, Box<dyn Read + Send>)> + Send + 'static,
@@ -187,6 +381,10 @@ where
     }
     let mut whisper = WhisperHandle::new(model_path)?;
     log_whisper_backend();
+    let emotion_cfg = EmotionConfig::from_env();
+    let mut emotion_last_fire: Option<Instant> = None;
+    let mut rms_ema: Option<f32> = None;
+    let mut peak_ema: Option<f32> = None;
 
     let chunk_samples = SAMPLE_RATE * CHUNK_MS / 1000;
     let chunk_bytes = chunk_samples * 2; // s16le
@@ -263,6 +461,104 @@ where
                             "stream word: {:.2}-{:.2} {}",
                             word.t0, word.t1, word.text
                         );
+                    }
+                }
+                if !window.words.is_empty() || !norm.is_empty() {
+                    let word_secs = window
+                        .words
+                        .last()
+                        .map(|w| w.t1.max(w.t0))
+                        .unwrap_or_else(|| window.seg_t1.max(window.seg_t0));
+                    let abs_secs = (window_start_secs + word_secs).max(0.0);
+                    let nanos_f = (abs_secs as f64 * 1_000_000_000.0).round();
+                    let nanos = nanos_f
+                        .max(0.0)
+                        .min((NO_DETECT - 1) as f64) as u64;
+                    last_word_ns.store(nanos, Ordering::Relaxed);
+                }
+                if let Some(cfg) = emotion_cfg.as_ref() {
+                    let (rms, peak) = audio_stats(&pcm);
+                    rms_ema = Some(match rms_ema {
+                        Some(prev) => prev * 0.9 + rms * 0.1,
+                        None => rms,
+                    });
+                    peak_ema = Some(match peak_ema {
+                        Some(prev) => prev * 0.9 + peak * 0.1,
+                        None => peak,
+                    });
+
+                    let mut text_score = 0.0f32;
+                    let mut emotion_start_secs = None;
+                    if cfg.text_enabled() {
+                        if !window.words.is_empty() {
+                            if let Some((idx, _phrase)) =
+                                match_wake_words(&window.words, &cfg.phrases)
+                            {
+                                text_score = 1.0;
+                                emotion_start_secs = Some(window.words[idx].t0.max(0.0));
+                            }
+                        }
+                        if text_score == 0.0 && !norm.is_empty() {
+                            if let Some((_pos, _phrase)) =
+                                match_wake_text(&norm, &cfg.phrases)
+                            {
+                                text_score = 1.0;
+                                emotion_start_secs = Some(window.seg_t0.max(0.0));
+                            }
+                        }
+                    }
+
+                    let mut audio_score = 0.0f32;
+                    if cfg.audio_enabled {
+                        if rms >= cfg.audio_rms && cfg.audio_rms > 0.0 {
+                            audio_score += (rms / cfg.audio_rms).min(2.0);
+                        }
+                        if peak >= cfg.audio_peak && cfg.audio_peak > 0.0 {
+                            audio_score += (peak / cfg.audio_peak).min(2.0);
+                        }
+                        if let Some(base) = rms_ema {
+                            if base > 0.0 && rms > base * 1.8 {
+                                audio_score += 0.5;
+                            }
+                        }
+                    }
+
+                    let score = cfg.audio_weight * audio_score + cfg.text_weight * text_score;
+                    if cfg.debug {
+                        eprintln!(
+                            "emotion audio: rms={:.3} peak={:.3} text_score={:.2} audio_score={:.2} total={:.2}",
+                            rms,
+                            peak,
+                            text_score,
+                            audio_score,
+                            score
+                        );
+                    }
+                    let now = Instant::now();
+                    let ready = emotion_last_fire
+                        .map(|t| now.duration_since(t) >= cfg.refractory)
+                        .unwrap_or(true);
+                    if ready && score >= cfg.threshold && !fired.load(Ordering::Relaxed) {
+                        emotion_last_fire = Some(now);
+                        let base_secs = emotion_start_secs.unwrap_or(window.seg_t0.max(0.0));
+                        let abs_t0_secs = (window_start_secs + base_secs).max(0.0);
+                        let nanos_f = (abs_t0_secs as f64 * 1_000_000_000.0).round();
+                        let nanos = nanos_f
+                            .max(0.0)
+                            .min((NO_DETECT - 1) as f64) as u64;
+                        let _ = detect_ns.compare_exchange(
+                            NO_DETECT,
+                            nanos,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                        let already = fired.swap(true, Ordering::Relaxed);
+                        if !already {
+                            eprintln!(
+                                "emotion trigger via audio: score={:.2} (rms={:.2}, peak={:.2})",
+                                score, rms, peak
+                            );
+                        }
                     }
                 }
                 let mut phrase_start_secs = None;
@@ -433,6 +729,7 @@ pub fn start_stream_wake_from_hls(
     start_instant: Instant,
     detect_ns: Arc<AtomicU64>,
     audio_ns: Arc<AtomicU64>,
+    last_word_ns: Arc<AtomicU64>,
 ) -> Result<()> {
     let media_url = media_url.clone();
     let model_path = model_path.to_path_buf();
@@ -459,11 +756,54 @@ pub fn start_stream_wake_from_hls(
             start_instant,
             detect_ns,
             audio_ns,
+            last_word_ns,
         ) {
             eprintln!("stream wake loop error: {err:#}");
         }
     });
     Ok(())
+}
+
+pub fn run_wake_worker_stream(
+    media_url_path: &Path,
+    model_path: &Path,
+    wake_phrases: &[String],
+    log_raw: bool,
+    stop: Arc<AtomicBool>,
+    fired: Arc<AtomicBool>,
+    start_instant: Instant,
+    detect_ns: Arc<AtomicU64>,
+    audio_ns: Arc<AtomicU64>,
+    last_word_ns: Arc<AtomicU64>,
+) -> Result<()> {
+    let path = media_url_path.to_path_buf();
+    let model_path = model_path.to_path_buf();
+    let wake_phrases = build_wake_phrases(wake_phrases);
+    if wake_phrases.is_empty() {
+        anyhow::bail!("no wake phrases provided");
+    }
+    run_wake_loop_with_spawn(
+        move || {
+            let url_raw = fs::read_to_string(&path)
+                .with_context(|| format!("reading media url file {}", path.display()))?;
+            let url_line = url_raw
+                .lines()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("media url file is empty"))?;
+            let url = Url::parse(url_line).context("parsing media url")?;
+            spawn_ffmpeg_pcm(&url)
+        },
+        &model_path,
+        wake_phrases,
+        log_raw,
+        stop,
+        fired,
+        start_instant,
+        detect_ns,
+        audio_ns,
+        last_word_ns,
+    )
 }
 
 /// Detect the wake phrase inside a local media file (TS/MP4/etc) and return its timestamp (seconds).
@@ -497,6 +837,7 @@ pub fn start_mic_wake_with_ffmpeg(
     start_instant: Instant,
     detect_ns: Arc<AtomicU64>,
     audio_ns: Arc<AtomicU64>,
+    last_word_ns: Arc<AtomicU64>,
 ) -> Result<()> {
     let mic = mic_device.map(|s| s.to_string());
     let model_path = model_path.to_path_buf();
@@ -515,6 +856,7 @@ pub fn start_mic_wake_with_ffmpeg(
             start_instant,
             detect_ns,
             audio_ns,
+            last_word_ns,
         ) {
             eprintln!("mic wake loop error: {err:#}");
         }
@@ -522,9 +864,42 @@ pub fn start_mic_wake_with_ffmpeg(
     Ok(())
 }
 
-fn transcribe_window(
+pub fn run_wake_worker_mic(
+    mic_device: Option<&str>,
+    model_path: &Path,
+    wake_phrases: &[String],
+    log_raw: bool,
+    stop: Arc<AtomicBool>,
+    fired: Arc<AtomicBool>,
+    start_instant: Instant,
+    detect_ns: Arc<AtomicU64>,
+    audio_ns: Arc<AtomicU64>,
+    last_word_ns: Arc<AtomicU64>,
+) -> Result<()> {
+    let mic = mic_device.map(|s| s.to_string());
+    let model_path = model_path.to_path_buf();
+    let wake_phrases = build_wake_phrases(wake_phrases);
+    if wake_phrases.is_empty() {
+        anyhow::bail!("no wake phrases provided");
+    }
+    run_wake_loop_with_spawn(
+        move || spawn_ffmpeg_pcm_mic(mic.as_deref()),
+        &model_path,
+        wake_phrases,
+        log_raw,
+        stop,
+        fired,
+        start_instant,
+        detect_ns,
+        audio_ns,
+        last_word_ns,
+    )
+}
+
+fn transcribe_audio(
     state: &mut whisper_rs::WhisperState,
     audio: &[f32],
+    single_segment: bool,
 ) -> Result<Option<TranscriptWindow>> {
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
     params.set_print_progress(false);
@@ -534,7 +909,7 @@ fn transcribe_window(
     params.set_no_timestamps(false);
     params.set_token_timestamps(true);
     params.set_split_on_word(true);
-    params.set_single_segment(true);
+    params.set_single_segment(single_segment);
     params.set_language(Some("en"));
     params.set_no_speech_thold(0.6);
 
@@ -606,6 +981,75 @@ fn transcribe_window(
         seg_t1,
         words,
     }))
+}
+
+#[allow(dead_code)]
+pub fn transcribe_words_from_input(
+    input: &str,
+    start_offset_secs: Option<f32>,
+    duration_secs: Option<f32>,
+    force_ts_input: bool,
+) -> Result<Vec<WordTiming>> {
+    Ok(
+        transcribe_clip_audio(input, start_offset_secs, duration_secs, force_ts_input)?
+            .words,
+    )
+}
+
+pub fn transcribe_clip_audio(
+    input: &str,
+    start_offset_secs: Option<f32>,
+    duration_secs: Option<f32>,
+    force_ts_input: bool,
+) -> Result<TranscriptPayload> {
+    let duration = match duration_secs {
+        Some(d) if d.is_finite() && d > 0.0 => Some(d),
+        _ => None,
+    };
+    if duration.is_none() {
+        anyhow::bail!("captions require a finite clip duration");
+    }
+
+    let model_path = select_best_model_path();
+    let mut whisper = WhisperHandle::new_with_gpu(&model_path, whisper_clip_prefers_gpu())?;
+    log_whisper_backend();
+
+    let (mut ffmpeg, mut pcm_reader) =
+        spawn_ffmpeg_pcm_input(input, start_offset_secs, duration, force_ts_input)?;
+    let audio = read_pcm_f32(&mut *pcm_reader)?;
+    let _ = ffmpeg.kill();
+
+    if audio.is_empty() {
+        return Ok(TranscriptPayload {
+            text: String::new(),
+            words: Vec::new(),
+        });
+    }
+
+    let window = whisper.transcribe_full_with_fallback(&audio)?;
+    if let Some(window) = window {
+        let text = if !window.text.trim().is_empty() {
+            window.text.trim().to_string()
+        } else {
+            window
+                .words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string()
+        };
+        return Ok(TranscriptPayload {
+            text,
+            words: window.words,
+        });
+    }
+
+    Ok(TranscriptPayload {
+        text: String::new(),
+        words: Vec::new(),
+    })
 }
 
 fn run_wake_loop_file(
@@ -846,6 +1290,55 @@ fn spawn_ffmpeg_pcm_mic(device: Option<&str>) -> Result<(Child, Box<dyn Read + S
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no mic candidates succeeded; set MIC_DEVICE to a valid input")))
 }
 
+fn spawn_ffmpeg_pcm_input(
+    input: &str,
+    start_offset_secs: Option<f32>,
+    duration_secs: Option<f32>,
+    force_ts_input: bool,
+) -> Result<(Child, Box<dyn Read + Send>)> {
+    let mut cmd = Command::new(ffmpeg_bin());
+    cmd.arg("-nostdin");
+
+    let is_url = Url::parse(input).is_ok();
+    if is_url {
+        for arg in ffmpeg_hwaccel_flags() {
+            cmd.arg(arg);
+        }
+    } else if force_ts_input {
+        cmd.arg("-f").arg("mpegts");
+    }
+
+    cmd.arg("-i").arg(input);
+    if let Some(ss) = start_offset_secs.filter(|v| v.is_finite() && *v > 0.0) {
+        cmd.arg("-ss").arg(format!("{ss:.3}"));
+    }
+    if let Some(d) = duration_secs.filter(|v| v.is_finite() && *v > 0.0) {
+        cmd.arg("-t").arg(format!("{d:.3}"));
+    }
+    cmd.args(wake_af_flags())
+        .arg("-vn")
+        .arg("-f")
+        .arg("s16le")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg(format!("{}", SAMPLE_RATE))
+        .arg("-")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(ffmpeg_spawn_err)
+        .context("spawning ffmpeg for caption audio")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("ffmpeg stdout missing"))?;
+    Ok((child, Box::new(stdout)))
+}
+
 fn ffmpeg_bin() -> String {
     std::env::var("FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string())
 }
@@ -940,6 +1433,17 @@ fn read_exact_i16(reader: &mut dyn Read, buf: &mut [i16], expected_bytes: usize)
         *out = i16::from_le_bytes([chunk[0], chunk[1]]);
     }
     Ok(())
+}
+
+fn read_pcm_f32(reader: &mut dyn Read) -> Result<Vec<f32>> {
+    let mut raw = Vec::new();
+    reader.read_to_end(&mut raw)?;
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    for chunk in raw.chunks_exact(2) {
+        let val = i16::from_le_bytes([chunk[0], chunk[1]]);
+        out.push(val as f32 / 32768.0);
+    }
+    Ok(out)
 }
 
 fn normalize(s: &str) -> String {
@@ -1066,5 +1570,19 @@ mod tests {
     #[test]
     fn normalize_drops_special() {
         assert_eq!(normalize("**ORANGE**"), "orange");
+    }
+
+    #[test]
+    fn audio_stats_reports_rms_and_peak() {
+        let samples = vec![0.0, 0.5, -0.5, 1.0, -1.0];
+        let (rms, peak) = audio_stats(&samples);
+        assert!((peak - 1.0).abs() < 1e-6);
+        assert!(rms > 0.6 && rms < 0.8);
+    }
+
+    #[test]
+    fn split_emotion_phrases_handles_commas() {
+        let phrases = split_emotion_phrases("wow, oh my god | wtf");
+        assert_eq!(phrases, vec!["wow", "oh my god", "wtf"]);
     }
 }

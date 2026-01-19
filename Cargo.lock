@@ -61,6 +61,7 @@ dependencies = [
  "m3u8-rs",
  "ort",
  "reqwest",
+ "serde",
  "serde_json",
  "tokenizers",
  "tokio",

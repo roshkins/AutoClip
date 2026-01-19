@@ -1,10 +1,14 @@
 use anyhow::{Context, Result};
 use std::cmp::{max, min};
 use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
+use serde::{Deserialize, Serialize};
 use tract_onnx::prelude::*;
 use tract_onnx::tract_hir::infer::Factoid;
 use tract_onnx::tract_hir::internal::DimLike;
@@ -18,7 +22,11 @@ use crate::loading::LoadingTicker;
 use crate::profile::profile_span;
 
 #[cfg(feature = "ort")]
+use crate::gpu;
+#[cfg(feature = "ort")]
 use ort::ep;
+#[cfg(feature = "ort")]
+use ort::init_from;
 #[cfg(feature = "ort")]
 use ort::session::Session;
 #[cfg(feature = "ort")]
@@ -77,12 +85,21 @@ const FACE_LANDMARK_EYE_NOSE_MIN: f32 = 0.05;
 const FACE_LANDMARK_NOSE_MOUTH_MIN: f32 = 0.06;
 const FACE_SCAN_REGION_SIZES: [f32; 3] = [0.7, 0.5, 0.35];
 const FACE_REGION_MARGIN: f32 = 0.02;
-const FACE_FRAME_HEAD_TOP_DEFAULT: f32 = -0.18;
-const FACE_FRAME_HEAD_TOP_MIN: f32 = -0.6;
+const FACE_FRAME_HEAD_TOP_DEFAULT: f32 = -0.28;
+const FACE_FRAME_HEAD_TOP_MIN: f32 = -0.8;
 const FACE_FRAME_HEAD_TOP_MAX: f32 = 0.2;
-const FACE_FRAME_EYE_TOP_RATIO: f32 = 0.40;
-const FACE_FRAME_EYE_CHIN_RATIO: f32 = 0.60;
-const FACE_FRAME_SHOULDER_SCALE: f32 = 2.6;
+const FACE_FRAME_EYE_TOP_RATIO: f32 = 0.45;
+const FACE_FRAME_EYE_CHIN_RATIO: f32 = 0.55;
+const FACE_FRAME_SHOULDER_SCALE: f32 = 3.2;
+const POSE_MODEL_MIN_MB_DEFAULT: u64 = 1;
+const POSE_MODEL_MAX_MB_DEFAULT: u64 = 64;
+const POSE_TRACT_OPT_DEFAULT: bool = false;
+const POSE_INPUT_SIZE_DEFAULT: u32 = 256;
+const POSE_INPUT_MAX_DEFAULT: u32 = 512;
+const POSE_LOAD_TIMEOUT_SECS_DEFAULT: u64 = 60;
+
+#[cfg(feature = "ort")]
+static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
 fn read_env_f32(name: &str, default: f32) -> f32 {
     std::env::var(name)
@@ -90,6 +107,26 @@ fn read_env_f32(name: &str, default: f32) -> f32 {
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|v| v.is_finite())
         .unwrap_or(default)
+}
+
+fn read_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn read_env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn pose_load_timeout() -> Duration {
+    let secs = read_env_u64("CLIP_POSE_LOAD_TIMEOUT_SECS", POSE_LOAD_TIMEOUT_SECS_DEFAULT);
+    let secs = if secs == 0 { POSE_LOAD_TIMEOUT_SECS_DEFAULT } else { secs.min(POSE_LOAD_TIMEOUT_SECS_DEFAULT) };
+    Duration::from_secs(secs)
 }
 
 fn face_frame_head_top_default() -> f32 {
@@ -116,6 +153,234 @@ fn face_frame_eye_chin_ratio() -> f32 {
 fn face_frame_shoulder_scale() -> f32 {
     let scale = read_env_f32("CLIP_FACE_FRAME_SHOULDER_SCALE", FACE_FRAME_SHOULDER_SCALE);
     if scale <= 0.0 { FACE_FRAME_SHOULDER_SCALE } else { scale }
+}
+
+fn pose_enabled() -> bool {
+    std::env::var("CLIP_POSE")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(true)
+}
+
+fn pose_debug_enabled() -> bool {
+    std::env::var("CLIP_POSE_DEBUG")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+fn pose_keypoint_min_score() -> f32 {
+    std::env::var("CLIP_POSE_SCORE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.30)
+}
+
+fn pose_input_scale() -> f32 {
+    std::env::var("CLIP_POSE_INPUT_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.003921569)
+}
+
+fn pose_input_size() -> u32 {
+    let size = read_env_u32("CLIP_POSE_INPUT_SIZE", POSE_INPUT_SIZE_DEFAULT);
+    if size == 0 { POSE_INPUT_SIZE_DEFAULT } else { size }
+}
+
+fn pose_input_max() -> u32 {
+    let max = read_env_u32("CLIP_POSE_INPUT_MAX", POSE_INPUT_MAX_DEFAULT);
+    let size = pose_input_size();
+    if max == 0 { size } else { max.max(size) }
+}
+
+#[cfg(feature = "ort")]
+fn ort_dylib_path() -> Option<PathBuf> {
+    let raw = std::env::var("CLIP_ORT_DYLIB")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("ORT_DYLIB_PATH")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })?;
+    let path = PathBuf::from(raw.trim());
+    if path.is_dir() {
+        Some(path.join("onnxruntime.dll"))
+    } else {
+        Some(path)
+    }
+}
+
+#[cfg(feature = "ort")]
+fn ensure_ort_runtime_loaded() -> Result<()> {
+    let result = ORT_INIT.get_or_init(|| {
+        let path = ort_dylib_path().unwrap_or_else(|| PathBuf::from("onnxruntime.dll"));
+        let builder = init_from(&path).map_err(|err| {
+            format!(
+                "failed to load ONNX Runtime dylib from {}: {err}",
+                path.display()
+            )
+        })?;
+        let _committed = builder.commit();
+        Ok(())
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(msg) => Err(anyhow::anyhow!(
+            "{msg} (set CLIP_ORT_DYLIB or update onnxruntime.dll to >=1.23.x)"
+        )),
+    }
+}
+
+enum LoadResult<T> {
+    Ok(T),
+    Timeout,
+    Err(anyhow::Error),
+}
+
+fn run_with_timeout<T, F>(timeout: Duration, f: F) -> LoadResult<T>
+where
+    T: Send + 'static,
+    F: Send + 'static + FnOnce() -> Result<T>,
+{
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(res) => match res {
+            Ok(value) => LoadResult::Ok(value),
+            Err(err) => LoadResult::Err(err),
+        },
+        Err(mpsc::RecvTimeoutError::Timeout) => LoadResult::Timeout,
+        Err(err) => LoadResult::Err(anyhow::anyhow!("pose load thread failed: {err}")),
+    }
+}
+
+fn pose_model_min_mb() -> u64 {
+    read_env_u64("CLIP_POSE_MODEL_MIN_MB", POSE_MODEL_MIN_MB_DEFAULT)
+}
+
+fn pose_model_max_mb() -> u64 {
+    read_env_u64("CLIP_POSE_MODEL_MAX_MB", POSE_MODEL_MAX_MB_DEFAULT)
+}
+
+fn pose_tract_opt_enabled() -> bool {
+    std::env::var("CLIP_POSE_TRACT_OPT")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(POSE_TRACT_OPT_DEFAULT)
+}
+
+fn pose_head_ratio() -> f32 {
+    std::env::var("CLIP_POSE_HEAD_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.60)
+}
+
+fn pose_shoulder_margin() -> f32 {
+    std::env::var("CLIP_POSE_SHOULDER_MARGIN")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.10)
+}
+
+#[cfg(feature = "ort")]
+fn ort_min_free_vram_mb() -> u64 {
+    std::env::var("CLIP_ORT_MIN_FREE_VRAM_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(512)
+}
+
+#[cfg(feature = "ort")]
+fn ort_gpu_mem_limit_mb() -> u64 {
+    read_env_u64("CLIP_ORT_GPU_MEM_LIMIT_MB", 0)
+}
+
+#[cfg(feature = "ort")]
+fn ort_device_id(min_free_mb: u64, label: &str) -> Option<i32> {
+    let raw = std::env::var("CLIP_ORT_DEVICE").unwrap_or_default();
+    let value = raw.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return gpu::pick_best_nvidia_device(min_free_mb, label).map(|v| v as i32);
+    }
+    if value.eq_ignore_ascii_case("cpu") || value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    match value.parse::<i32>() {
+        Ok(idx) => Some(idx),
+        Err(_) => {
+            eprintln!("clip detect: unknown CLIP_ORT_DEVICE={value}; using auto");
+            gpu::pick_best_nvidia_device(min_free_mb, label).map(|v| v as i32)
+        }
+    }
+}
+
+fn pose_model_path() -> Option<String> {
+    if !pose_enabled() {
+        return None;
+    }
+    let path = std::env::var("CLIP_POSE_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "models/pose/movenet_singlepose_thunder.onnx".to_string());
+    let path_ref = Path::new(&path);
+    if !path_ref.exists() {
+        eprintln!("clip detect: pose model missing at {}; skipping pose", path);
+        return None;
+    }
+    if let Ok(meta) = fs::metadata(path_ref) {
+        let bytes = meta.len();
+        let min_bytes = pose_model_min_mb().saturating_mul(1024 * 1024);
+        let max_bytes = pose_model_max_mb().saturating_mul(1024 * 1024);
+        if bytes < min_bytes || (max_bytes > 0 && bytes > max_bytes) {
+            let mb = bytes as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "clip detect: pose model size {:.1} MB out of range [{}, {}]; skipping pose",
+                mb,
+                pose_model_min_mb(),
+                pose_model_max_mb()
+            );
+            return None;
+        }
+    }
+    if let Ok(mut file) = fs::File::open(path_ref) {
+        let mut header = [0u8; 4];
+        if let Ok(read) = file.read(&mut header) {
+            if read >= 1 && header[0] == b'<' {
+                eprintln!("clip detect: pose model looks like text/HTML; skipping pose");
+                return None;
+            }
+            if read >= 2 && header[0] == b'P' && header[1] == b'K' {
+                eprintln!("clip detect: pose model appears to be a zip; skipping pose");
+                return None;
+            }
+        }
+    }
+    Some(path)
+}
+
+fn pose_backend() -> FaceBackend {
+    match std::env::var("CLIP_POSE_BACKEND") {
+        Ok(value) => match parse_face_backend(&value) {
+            Some(backend) => backend,
+            None => {
+                eprintln!(
+                    "clip detect: unknown CLIP_POSE_BACKEND={value}; using auto"
+                );
+                FaceBackend::Auto
+            }
+        },
+        Err(_) => FaceBackend::Auto,
+    }
 }
 
 fn parse_face_backend(value: &str) -> Option<FaceBackend> {
@@ -481,6 +746,7 @@ async fn build_face_sweep_inputs(
                 detector,
                 source_dims,
                 None,
+                None,
                 &mut face_frame_cache,
             )
             .await;
@@ -488,6 +754,7 @@ async fn build_face_sweep_inputs(
                 face_samples.push(FaceSample {
                     time: seek,
                     candidates,
+                    pose: None,
                 });
             }
         }
@@ -607,6 +874,14 @@ pub async fn detect_layout_hints(
             None
         }
     };
+    let face_id_matcher = FaceIdMatcher::from_env();
+    let pose_detector = match PoseDetector::new(config) {
+        Ok(detector) => detector,
+        Err(err) => {
+            eprintln!("clip detect: failed to load pose model: {err:#}");
+            None
+        }
+    };
 
     if gameplay_detection {
         let cfg = read_clip_gameplay_config(config.frame_width, config.frame_height);
@@ -719,14 +994,32 @@ pub async fn detect_layout_hints(
                     detector,
                     source_dims,
                     hints.face_region,
+                    face_id_matcher.as_ref(),
                     &mut face_frame_cache,
                 )
                 .await;
+                let pose = if !candidates.is_empty() {
+                    if let Some(detector) = pose_detector.as_ref() {
+                        detect_pose_observation(
+                            input,
+                            seek_arg,
+                            detector,
+                            source_dims,
+                            &mut face_frame_cache,
+                        )
+                        .await
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 face_samples_attempted += 1;
                 if !candidates.is_empty() {
                     face_samples.push(FaceSample {
                         time: seek,
                         candidates,
+                        pose,
                     });
                 }
             }
@@ -768,6 +1061,16 @@ pub async fn detect_layout_hints(
                     config.face_score_threshold
                 );
             }
+        }
+    }
+    if let (Some(matcher), Some(best)) = (face_id_matcher.as_ref(), face_best) {
+        if matcher.require_motion && best.max_dist < matcher.motion_threshold {
+            eprintln!(
+                "face id: motion {:.4} below {:.4}; ignoring face match",
+                best.max_dist, matcher.motion_threshold
+            );
+            face_best = None;
+            face_observations.clear();
         }
     }
     if gameplay_detection && gameplay_total_samples > 0 {
@@ -833,6 +1136,10 @@ pub async fn detect_layout_hints(
                 if let (Some(detector), Some(labels), Some(cfg)) =
                     (clip_detector.as_ref(), labels, cfg)
                 {
+                    let exclude = hints
+                        .face_region
+                        .or(hints.face_box)
+                        .map(|rect| expand_rect(rect, cam_region_scale()));
                     let gameplay_frame = if cfg.frame_width == config.frame_width
                         && cfg.frame_height == config.frame_height
                     {
@@ -862,7 +1169,7 @@ pub async fn detect_layout_hints(
                         (frame.as_slice(), config.frame_width, config.frame_height)
                     };
 
-                    if let Some(obs) = detector.detect_region(rgb, gw, gh, None, labels) {
+                    if let Some(obs) = detector.detect_region(rgb, gw, gh, exclude, labels) {
                         let weight = obs.score.max(0.0);
                         if weight > 0.0 {
                             gameplay_sum_x += obs.center.x * weight;
@@ -892,7 +1199,7 @@ pub async fn detect_layout_hints(
 
     if let Some(best) = face_best {
         hints.face_box = Some(best.rect);
-        hints.face_frame_spec = Some(best.frame_spec);
+        hints.face_frame_spec = best.frame_spec;
         let region = pick_face_region(best.rect).or_else(|| {
             if best.region.w >= 0.25 && best.region.h >= 0.25 {
                 Some(best.region)
@@ -938,6 +1245,18 @@ pub async fn detect_layout_hints(
             best.time, best.score
         );
     }
+    if emotion_face_enabled() {
+        if let Some(best) = face_best {
+            let motion = best.max_dist;
+            let threshold = emotion_face_motion_threshold();
+            if motion >= threshold || emotion_debug_enabled() {
+                eprintln!(
+                    "clip detect: face emotion motion={:.4} (threshold {:.4})",
+                    motion, threshold
+                );
+            }
+        }
+    }
     if face_debug_enabled() {
         if let Some(rect) = hints.face_box {
             eprintln!(
@@ -955,6 +1274,7 @@ pub async fn detect_layout_hints(
         }
     }
     if let Some(best) = gameplay_best {
+        hints.game_region = Some(best.rect);
         log_gameplay_debug(&format!(
             "clip detect: gameplay pick score={:.4} center x={:.3} y={:.3} region x={:.3} y={:.3} w={:.3} h={:.3}",
             best.score,
@@ -979,6 +1299,89 @@ pub async fn detect_layout_hints(
         });
     }
     Ok(hints)
+}
+
+async fn enroll_face_id_from_input(
+    input: &str,
+    out_path: &Path,
+    seeks: &[f32],
+    strict: bool,
+) -> Result<bool> {
+    let cfg = read_clip_detect_config();
+    let Some(detector) = YunetDetector::new(&cfg)? else {
+        anyhow::bail!("face detector unavailable; cannot enroll");
+    };
+    let face_cfg = face_id_config()
+        .ok_or_else(|| anyhow::anyhow!("face id config disabled"))?;
+    if !face_cfg.model_path.exists() {
+        anyhow::bail!(
+            "face id model not found at {}",
+            face_cfg.model_path.display()
+        );
+    }
+    let model = FaceIdModel::load(&face_cfg.model_path, face_cfg.bgr)?;
+    let mut cache = FaceFrameCache::new(4);
+    let source_dims = probe_media_dimensions(input).await;
+    let full_region = NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    let mut last_err: Option<anyhow::Error> = None;
+    for seek in seeks {
+        let seek_arg = if *seek > 0.0 { Some(*seek) } else { None };
+        let (frame, candidates) = match detect_faces_in_region_with_frame(
+            input,
+            seek_arg,
+            &detector,
+            full_region,
+            source_dims,
+            &mut cache,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                if strict {
+                    return Err(err);
+                }
+                last_err = Some(err);
+                continue;
+            }
+        };
+        let Some(best) = candidates
+            .iter()
+            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+            .copied()
+        else {
+            continue;
+        };
+        let Some(embedding) = model.embed_from_face_frame(&frame, best.model_rect) else {
+            continue;
+        };
+        write_face_id_embedding(out_path, &embedding)?;
+        return Ok(true);
+    }
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+    Ok(false)
+}
+
+pub async fn enroll_face_id_from_image_url(
+    image_url: &str,
+    out_path: &Path,
+) -> Result<bool> {
+    enroll_face_id_from_input(image_url, out_path, &[0.0], true).await
+}
+
+pub async fn enroll_face_id_from_media_url(
+    media_url: &str,
+    out_path: &Path,
+) -> Result<bool> {
+    let seeks = [0.0, 2.0, 5.0];
+    enroll_face_id_from_input(media_url, out_path, &seeks, false).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1154,6 +1557,7 @@ async fn detect_face_candidates(
     detector: &YunetDetector,
     source_dims: Option<(u32, u32)>,
     preferred_region: Option<NormalizedRect>,
+    face_id: Option<&FaceIdMatcher>,
     frame_cache: &mut FaceFrameCache,
 ) -> Vec<FaceCandidate> {
     let regions = build_face_scan_regions();
@@ -1178,6 +1582,7 @@ async fn detect_face_candidates(
                 detector,
                 region,
                 source_dims,
+                face_id,
                 frame_cache,
             )
             .await
@@ -1223,6 +1628,7 @@ async fn detect_face_candidates(
         detector,
         full_region,
         source_dims,
+        face_id,
         frame_cache,
     )
     .await
@@ -1304,6 +1710,7 @@ async fn detect_face_candidates(
             detector,
             source_dims,
             all_candidates,
+            face_id,
             frame_cache,
         )
         .await;
@@ -1330,6 +1737,7 @@ async fn detect_face_candidates(
             detector,
             region,
             source_dims,
+            face_id,
             frame_cache,
         )
         .await
@@ -1359,11 +1767,39 @@ async fn detect_face_candidates(
         detector,
         source_dims,
         all_candidates,
+        face_id,
         frame_cache,
     )
     .await;
     maybe_dump_face_candidates(input, seek, &all_candidates, "faces").await;
     all_candidates
+}
+
+async fn detect_pose_observation(
+    input: &str,
+    seek: Option<f32>,
+    detector: &PoseDetector,
+    source_dims: Option<(u32, u32)>,
+    frame_cache: &mut FaceFrameCache,
+) -> Option<PoseObservation> {
+    let region = NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    let frame = extract_face_frame_rgb_cached(
+        Some(frame_cache),
+        input,
+        seek,
+        detector.input_w,
+        detector.input_h,
+        region,
+        source_dims,
+    )
+    .await
+    .ok()?;
+    detector.detect_pose(&frame)
 }
 
 async fn apply_face_tile_search(
@@ -1372,6 +1808,7 @@ async fn apply_face_tile_search(
     detector: &YunetDetector,
     source_dims: Option<(u32, u32)>,
     mut candidates: Vec<FaceCandidate>,
+    _face_id: Option<&FaceIdMatcher>,
     frame_cache: &mut FaceFrameCache,
 ) -> Vec<FaceCandidate> {
     let Some(tile_config) = face_tile_config() else {
@@ -1523,6 +1960,7 @@ async fn detect_faces_in_region(
     detector: &YunetDetector,
     region: NormalizedRect,
     source_dims: Option<(u32, u32)>,
+    face_id: Option<&FaceIdMatcher>,
     frame_cache: &mut FaceFrameCache,
 ) -> Result<Vec<FaceCandidate>> {
     let frame = extract_face_frame_rgb_cached(
@@ -1535,7 +1973,33 @@ async fn detect_faces_in_region(
         source_dims,
     )
     .await?;
-    Ok(detector.detect_faces(frame.as_ref()))
+    let mut candidates = detector.detect_faces(frame.as_ref());
+    if let Some(face_id) = face_id {
+        candidates = filter_face_id_candidates(face_id, frame.as_ref(), candidates);
+    }
+    Ok(candidates)
+}
+
+async fn detect_faces_in_region_with_frame(
+    input: &str,
+    seek: Option<f32>,
+    detector: &YunetDetector,
+    region: NormalizedRect,
+    source_dims: Option<(u32, u32)>,
+    frame_cache: &mut FaceFrameCache,
+) -> Result<(Arc<FaceFrame>, Vec<FaceCandidate>)> {
+    let frame = extract_face_frame_rgb_cached(
+        Some(frame_cache),
+        input,
+        seek,
+        detector.input_w,
+        detector.input_h,
+        region,
+        source_dims,
+    )
+    .await?;
+    let candidates = detector.detect_faces(frame.as_ref());
+    Ok((frame, candidates))
 }
 
 async fn detect_faces_in_region_raw(
@@ -1643,7 +2107,7 @@ fn select_face_with_relaxation(
                     score: best.score,
                     time: sample.time,
                     region: best.region,
-                    frame_spec: face_frame_spec_for_candidate(&best),
+                    frame_spec: face_frame_spec_for_candidate(&best, sample.pose.as_ref()),
                 });
             }
         }
@@ -1715,7 +2179,7 @@ fn select_best_raw_candidate(
                 score: raw,
                 time: sample.time,
                 region: best.region,
-                frame_spec: face_frame_spec_for_candidate(&best),
+                frame_spec: face_frame_spec_for_candidate(&best, sample.pose.as_ref()),
             });
         }
     }
@@ -2032,6 +2496,364 @@ fn face_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn emotion_face_enabled() -> bool {
+    std::env::var("CLIP_EMOTION_FACE")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+fn emotion_debug_enabled() -> bool {
+    std::env::var("CLIP_EMOTION_DEBUG")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+fn emotion_face_motion_threshold() -> f32 {
+    std::env::var("CLIP_EMOTION_FACE_MOTION")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.035)
+}
+
+#[derive(Clone, Debug)]
+struct FaceIdConfig {
+    model_path: PathBuf,
+    file_path: PathBuf,
+    threshold: f32,
+    require_motion: bool,
+    motion_threshold: f32,
+    bgr: bool,
+    debug: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FaceIdEmbedding {
+    embedding: Vec<f32>,
+}
+
+struct FaceIdModel {
+    model: TypedRunnableModel<TypedModel>,
+    input_w: u32,
+    input_h: u32,
+    layout: ModelLayout,
+    bgr: bool,
+}
+
+struct FaceIdMatcher {
+    model: FaceIdModel,
+    embedding: Vec<f32>,
+    threshold: f32,
+    require_motion: bool,
+    motion_threshold: f32,
+    debug: bool,
+}
+
+fn face_id_enabled() -> bool {
+    std::env::var("CLIP_FACE_ID")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+fn face_id_config() -> Option<FaceIdConfig> {
+    if !face_id_enabled() {
+        return None;
+    }
+    let model_path = std::env::var("CLIP_FACE_ID_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "models/face_id/arcface.onnx".to_string());
+    let file_path = std::env::var("CLIP_FACE_ID_FILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "face_id/stream.json".to_string());
+    let threshold = std::env::var("CLIP_FACE_ID_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.35);
+    let require_motion = std::env::var("CLIP_FACE_ID_REQUIRE_MOTION")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(true);
+    let motion_threshold = std::env::var("CLIP_FACE_ID_MOTION")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.015);
+    let bgr = std::env::var("CLIP_FACE_ID_BGR")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(true);
+    let debug = std::env::var("CLIP_FACE_ID_DEBUG")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false);
+
+    Some(FaceIdConfig {
+        model_path: PathBuf::from(model_path),
+        file_path: PathBuf::from(file_path),
+        threshold,
+        require_motion,
+        motion_threshold,
+        bgr,
+        debug,
+    })
+}
+
+fn load_face_id_embedding(path: &Path) -> Result<Vec<f32>> {
+    let data = std::fs::read_to_string(path)
+        .with_context(|| format!("reading face id embedding {}", path.display()))?;
+    let parsed: FaceIdEmbedding = serde_json::from_str(&data)
+        .context("parsing face id embedding json")?;
+    Ok(normalize_embedding(&parsed.embedding))
+}
+
+fn write_face_id_embedding(path: &Path, embedding: &[f32]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let payload = FaceIdEmbedding {
+        embedding: embedding.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&payload)
+        .context("serializing face id embedding")?;
+    std::fs::write(path, json)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn resolve_face_id_input(model: &InferenceModel) -> Result<(u32, u32, ModelLayout)> {
+    let fact = model.input_fact(0)?.clone();
+    let shape = fact
+        .shape
+        .as_concrete_finite()?
+        .ok_or_else(|| anyhow::anyhow!("face id model input shape is not concrete"))?;
+    if shape.len() != 4 {
+        anyhow::bail!("face id model input must be 4D");
+    }
+    if shape[1] == 3 {
+        let h = shape[2] as u32;
+        let w = shape[3] as u32;
+        Ok((w, h, ModelLayout::Nchw))
+    } else if shape[3] == 3 {
+        let h = shape[1] as u32;
+        let w = shape[2] as u32;
+        Ok((w, h, ModelLayout::Nhwc))
+    } else {
+        anyhow::bail!("face id model input layout is not RGB");
+    }
+}
+
+fn normalize_embedding(embedding: &[f32]) -> Vec<f32> {
+    let mut sum = 0.0f32;
+    for v in embedding {
+        sum += v * v;
+    }
+    let norm = sum.sqrt().max(1e-6);
+    embedding.iter().map(|v| v / norm).collect()
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        sum += x * y;
+    }
+    sum
+}
+
+impl FaceIdModel {
+    fn load(path: &Path, bgr: bool) -> Result<Self> {
+        let model = tract_onnx::onnx()
+            .model_for_path(path)
+            .with_context(|| format!("loading face id model at {}", path.display()))?;
+        let (input_w, input_h, layout) = resolve_face_id_input(&model)?;
+        let input_shape = match layout {
+            ModelLayout::Nchw => tvec!(1, 3, input_h as usize, input_w as usize),
+            ModelLayout::Nhwc => tvec!(1, input_h as usize, input_w as usize, 3),
+        };
+        let model = model
+            .with_input_fact(0, InferenceFact::dt_shape(f32::datum_type(), input_shape))?
+            .into_optimized()?
+            .into_runnable()?;
+        Ok(Self {
+            model,
+            input_w,
+            input_h,
+            layout,
+            bgr,
+        })
+    }
+
+    fn embed_from_face_frame(
+        &self,
+        frame: &FaceFrame,
+        rect: NormalizedRect,
+    ) -> Option<Vec<f32>> {
+        let rect = expand_rect(rect, 1.2);
+        let src_w = frame.width as usize;
+        let src_h = frame.height as usize;
+        if frame.rgb.len() < src_w * src_h * 3 {
+            return None;
+        }
+        let x0 = (rect.x * src_w as f32).floor().clamp(0.0, (src_w - 1) as f32) as usize;
+        let y0 = (rect.y * src_h as f32).floor().clamp(0.0, (src_h - 1) as f32) as usize;
+        let x1 = ((rect.x + rect.w) * src_w as f32)
+            .ceil()
+            .clamp((x0 + 1) as f32, src_w as f32) as usize;
+        let y1 = ((rect.y + rect.h) * src_h as f32)
+            .ceil()
+            .clamp((y0 + 1) as f32, src_h as f32) as usize;
+        let crop_w = x1.saturating_sub(x0).max(1);
+        let crop_h = y1.saturating_sub(y0).max(1);
+
+        let mut input = vec![0.0f32; (self.input_w * self.input_h * 3) as usize];
+        for oy in 0..self.input_h as usize {
+            let fy = if self.input_h > 1 {
+                oy as f32 / (self.input_h - 1) as f32
+            } else {
+                0.0
+            };
+            let sy = y0 as f32 + fy * (crop_h as f32 - 1.0);
+            let sy0 = sy.floor().clamp(0.0, (src_h - 1) as f32) as usize;
+            let sy1 = (sy0 + 1).min(src_h - 1);
+            let wy = sy - sy0 as f32;
+            for ox in 0..self.input_w as usize {
+                let fx = if self.input_w > 1 {
+                    ox as f32 / (self.input_w - 1) as f32
+                } else {
+                    0.0
+                };
+                let sx = x0 as f32 + fx * (crop_w as f32 - 1.0);
+                let sx0 = sx.floor().clamp(0.0, (src_w - 1) as f32) as usize;
+                let sx1 = (sx0 + 1).min(src_w - 1);
+                let wx = sx - sx0 as f32;
+                let idx00 = (sy0 * src_w + sx0) * 3;
+                let idx01 = (sy0 * src_w + sx1) * 3;
+                let idx10 = (sy1 * src_w + sx0) * 3;
+                let idx11 = (sy1 * src_w + sx1) * 3;
+                for c in 0..3 {
+                    let v00 = frame.rgb[idx00 + c] as f32;
+                    let v01 = frame.rgb[idx01 + c] as f32;
+                    let v10 = frame.rgb[idx10 + c] as f32;
+                    let v11 = frame.rgb[idx11 + c] as f32;
+                    let v0 = v00 + (v01 - v00) * wx;
+                    let v1 = v10 + (v11 - v10) * wx;
+                    let v = v0 + (v1 - v0) * wy;
+                    let channel = if self.bgr { 2 - c } else { c };
+                    let out_idx = (oy * self.input_w as usize + ox) * 3 + channel;
+                    input[out_idx] = (v - 127.5) / 128.0;
+                }
+            }
+        }
+
+        let tensor = match self.layout {
+            ModelLayout::Nchw => {
+                let mut chw = vec![0.0f32; (self.input_w * self.input_h * 3) as usize];
+                for y in 0..self.input_h as usize {
+                    for x in 0..self.input_w as usize {
+                        let base = (y * self.input_w as usize + x) * 3;
+                        for c in 0..3 {
+                            let idx = c * (self.input_w * self.input_h) as usize
+                                + y * self.input_w as usize
+                                + x;
+                            chw[idx] = input[base + c];
+                        }
+                    }
+                }
+                Tensor::from_shape(
+                    &[1, 3, self.input_h as usize, self.input_w as usize],
+                    &chw,
+                )
+                .ok()?
+            }
+            ModelLayout::Nhwc => Tensor::from_shape(
+                &[1, self.input_h as usize, self.input_w as usize, 3],
+                &input,
+            )
+            .ok()?,
+        };
+
+        let outputs = self.model.run(tvec!(tensor.into())).ok()?;
+        let output = outputs.get(0)?;
+        let view = output.to_array_view::<f32>().ok()?;
+        let embedding: Vec<f32> = view.iter().copied().collect();
+        Some(normalize_embedding(&embedding))
+    }
+}
+
+impl FaceIdMatcher {
+    fn from_env() -> Option<Self> {
+        let cfg = face_id_config()?;
+        if !cfg.model_path.exists() {
+            eprintln!(
+                "face id: model not found at {}; disabling",
+                cfg.model_path.display()
+            );
+            return None;
+        }
+        if !cfg.file_path.exists() {
+            eprintln!(
+                "face id: embedding not found at {}; disabling",
+                cfg.file_path.display()
+            );
+            return None;
+        }
+        let model = FaceIdModel::load(&cfg.model_path, cfg.bgr).ok()?;
+        let embedding = load_face_id_embedding(&cfg.file_path).ok()?;
+        Some(Self {
+            model,
+            embedding,
+            threshold: cfg.threshold,
+            require_motion: cfg.require_motion,
+            motion_threshold: cfg.motion_threshold,
+            debug: cfg.debug,
+        })
+    }
+
+    fn matches_candidate(&self, frame: &FaceFrame, rect: NormalizedRect) -> Option<f32> {
+        let embed = self.model.embed_from_face_frame(frame, rect)?;
+        Some(cosine_similarity(&embed, &self.embedding))
+    }
+}
+
+fn filter_face_id_candidates(
+    matcher: &FaceIdMatcher,
+    frame: &FaceFrame,
+    candidates: Vec<FaceCandidate>,
+) -> Vec<FaceCandidate> {
+    let mut kept = Vec::new();
+    let mut best_sim: Option<f32> = None;
+    for candidate in candidates {
+        let sim = match matcher.matches_candidate(frame, candidate.model_rect) {
+            Some(v) => v,
+            None => continue,
+        };
+        if matcher.debug {
+            best_sim = Some(best_sim.map(|b| b.max(sim)).unwrap_or(sim));
+        }
+        if sim >= matcher.threshold {
+            kept.push(candidate);
+        }
+    }
+    if matcher.debug {
+        if let Some(sim) = best_sim {
+            eprintln!(
+                "face id: best similarity {:.4} (threshold {:.4})",
+                sim, matcher.threshold
+            );
+        } else {
+            eprintln!("face id: no candidates to score");
+        }
+    }
+    kept
+}
+
 fn face_dump_dir() -> Option<PathBuf> {
     std::env::var("CLIP_FACE_DUMP_DIR")
         .ok()
@@ -2228,6 +3050,13 @@ enum ModelLayout {
     Nhwc,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoseInputSource {
+    Model,
+    Fallback,
+    Clamped,
+}
+
 fn resolve_model_input(
     model: &InferenceModel,
     config: &ClipDetectConfig,
@@ -2272,6 +3101,90 @@ fn resolve_model_input(
         _ => return fallback,
     };
     (input_w, input_h, layout)
+}
+
+fn resolve_pose_input_from_dims(
+    dims: &[Option<usize>],
+    fallback_size: u32,
+    max_side: u32,
+) -> (u32, u32, ModelLayout, PoseInputSource) {
+    let mut layout = ModelLayout::Nchw;
+    let mut source = PoseInputSource::Fallback;
+    let mut input_w = fallback_size;
+    let mut input_h = fallback_size;
+    let mut layout_known = false;
+
+    if dims.len() == 4 {
+        if dims.get(1).and_then(|d| *d) == Some(3) {
+            layout = ModelLayout::Nchw;
+            layout_known = true;
+        } else if dims.get(3).and_then(|d| *d) == Some(3) {
+            layout = ModelLayout::Nhwc;
+            layout_known = true;
+        }
+    }
+
+    if layout_known && dims.len() == 4 {
+        let (input_h_opt, input_w_opt) = match layout {
+            ModelLayout::Nchw => (dims.get(2).and_then(|d| *d), dims.get(3).and_then(|d| *d)),
+            ModelLayout::Nhwc => (dims.get(1).and_then(|d| *d), dims.get(2).and_then(|d| *d)),
+        };
+        if let (Some(input_h_raw), Some(input_w_raw)) = (input_h_opt, input_w_opt) {
+            if let (Ok(input_h_val), Ok(input_w_val)) = (
+                u32::try_from(input_h_raw),
+                u32::try_from(input_w_raw),
+            ) {
+                if input_h_val > 0 && input_w_val > 0 {
+                    input_h = input_h_val;
+                    input_w = input_w_val;
+                    source = PoseInputSource::Model;
+                }
+            }
+        }
+    }
+
+    if input_w > max_side || input_h > max_side {
+        input_w = fallback_size;
+        input_h = fallback_size;
+        source = PoseInputSource::Clamped;
+    }
+
+    (input_w, input_h, layout, source)
+}
+
+#[cfg(feature = "ort")]
+fn resolve_model_input_from_ort(
+    session: &Session,
+    fallback_size: u32,
+    max_side: u32,
+) -> (u32, u32, ModelLayout, PoseInputSource) {
+    let input = match session.inputs().first() {
+        Some(val) => val,
+        None => {
+            return (
+                fallback_size,
+                fallback_size,
+                ModelLayout::Nchw,
+                PoseInputSource::Fallback,
+            );
+        }
+    };
+    let shape = match input.dtype().tensor_shape() {
+        Some(val) => val,
+        None => {
+            return (
+                fallback_size,
+                fallback_size,
+                ModelLayout::Nchw,
+                PoseInputSource::Fallback,
+            );
+        }
+    };
+    let dims: Vec<Option<usize>> = shape
+        .iter()
+        .map(|d| if *d > 0 { usize::try_from(*d).ok() } else { None })
+        .collect();
+    resolve_pose_input_from_dims(&dims, fallback_size, max_side)
 }
 
 enum YunetBackend {
@@ -2326,7 +3239,7 @@ impl YunetDetector {
                 #[cfg(feature = "ort")]
                 {
                     drop(model);
-                    let session = build_ort_session(model_path)?;
+                    let session = build_ort_session(model_path, "face")?;
                     outputs = YunetOutputMap::from_session_outputs(session.outputs());
                     YunetBackend::Ort(std::sync::Mutex::new(session))
                 }
@@ -2340,7 +3253,7 @@ impl YunetDetector {
             FaceBackend::Auto => {
                 #[cfg(feature = "ort")]
                 {
-                    match build_ort_session(model_path) {
+                    match build_ort_session(model_path, "face") {
                         Ok(session) => {
                             outputs = YunetOutputMap::from_session_outputs(session.outputs());
                             drop(model);
@@ -2783,9 +3696,34 @@ impl YunetDetector {
 }
 
 #[cfg(feature = "ort")]
-fn build_ort_session(model_path: &str) -> Result<Session> {
+fn build_ort_session(model_path: &str, label: &str) -> Result<Session> {
+    ensure_ort_runtime_loaded()?;
+    let min_free = ort_min_free_vram_mb();
+    let device = ort_device_id(min_free, label);
+    let allow_gpu = match device {
+        Some(dev) => gpu::gpu_vram_allows(min_free, Some(dev as u32), label),
+        None => false,
+    };
+    let mut providers = Vec::new();
+    if allow_gpu {
+        let mut cuda = ep::CUDA::default()
+            .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
+            .with_conv_max_workspace(false);
+        if let Some(dev) = device {
+            cuda = cuda.with_device_id(dev);
+        }
+        let mem_limit = ort_gpu_mem_limit_mb();
+        if mem_limit > 0 {
+            cuda = cuda.with_memory_limit(mem_limit.saturating_mul(1024 * 1024) as usize);
+        }
+        providers.push(cuda.build());
+        if let Some(dev) = device {
+            eprintln!("clip detect: ORT using CUDA device {dev} for {label}");
+        }
+    }
+    providers.push(ep::CPU::default().build());
     let session = Session::builder()?
-        .with_execution_providers([ep::CUDA::default().build(), ep::CPU::default().build()])?
+        .with_execution_providers(providers)?
         .commit_from_file(model_path)
         .with_context(|| format!("loading ORT session at {model_path}"))?;
     Ok(session)
@@ -2867,6 +3805,356 @@ fn rgb_to_bgr_hwc(rgb: &[u8], width: usize, height: usize) -> Option<Vec<f32>> {
         out[idx] = b;
         out[idx + 1] = g;
         out[idx + 2] = r;
+    }
+    Some(out)
+}
+
+fn rgb_to_rgb_chw_scaled(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    scale: f32,
+) -> Option<Vec<f32>> {
+    let expected = width * height * 3;
+    if rgb.len() < expected {
+        return None;
+    }
+    let scale = if scale.is_finite() { scale } else { 1.0 };
+    let mut out = vec![0f32; expected];
+    let area = width * height;
+    for y in 0..height {
+        for x in 0..width {
+            let idx = (y * width + x) * 3;
+            let r = rgb[idx] as f32 * scale;
+            let g = rgb[idx + 1] as f32 * scale;
+            let b = rgb[idx + 2] as f32 * scale;
+            let offset = y * width + x;
+            out[offset] = r;
+            out[area + offset] = g;
+            out[area * 2 + offset] = b;
+        }
+    }
+    Some(out)
+}
+
+fn rgb_to_rgb_hwc_scaled(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    scale: f32,
+) -> Option<Vec<f32>> {
+    let expected = width * height * 3;
+    if rgb.len() < expected {
+        return None;
+    }
+    let scale = if scale.is_finite() { scale } else { 1.0 };
+    let mut out = vec![0f32; expected];
+    for idx in (0..expected).step_by(3) {
+        out[idx] = rgb[idx] as f32 * scale;
+        out[idx + 1] = rgb[idx + 1] as f32 * scale;
+        out[idx + 2] = rgb[idx + 2] as f32 * scale;
+    }
+    Some(out)
+}
+
+enum PoseBackend {
+    Tract(TypedRunnableModel<TypedModel>),
+    #[cfg(feature = "ort")]
+    Ort(std::sync::Mutex<Session>),
+}
+
+struct PoseDetector {
+    backend: PoseBackend,
+    input_w: u32,
+    input_h: u32,
+    layout: ModelLayout,
+    input_scale: f32,
+}
+
+impl PoseDetector {
+    fn new(_config: &ClipDetectConfig) -> Result<Option<Self>> {
+        let Some(model_path) = pose_model_path() else {
+            return Ok(None);
+        };
+        let pose_start = Instant::now();
+        let pose_timeout = pose_load_timeout();
+        let pose_deadline = pose_start + pose_timeout;
+        let pose_tick =
+            LoadingTicker::start("clip detect: loading pose model", Duration::from_secs(5));
+        let backend_choice = pose_backend();
+        let timeout_secs = pose_timeout.as_secs_f32();
+
+        #[cfg(feature = "ort")]
+        if matches!(backend_choice, FaceBackend::Ort | FaceBackend::Auto) {
+            let Some(remaining) = pose_deadline.checked_duration_since(Instant::now()) else {
+                drop(pose_tick);
+                eprintln!(
+                    "clip detect: pose model load timed out after {:.1}s; skipping pose",
+                    timeout_secs
+                );
+                return Ok(None);
+            };
+            let model_path_clone = model_path.clone();
+            let fallback_size = pose_input_size();
+            let max_side = pose_input_max();
+            let ort_result = run_with_timeout(remaining, move || {
+                let session = build_ort_session(&model_path_clone, "pose")?;
+                let (input_w, input_h, layout, source) =
+                    resolve_model_input_from_ort(&session, fallback_size, max_side);
+                Ok((session, input_w, input_h, layout, source))
+            });
+            match ort_result {
+                LoadResult::Ok((session, input_w, input_h, layout, source)) => {
+                    drop(pose_tick);
+                    eprintln!(
+                        "clip detect: pose model loaded in {:.1}s",
+                        pose_start.elapsed().as_secs_f32()
+                    );
+                    if matches!(source, PoseInputSource::Fallback) {
+                        eprintln!(
+                            "clip detect: pose input unresolved; using {}x{}",
+                            input_w, input_h
+                        );
+                    } else if matches!(source, PoseInputSource::Clamped) {
+                        eprintln!(
+                            "clip detect: pose input exceeds max {}; using {}x{}",
+                            max_side, input_w, input_h
+                        );
+                    }
+                    eprintln!("clip detect: pose backend=ort");
+                    return Ok(Some(Self {
+                        backend: PoseBackend::Ort(std::sync::Mutex::new(session)),
+                        input_w,
+                        input_h,
+                        layout,
+                        input_scale: pose_input_scale(),
+                    }));
+                }
+                LoadResult::Timeout => {
+                    drop(pose_tick);
+                    eprintln!(
+                        "clip detect: pose model load timed out after {:.1}s; skipping pose",
+                        timeout_secs
+                    );
+                    return Ok(None);
+                }
+                LoadResult::Err(err) => {
+                    if matches!(backend_choice, FaceBackend::Ort) {
+                        return Err(err);
+                    }
+                    eprintln!(
+                        "clip detect: pose ORT init failed ({err:#}); falling back to tract"
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(feature = "ort"))]
+        if matches!(backend_choice, FaceBackend::Ort) {
+            anyhow::bail!(
+                "pose backend 'ort' requested but autoclip was built without the ort feature"
+            );
+        }
+
+        let Some(remaining) = pose_deadline.checked_duration_since(Instant::now()) else {
+            drop(pose_tick);
+            eprintln!(
+                "clip detect: pose model load timed out after {:.1}s; skipping pose",
+                timeout_secs
+            );
+            return Ok(None);
+        };
+        let fallback_size = pose_input_size();
+        let max_side = pose_input_max();
+        let model_path_clone = model_path.clone();
+        let tract_result = run_with_timeout(remaining, move || {
+            let model = tract_onnx::onnx()
+                .model_for_path(&model_path_clone)
+                .with_context(|| format!("loading pose model at {model_path_clone}"))?;
+            let (input_w, input_h, layout, source) = match model.input_fact(0) {
+                Ok(fact) => {
+                    let dims: Vec<Option<usize>> = fact
+                        .shape
+                        .dims()
+                        .map(|d| d.concretize().and_then(|d| d.to_usize().ok()))
+                        .collect();
+                    resolve_pose_input_from_dims(&dims, fallback_size, max_side)
+                }
+                Err(_) => (
+                    fallback_size,
+                    fallback_size,
+                    ModelLayout::Nchw,
+                    PoseInputSource::Fallback,
+                ),
+            };
+            let input_shape = match layout {
+                ModelLayout::Nchw => tvec!(1, 3, input_h as usize, input_w as usize),
+                ModelLayout::Nhwc => tvec!(1, input_h as usize, input_w as usize, 3),
+            };
+            let model = model.with_input_fact(
+                0,
+                InferenceFact::dt_shape(f32::datum_type(), input_shape),
+            )?;
+            let model = if pose_tract_opt_enabled() {
+                model.into_optimized()?
+            } else {
+                model.into_typed()?
+            };
+            let backend = PoseBackend::Tract(model.into_runnable()?);
+            Ok((backend, input_w, input_h, layout, source))
+        });
+        match tract_result {
+            LoadResult::Ok((backend, input_w, input_h, layout, source)) => {
+                drop(pose_tick);
+                eprintln!(
+                    "clip detect: pose model loaded in {:.1}s",
+                    pose_start.elapsed().as_secs_f32()
+                );
+                if matches!(source, PoseInputSource::Fallback) {
+                    eprintln!(
+                        "clip detect: pose input unresolved; using {}x{}",
+                        input_w, input_h
+                    );
+                } else if matches!(source, PoseInputSource::Clamped) {
+                    eprintln!(
+                        "clip detect: pose input exceeds max {}; using {}x{}",
+                        max_side, input_w, input_h
+                    );
+                }
+                eprintln!("clip detect: pose backend=tract");
+                Ok(Some(Self {
+                    backend,
+                    input_w,
+                    input_h,
+                    layout,
+                    input_scale: pose_input_scale(),
+                }))
+            }
+            LoadResult::Timeout => {
+                drop(pose_tick);
+                eprintln!(
+                    "clip detect: pose model load timed out after {:.1}s; skipping pose",
+                    timeout_secs
+                );
+                Ok(None)
+            }
+            LoadResult::Err(err) => {
+                drop(pose_tick);
+                Err(err)
+            }
+        }
+    }
+
+    fn detect_pose(&self, frame: &FaceFrame) -> Option<PoseObservation> {
+        let rgb = &frame.rgb;
+        let input = match self.layout {
+            ModelLayout::Nchw => rgb_to_rgb_chw_scaled(
+                rgb,
+                self.input_w as usize,
+                self.input_h as usize,
+                self.input_scale,
+            ),
+            ModelLayout::Nhwc => rgb_to_rgb_hwc_scaled(
+                rgb,
+                self.input_w as usize,
+                self.input_h as usize,
+                self.input_scale,
+            ),
+        };
+        let Some(input) = input else { return None };
+        let outputs = match &self.backend {
+            PoseBackend::Tract(model) => {
+                let tensor = match self.layout {
+                    ModelLayout::Nchw => Tensor::from_shape(
+                        &[1usize, 3, self.input_h as usize, self.input_w as usize],
+                        &input,
+                    )
+                    .ok(),
+                    ModelLayout::Nhwc => Tensor::from_shape(
+                        &[1usize, self.input_h as usize, self.input_w as usize, 3],
+                        &input,
+                    )
+                    .ok(),
+                };
+                let Some(tensor) = tensor else { return None };
+                model.run(tvec!(tensor.into())).ok()
+            }
+            #[cfg(feature = "ort")]
+            PoseBackend::Ort(session) => {
+                session
+                    .lock()
+                    .ok()
+                    .and_then(|mut guard| {
+                        run_ort_session(
+                            &mut *guard,
+                            &input,
+                            self.input_w,
+                            self.input_h,
+                            self.layout,
+                        )
+                    })
+            }
+        }?;
+        if outputs.is_empty() {
+            return None;
+        }
+        let output = outputs.first()?;
+        let mut keypoints = decode_movenet_keypoints(output)?;
+        if let Some(mapping) = frame.mapping.as_ref() {
+            if let Some(mapped) = map_pose_keypoints(mapping, &keypoints) {
+                keypoints = mapped;
+            }
+        }
+        let score = keypoints
+            .iter()
+            .map(|kp| if kp.score.is_finite() { kp.score.max(0.0) } else { 0.0 })
+            .sum::<f32>()
+            / POSE_KEYPOINT_COUNT.max(1) as f32;
+        let observation = PoseObservation { keypoints, score };
+        if pose_debug_enabled() {
+            let eye = observation.keypoints[POSE_KP_LEFT_EYE];
+            let shoulder = observation.keypoints[POSE_KP_LEFT_SHOULDER];
+            eprintln!(
+                "clip detect: pose score={:.3} eye=({:.3},{:.3}) shoulder=({:.3},{:.3})",
+                observation.score, eye.x, eye.y, shoulder.x, shoulder.y
+            );
+        }
+        Some(observation)
+    }
+}
+
+fn decode_movenet_keypoints(output: &Tensor) -> Option<[PoseKeypoint; POSE_KEYPOINT_COUNT]> {
+    let data = output.as_slice::<f32>().ok()?;
+    if data.len() < POSE_KEYPOINT_COUNT * 3 {
+        return None;
+    }
+    let mut keypoints = [PoseKeypoint { x: 0.0, y: 0.0, score: 0.0 }; POSE_KEYPOINT_COUNT];
+    let base = 0usize;
+    for idx in 0..POSE_KEYPOINT_COUNT {
+        let offset = base + idx * 3;
+        let y = data[offset];
+        let x = data[offset + 1];
+        let score = data[offset + 2];
+        let x = if x.is_finite() { clamp_unit(x) } else { 0.0 };
+        let y = if y.is_finite() { clamp_unit(y) } else { 0.0 };
+        let score = if score.is_finite() { score } else { 0.0 };
+        keypoints[idx] = PoseKeypoint { x, y, score };
+    }
+    Some(keypoints)
+}
+
+fn map_pose_keypoints(
+    mapping: &FrameMapping,
+    keypoints: &[PoseKeypoint; POSE_KEYPOINT_COUNT],
+) -> Option<[PoseKeypoint; POSE_KEYPOINT_COUNT]> {
+    let mut out = [PoseKeypoint { x: 0.0, y: 0.0, score: 0.0 }; POSE_KEYPOINT_COUNT];
+    for (idx, kp) in keypoints.iter().enumerate() {
+        let mapped = mapping.map_point(NormalizedPoint { x: kp.x, y: kp.y })?;
+        out[idx] = PoseKeypoint {
+            x: mapped.x,
+            y: mapped.y,
+            score: kp.score,
+        };
     }
     Some(out)
 }
@@ -3155,7 +4443,17 @@ fn landmarks_frontal(points: &[NormalizedPoint; 5], rect: NormalizedRect) -> boo
     true
 }
 
-fn face_frame_spec_for_candidate(candidate: &FaceCandidate) -> FaceFrameSpec {
+fn face_frame_spec_for_candidate(
+    candidate: &FaceCandidate,
+    pose: Option<&PoseObservation>,
+) -> Option<FaceFrameSpec> {
+    if let Some(pose) = pose {
+        return pose_frame_spec_for_candidate(candidate, pose);
+    }
+    Some(face_frame_spec_from_landmarks(candidate))
+}
+
+fn face_frame_spec_from_landmarks(candidate: &FaceCandidate) -> FaceFrameSpec {
     let mut head_top_offset = face_frame_head_top_default();
     if candidate.landmarks_ok {
         if let Some(points) = candidate.landmarks {
@@ -3183,6 +4481,159 @@ fn face_frame_spec_for_candidate(candidate: &FaceCandidate) -> FaceFrameSpec {
         head_top_offset,
         shoulder_width_scale: face_frame_shoulder_scale(),
     }
+}
+
+fn pose_frame_spec_for_candidate(
+    candidate: &FaceCandidate,
+    pose: &PoseObservation,
+) -> Option<FaceFrameSpec> {
+    let min_score = pose_keypoint_min_score();
+    if !pose_matches_face(candidate.rect, pose, min_score) {
+        return None;
+    }
+
+    let mut head_top_offset = face_frame_head_top_default();
+    let mut shoulder_width_scale = face_frame_shoulder_scale();
+
+    if let Some((eye_mid, head_anchor, shoulder_mid)) =
+        pose_head_and_shoulders(pose, min_score)
+    {
+        let head_span = shoulder_mid.y - eye_mid.y;
+        if head_span.is_finite() && head_span > 1e-4 {
+            let head_top = head_anchor.y - head_span * pose_head_ratio();
+            let denom = candidate.rect.h.max(1e-4);
+            let offset = (head_top - candidate.rect.y) / denom;
+            if offset.is_finite() {
+                head_top_offset = offset;
+            }
+        }
+    }
+
+    if let Some(width) = pose_shoulder_width(pose, min_score) {
+        let denom = candidate.rect.w.max(1e-4);
+        let scale = (width * pose_shoulder_margin()) / denom;
+        if scale.is_finite() && scale > 0.0 {
+            shoulder_width_scale = scale.clamp(1.0, 12.0);
+        }
+    }
+
+    let spec = FaceFrameSpec {
+        head_top_offset,
+        shoulder_width_scale,
+    };
+    if pose_debug_enabled() {
+        eprintln!(
+            "clip detect: pose frame spec head_top={:.3} shoulder_scale={:.2}",
+            spec.head_top_offset, spec.shoulder_width_scale
+        );
+    }
+    Some(spec)
+}
+
+fn pose_matches_face(
+    rect: NormalizedRect,
+    pose: &PoseObservation,
+    min_score: f32,
+) -> bool {
+    let nose = pose_keypoint(pose, POSE_KP_NOSE, min_score);
+    let eye = pose_midpoint(
+        pose_keypoint(pose, POSE_KP_LEFT_EYE, min_score),
+        pose_keypoint(pose, POSE_KP_RIGHT_EYE, min_score),
+    );
+    let point = nose.or(eye);
+    let Some(point) = point else { return false };
+    rect_contains_point(rect, point, 0.06)
+}
+
+fn pose_head_and_shoulders(
+    pose: &PoseObservation,
+    min_score: f32,
+) -> Option<(NormalizedPoint, NormalizedPoint, NormalizedPoint)> {
+    let left_eye = pose_keypoint(pose, POSE_KP_LEFT_EYE, min_score);
+    let right_eye = pose_keypoint(pose, POSE_KP_RIGHT_EYE, min_score);
+    let nose = pose_keypoint(pose, POSE_KP_NOSE, min_score);
+    let eye_mid = pose_midpoint(left_eye, right_eye).or(nose);
+
+    let mut head_candidates = Vec::new();
+    if let Some(pt) = left_eye {
+        head_candidates.push(pt);
+    }
+    if let Some(pt) = right_eye {
+        head_candidates.push(pt);
+    }
+    if let Some(pt) = pose_keypoint(pose, POSE_KP_LEFT_EAR, min_score) {
+        head_candidates.push(pt);
+    }
+    if let Some(pt) = pose_keypoint(pose, POSE_KP_RIGHT_EAR, min_score) {
+        head_candidates.push(pt);
+    }
+    if let Some(pt) = nose {
+        head_candidates.push(pt);
+    }
+    let head_anchor = head_candidates
+        .into_iter()
+        .min_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+
+    let shoulder_mid = pose_midpoint(
+        pose_keypoint(pose, POSE_KP_LEFT_SHOULDER, min_score),
+        pose_keypoint(pose, POSE_KP_RIGHT_SHOULDER, min_score),
+    );
+
+    match (eye_mid, head_anchor, shoulder_mid) {
+        (Some(eye_mid), Some(head_anchor), Some(shoulder_mid)) => {
+            Some((eye_mid, head_anchor, shoulder_mid))
+        }
+        _ => None,
+    }
+}
+
+fn pose_shoulder_width(pose: &PoseObservation, min_score: f32) -> Option<f32> {
+    let left = pose_keypoint(pose, POSE_KP_LEFT_SHOULDER, min_score)?;
+    let right = pose_keypoint(pose, POSE_KP_RIGHT_SHOULDER, min_score)?;
+    let width = (right.x - left.x).abs();
+    if width.is_finite() && width > 0.0 {
+        Some(width)
+    } else {
+        None
+    }
+}
+
+fn pose_keypoint(
+    pose: &PoseObservation,
+    idx: usize,
+    min_score: f32,
+) -> Option<NormalizedPoint> {
+    let kp = pose.keypoints.get(idx)?;
+    if kp.score < min_score {
+        return None;
+    }
+    if !(kp.x.is_finite() && kp.y.is_finite()) {
+        return None;
+    }
+    Some(NormalizedPoint {
+        x: clamp_unit(kp.x),
+        y: clamp_unit(kp.y),
+    })
+}
+
+fn pose_midpoint(
+    left: Option<NormalizedPoint>,
+    right: Option<NormalizedPoint>,
+) -> Option<NormalizedPoint> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(midpoint(left, right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        _ => None,
+    }
+}
+
+fn rect_contains_point(rect: NormalizedRect, point: NormalizedPoint, margin: f32) -> bool {
+    let min_x = rect.x - margin;
+    let max_x = rect.x + rect.w + margin;
+    let min_y = rect.y - margin;
+    let max_y = rect.y + rect.h + margin;
+    point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y
 }
 
 fn normalize_rect(
@@ -3585,6 +5036,8 @@ struct FaceFrame {
     rgb: Vec<u8>,
     mapping: Option<FrameMapping>,
     region: NormalizedRect,
+    width: u32,
+    height: u32,
 }
 
 fn build_face_filter(model_w: u32, model_h: u32, region: NormalizedRect) -> String {
@@ -3702,6 +5155,8 @@ async fn extract_face_frame_rgb(
         rgb: data,
         mapping,
         region,
+        width: model_w,
+        height: model_h,
     })
 }
 
@@ -3847,10 +5302,33 @@ struct FaceCandidate {
     region: NormalizedRect,
 }
 
+const POSE_KEYPOINT_COUNT: usize = 17;
+const POSE_KP_NOSE: usize = 0;
+const POSE_KP_LEFT_EYE: usize = 1;
+const POSE_KP_RIGHT_EYE: usize = 2;
+const POSE_KP_LEFT_EAR: usize = 3;
+const POSE_KP_RIGHT_EAR: usize = 4;
+const POSE_KP_LEFT_SHOULDER: usize = 5;
+const POSE_KP_RIGHT_SHOULDER: usize = 6;
+
+#[derive(Clone, Copy, Debug)]
+struct PoseKeypoint {
+    x: f32,
+    y: f32,
+    score: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PoseObservation {
+    keypoints: [PoseKeypoint; POSE_KEYPOINT_COUNT],
+    score: f32,
+}
+
 #[derive(Clone, Debug)]
 struct FaceSample {
     time: f32,
     candidates: Vec<FaceCandidate>,
+    pose: Option<PoseObservation>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3865,7 +5343,7 @@ struct FaceObservation {
     score: f32,
     time: f32,
     region: NormalizedRect,
-    frame_spec: FaceFrameSpec,
+    frame_spec: Option<FaceFrameSpec>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3876,7 +5354,7 @@ struct FaceConsensus {
     count: usize,
     max_dist: f32,
     region: NormalizedRect,
-    frame_spec: FaceFrameSpec,
+    frame_spec: Option<FaceFrameSpec>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3913,6 +5391,23 @@ fn rect_area(rect: NormalizedRect) -> f32 {
         return 0.0;
     }
     area.max(0.0)
+}
+
+fn active_face_motion_threshold() -> f32 {
+    std::env::var("CLIP_FACE_ACTIVE_MOTION")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.015)
+}
+
+fn active_face_area_ratio() -> f32 {
+    std::env::var("CLIP_FACE_ACTIVE_AREA_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.clamp(0.05, 1.0))
+        .unwrap_or(0.35)
 }
 
 fn expand_rect(rect: NormalizedRect, scale: f32) -> NormalizedRect {
@@ -3954,6 +5449,43 @@ fn select_consensus_face(observations: &[FaceObservation]) -> Option<FaceConsens
         } else {
             clusters.push(FaceCluster::new(*obs));
         }
+    }
+
+    let max_area = clusters
+        .iter()
+        .fold(0.0f32, |best, cluster| best.max(cluster.max_area));
+    let mut best_active: Option<&FaceCluster> = None;
+    let motion_threshold = active_face_motion_threshold();
+    let area_ratio = active_face_area_ratio();
+    let strong_motion = motion_threshold * 2.0;
+    for cluster in &clusters {
+        if cluster.max_dist < motion_threshold {
+            continue;
+        }
+        if max_area > 0.0
+            && cluster.max_area < max_area * area_ratio
+            && cluster.max_dist < strong_motion
+        {
+            continue;
+        }
+        let take = match best_active {
+            None => true,
+            Some(best) => {
+                cluster.max_dist > best.max_dist
+                    || (cluster.max_dist == best.max_dist
+                        && (cluster.max_area > best.max_area
+                            || (cluster.max_area == best.max_area
+                                && (cluster.count > best.count
+                                    || (cluster.count == best.count
+                                        && cluster.score_sum > best.score_sum)))))
+            }
+        };
+        if take {
+            best_active = Some(cluster);
+        }
+    }
+    if let Some(cluster) = best_active {
+        return Some(cluster.to_consensus());
     }
 
     let mut best_cluster: Option<&FaceCluster> = None;
@@ -4256,6 +5788,74 @@ mod tests {
         }
     }
 
+    fn rect_at(cx: f32, cy: f32, w: f32, h: f32) -> NormalizedRect {
+        NormalizedRect {
+            x: cx - w / 2.0,
+            y: cy - h / 2.0,
+            w,
+            h,
+        }
+    }
+
+    fn obs_at(cx: f32, cy: f32, w: f32, h: f32, time: f32) -> FaceObservation {
+        let rect = rect_at(cx, cy, w, h);
+        FaceObservation {
+            rect,
+            score: 0.9,
+            time,
+            region: rect,
+            frame_spec: Some(FaceFrameSpec {
+                head_top_offset: 0.0,
+                shoulder_width_scale: 1.0,
+            }),
+        }
+    }
+
+    fn pose_obs(points: &[(usize, f32, f32, f32)]) -> PoseObservation {
+        let mut keypoints = [PoseKeypoint { x: 0.0, y: 0.0, score: 0.0 }; POSE_KEYPOINT_COUNT];
+        for (idx, x, y, score) in points {
+            if *idx < keypoints.len() {
+                keypoints[*idx] = PoseKeypoint {
+                    x: *x,
+                    y: *y,
+                    score: *score,
+                };
+            }
+        }
+        let score = keypoints
+            .iter()
+            .map(|kp| kp.score.max(0.0))
+            .sum::<f32>()
+            / POSE_KEYPOINT_COUNT.max(1) as f32;
+        PoseObservation { keypoints, score }
+    }
+
+    #[test]
+    fn resolve_pose_input_prefers_model_dims() {
+        let dims = vec![Some(1), Some(3), Some(256), Some(256)];
+        let (w, h, layout, source) = resolve_pose_input_from_dims(&dims, 256, 512);
+        assert_eq!((w, h), (256, 256));
+        assert!(matches!(layout, ModelLayout::Nchw));
+        assert_eq!(source, PoseInputSource::Model);
+    }
+
+    #[test]
+    fn resolve_pose_input_clamps_large_dims() {
+        let dims = vec![Some(1), Some(3), Some(1080), Some(1920)];
+        let (w, h, _layout, source) = resolve_pose_input_from_dims(&dims, 256, 512);
+        assert_eq!((w, h), (256, 256));
+        assert_eq!(source, PoseInputSource::Clamped);
+    }
+
+    #[test]
+    fn resolve_pose_input_falls_back_for_dynamic_dims() {
+        let dims = vec![Some(1), None, None, Some(3)];
+        let (w, h, layout, source) = resolve_pose_input_from_dims(&dims, 256, 512);
+        assert_eq!((w, h), (256, 256));
+        assert!(matches!(layout, ModelLayout::Nhwc));
+        assert_eq!(source, PoseInputSource::Fallback);
+    }
+
     #[test]
     fn detect_reticle_candidate_finds_crosshair() {
         let width = 96;
@@ -4294,6 +5894,22 @@ mod tests {
         let last = *times.last().unwrap();
         assert!((first - 1.0).abs() < 1e-6);
         assert!(last > 7.0, "expected samples to reach near the clip end");
+    }
+
+    #[test]
+    fn moving_face_beats_static_when_area_close() {
+        let mut observations = Vec::new();
+        observations.push(obs_at(0.8, 0.5, 0.5, 0.4, 1.0));
+        observations.push(obs_at(0.8, 0.5, 0.5, 0.4, 2.0));
+        observations.push(obs_at(0.8, 0.5, 0.5, 0.4, 3.0));
+
+        observations.push(obs_at(0.2, 0.5, 0.4, 0.3, 1.0));
+        observations.push(obs_at(0.25, 0.5, 0.4, 0.3, 2.0));
+        observations.push(obs_at(0.3, 0.5, 0.4, 0.3, 3.0));
+
+        let consensus = select_consensus_face(&observations).expect("expected consensus");
+        let center = rect_center(consensus.rect);
+        assert!(center.x < 0.5, "moving face should be preferred");
     }
 
     #[test]
@@ -4442,5 +6058,49 @@ mod tests {
             NormalizedPoint { x: 0.62, y: 0.67 },
         ];
         assert!(!landmarks_frontal(&points, rect));
+    }
+
+    #[test]
+    fn pose_frame_spec_uses_shoulders() {
+        let candidate = FaceCandidate {
+            rect: NormalizedRect {
+                x: 0.4,
+                y: 0.2,
+                w: 0.2,
+                h: 0.4,
+            },
+            model_rect: NormalizedRect {
+                x: 0.4,
+                y: 0.2,
+                w: 0.2,
+                h: 0.4,
+            },
+            raw_score: 0.9,
+            score: 0.9,
+            landmarks_ok: false,
+            landmarks: None,
+            region: NormalizedRect {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            },
+        };
+        let pose = pose_obs(&[
+            (POSE_KP_LEFT_EYE, 0.45, 0.25, 0.95),
+            (POSE_KP_RIGHT_EYE, 0.55, 0.25, 0.95),
+            (POSE_KP_NOSE, 0.50, 0.30, 0.90),
+            (POSE_KP_LEFT_SHOULDER, 0.35, 0.60, 0.90),
+            (POSE_KP_RIGHT_SHOULDER, 0.65, 0.60, 0.90),
+        ]);
+        let spec = pose_frame_spec_for_candidate(&candidate, &pose)
+            .expect("expected pose-based frame spec");
+        let expected_scale =
+            (0.30 * pose_shoulder_margin()) / candidate.rect.w.max(1e-4);
+        assert!((spec.shoulder_width_scale - expected_scale).abs() < 0.05);
+        assert!(
+            spec.head_top_offset < 0.0,
+            "expected pose to push head top above face box"
+        );
     }
 }

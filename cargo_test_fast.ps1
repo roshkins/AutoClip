@@ -265,15 +265,6 @@ if ($NoNinja -or $env:WHISPER_NO_NINJA) {
     $setNinja = (Set-EnvIfEmpty -Name "WHISPER_CMAKE_MAKE_PROGRAM" -Value $ninja.Source) -or $setNinja
 }
 
-$sccache = Get-Command sccache -ErrorAction SilentlyContinue
-$setCache = $false
-if ($sccache) {
-    $setCache = Set-EnvIfEmpty -Name "RUSTC_WRAPPER" -Value $sccache.Source
-    $setCache = (Set-EnvIfEmpty -Name "CMAKE_C_COMPILER_LAUNCHER" -Value $sccache.Source) -or $setCache
-    $setCache = (Set-EnvIfEmpty -Name "CMAKE_CXX_COMPILER_LAUNCHER" -Value $sccache.Source) -or $setCache
-    $setCache = (Set-EnvIfEmpty -Name "CMAKE_CUDA_COMPILER_LAUNCHER" -Value $sccache.Source) -or $setCache
-}
-
 $setArch = $false
 if ($CudaArch) {
     $archList = $CudaArch.Trim()
@@ -311,7 +302,7 @@ if ($CudaArch) {
     }
 }
 
-Write-Host "fast whisper env:" -ForegroundColor Cyan
+Write-Host "fast test env:" -ForegroundColor Cyan
 Write-Host "  jobs=$env:CARGO_BUILD_JOBS (set=$setJobs)"
 Write-Host "  cmake_parallel=$env:CMAKE_BUILD_PARALLEL_LEVEL (set=$setCmake)"
 Write-Host "  skip_bindgen=$env:WHISPER_DONT_GENERATE_BINDINGS (set=$setBindings)"
@@ -321,10 +312,7 @@ if ($env:GGML_CUDA_ARCHITECTURES) {
 if ($ninja) {
     Write-Host "  ninja=$env:WHISPER_CMAKE_GENERATOR (set=$setNinja)"
 }
-if ($sccache) {
-    Write-Host "  sccache=$env:RUSTC_WRAPPER (set=$setCache)"
-}
 
 $cargo = Get-Command cargo -ErrorAction Stop
-& $cargo.Source run @Args
+& $cargo.Source test @Args
 exit $LASTEXITCODE
