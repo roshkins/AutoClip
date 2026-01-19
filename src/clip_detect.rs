@@ -4488,8 +4488,8 @@ fn pose_frame_spec_for_candidate(
     pose: &PoseObservation,
 ) -> Option<FaceFrameSpec> {
     let min_score = pose_keypoint_min_score();
-    if !pose_matches_face(candidate.rect, pose, min_score) {
-        return None;
+    if !pose_matches_face(candidate.rect, pose, min_score) && pose_debug_enabled() {
+        eprintln!("clip detect: pose does not match face; applying pose framing");
     }
 
     let mut head_top_offset = face_frame_head_top_default();

@@ -55,3 +55,8 @@ cargo_check_err.log
 run_result.txt
 *.log
 *.tmp
+.whisper_wake_media_url.txt
+.whisper_wake_status.json
+error.txt
+pending_face_reframe.patch
+tmp_manifest.json
