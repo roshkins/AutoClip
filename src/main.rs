@@ -3588,8 +3588,6 @@ const LOW_RESOURCE_OVERRIDES: &[(&str, &str)] = &[
     ("CLIP_DETECT", "0"),
     ("CLIP_GAMEPLAY", "0"),
     ("CLIP_REGION_DETECT", "0"),
-    ("CLIP_CAPTIONS", "0"),
-    ("CLIP_CLOSED_CAPTIONS", "0"),
     ("CLIP_LLM_ENABLE", "0"),
     ("CLIP_EMOTION_ENABLE", "0"),
     ("CLIP_EMOTION_AUDIO", "0"),
@@ -4029,6 +4027,24 @@ fn resolve_caption_pixels(out_h: u32, value: Option<f32>, default_ratio: f32) ->
     }
 }
 
+fn default_caption_font() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let candidates = [
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\seguisb.ttf",
+            r"C:\Windows\Fonts\calibri.ttf",
+        ];
+        for path in candidates {
+            if Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn read_caption_config(out_h: u32) -> Option<CaptionConfig> {
     if !captions_enabled() {
         return None;
@@ -4037,10 +4053,13 @@ fn read_caption_config(out_h: u32) -> Option<CaptionConfig> {
         .ok()
         .and_then(|v| parse_caption_position(&v))
         .unwrap_or(CaptionPosition::Margin);
-    let font = std::env::var("CLIP_CAPTIONS_FONT")
+    let mut font = std::env::var("CLIP_CAPTIONS_FONT")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
+    if font.is_none() {
+        font = default_caption_font();
+    }
     let font_size = std::env::var("CLIP_CAPTIONS_SIZE")
         .ok()
         .and_then(|v| v.parse::<f32>().ok());
@@ -7496,7 +7515,7 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
         &output_path,
         out_w,
         out_h,
-        None,
+        progress_total_secs,
         None,
         true,
         true,
@@ -8007,6 +8026,92 @@ fn print_help(bin: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command as SysCommand;
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            Self { saved: Vec::new() }
+        }
+
+        fn set(&mut self, key: &str, value: &str) {
+            if !self.saved.iter().any(|(k, _)| k == key) {
+                self.saved.push((key.to_string(), std::env::var(key).ok()));
+            }
+            std::env::set_var(key, value);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, val) in self.saved.drain(..) {
+                match val {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn tool_available(tool: &str) -> bool {
+        SysCommand::new(tool)
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn generate_test_video(path: &Path) -> Result<()> {
+        let status = SysCommand::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x180:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-shortest",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                path.to_string_lossy().as_ref(),
+            ])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("ffmpeg failed generating test video");
+        }
+        Ok(())
+    }
+
+    fn output_has_subtitles(path: &Path) -> Result<bool> {
+        let output = SysCommand::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                path.to_string_lossy().as_ref(),
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout.lines().any(|line| line.trim() == "subtitle"))
+    }
 
     #[tokio::test]
     async fn run_stub_succeeds() {
@@ -8199,6 +8304,59 @@ mod tests {
         let srt = build_srt_from_payload(&payload, Some(2.0)).unwrap();
         assert!(srt.contains("00:00:00,000 --> 00:00:01,000"));
         assert!(srt.contains("Hello world"));
+    }
+
+    #[tokio::test]
+    async fn captions_embed_subtitles_in_low_resource_mode() -> Result<()> {
+        if !tool_available("ffmpeg") || !tool_available("ffprobe") {
+            eprintln!("skipping: ffmpeg/ffprobe not available");
+            return Ok(());
+        }
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("autoclip_caption_test_{stamp}"));
+        fs::create_dir_all(&dir)?;
+        let input = dir.join("input.mp4");
+        let output = dir.join("output.mp4");
+        generate_test_video(&input)?;
+
+        let mut env = EnvGuard::new();
+        env.set("CLIP_LOW_RESOURCES", "1");
+        env.set("CLIP_CAPTIONS", "1");
+        env.set("CLIP_CLOSED_CAPTIONS", "1");
+        env.set("CLIP_TEST_TRANSCRIPT", "hello world from test");
+        env.set("CLIP_LAYOUT", "full");
+        env.set("CLIP_DETECT", "0");
+        env.set("CLIP_FACE_TRACK", "0");
+        env.set("CLIP_LIVE_FAST", "0");
+        env.set("FFMPEG_ENCODER", "libx264");
+        env.set("FFMPEG_HWACCEL", "none");
+        if let Some(font) = default_caption_font() {
+            env.set("CLIP_CAPTIONS_FONT", &font);
+        }
+
+        run_ffmpeg_internal(
+            input.to_string_lossy().as_ref(),
+            &output,
+            320,
+            180,
+            Some(1.0),
+            None,
+            true,
+            false,
+            None,
+            false,
+        )
+        .await?;
+
+        assert!(
+            output_has_subtitles(&output)?,
+            "expected subtitle stream in output"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     /// Optional network test: set M3U8_TEST_URL to a live master playlist URL (e.g., Kick channel).

@@ -1030,6 +1030,39 @@ pub fn transcribe_clip_audio(
     if duration.is_none() {
         anyhow::bail!("captions require a finite clip duration");
     }
+    if let Ok(test_text) = env::var("CLIP_TEST_TRANSCRIPT") {
+        let trimmed = test_text.trim();
+        if !trimmed.is_empty() {
+            let dur = duration.unwrap_or(0.0).max(0.0);
+            let mut words = Vec::new();
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            if !tokens.is_empty() && dur > 0.0 {
+                let count = tokens.len() as f32;
+                let step = (dur / count).max(0.05);
+                let mut t0 = 0.0;
+                for token in tokens {
+                    let t1 = (t0 + step).min(dur);
+                    if t1 <= t0 {
+                        break;
+                    }
+                    words.push(WordTiming {
+                        text: token.to_string(),
+                        norm: normalize(token),
+                        t0,
+                        t1,
+                    });
+                    t0 = t1;
+                    if (dur - t0) <= 0.0 {
+                        break;
+                    }
+                }
+            }
+            return Ok(TranscriptPayload {
+                text: trimmed.to_string(),
+                words,
+            });
+        }
+    }
 
     let model_path = select_best_model_path();
     let mut whisper = WhisperHandle::new_with_gpu(&model_path, whisper_clip_prefers_gpu())?;
@@ -1606,5 +1639,21 @@ mod tests {
     fn split_emotion_phrases_handles_commas() {
         let phrases = split_emotion_phrases("wow, oh my god | wtf");
         assert_eq!(phrases, vec!["wow", "oh my god", "wtf"]);
+    }
+
+    #[test]
+    fn transcribe_clip_audio_uses_test_transcript() -> Result<()> {
+        let key = "CLIP_TEST_TRANSCRIPT";
+        let prev = env::var(key).ok();
+        env::set_var(key, "hello world");
+        let payload = transcribe_clip_audio("missing.mp4", None, Some(1.0), false)?;
+        assert_eq!(payload.text, "hello world");
+        assert!(!payload.words.is_empty());
+        if let Some(value) = prev {
+            env::set_var(key, value);
+        } else {
+            env::remove_var(key);
+        }
+        Ok(())
     }
 }
