@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio};
+use std::process::{Child, Command as StdCommand, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::process::Command;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -38,7 +38,7 @@ use clip_layout::{
     build_face_only_filter_graph, build_full_frame_fill_filter_graph,
     build_stacked_filter_graph, build_tracked_full_frame_fill_filter_graph,
     read_clip_layout_config, read_clip_layout_hints, resolve_stacked_layout_dims, ClipLayoutMode,
-    FilterGraph, NormalizedPoint, NormalizedRect, StackedLayoutDims,
+    ClipLayoutHints, FilterGraph, NormalizedPoint, NormalizedRect, StackedLayoutDims,
 };
 use profile::profile_span;
 use rolling_buffer::RollingBuffer;
@@ -194,7 +194,8 @@ impl AutoClip {
         let buffer_target_ns = Arc::new(std::sync::atomic::AtomicU64::new(buffer_window_ns));
         let max_latency_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        spawn_ctrl_c_handler(stop.clone());
+        let whisper_worker = Arc::new(Mutex::new(None));
+        spawn_ctrl_c_handler(stop.clone(), Some(whisper_worker.clone()));
         let mut last_detect_instant: Option<Instant> = None;
         let wake_start = Arc::new(Mutex::new(Instant::now()));
         let _start_instant = *wake_start.lock().expect("wake start lock poisoned");
@@ -262,15 +263,32 @@ impl AutoClip {
         }
 
         let hls = HlsClient::new()?;
-        let (master_url, master) = hls.fetch_master_from_page(page_url).await?;
+        let (master_url, master, headers) =
+            hls.fetch_master_from_page_with_headers(page_url).await?;
         let initial_media_url = hls.highest_variant_url(&master_url, &master)?;
         println!("tracking variant: {}", initial_media_url);
         let media_url = Arc::new(Mutex::new(initial_media_url));
+        let media_headers = Arc::new(Mutex::new(headers));
+        let mut media_url_last_refresh = Instant::now();
+        let mut media_url_expires_at = {
+            let guard = media_url.lock().expect("media url lock poisoned");
+            signed_url_expiry(&guard)
+        };
+        let m3u8_refresh_interval = read_m3u8_refresh_secs();
+        let m3u8_refresh_margin = Duration::from_secs(30);
 
         let mut seen: HashSet<String> = HashSet::new();
         let mut stream_time = Duration::ZERO;
         let mut detect_stream_time: Option<Duration> = None;
         let mut after_remaining: Option<Duration> = None;
+        let mut wake_counter: u64 = 0;
+        let mut active_wake_id: Option<u64> = None;
+        let mut last_audio_ns_seen: u64 = 0;
+        let mut last_audio_seen_at = Instant::now();
+        let offline_timeout = read_stream_offline_secs();
+        let mut last_progress_at = Instant::now();
+        let mut wake_stall_triggered = false;
+        let mut wake_stall_logged = false;
         let refractory = std::env::var("WAKE_REFRACTORY_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -279,13 +297,17 @@ impl AutoClip {
         let mut refractory_until: Option<Instant> = None;
         let latency_refresh_threshold = Duration::from_secs(240);
         let mut last_latency_refresh: Option<Instant> = None;
-        let word_refresh_threshold = Duration::from_secs(30);
-        let word_refresh_cooldown = Duration::from_secs(30);
-        let mut last_word_refresh: Option<Instant> = None;
+        let mut restart_triggered = false;
+        let mut last_warmup_log: Option<Instant> = None;
+        let warmup_log_interval = Duration::from_secs(5);
+        let mut restart_request: Option<String> = None;
+        let mut last_restart_defer: Option<Instant> = None;
+        let restart_defer_interval = Duration::from_secs(5);
         let whisper_isolate = whisper_isolate_enabled();
         let status_poll = whisper_worker_status_poll();
-        let worker_status_path = whisper_worker_status_path();
-        let worker_media_url_path = whisper_worker_media_url_path();
+        let worker_status_path = whisper_worker_status_path(&self.config.save_path);
+        let worker_media_url_path = whisper_worker_media_url_path(&self.config.save_path);
+        let last_status_ms = Arc::new(AtomicU64::new(now_unix_ms()));
         if whisper_isolate && !self.config.use_mic_for_wake {
             let guard = media_url.lock().expect("media url lock poisoned");
             if let Err(err) = write_media_url_file(&worker_media_url_path, &guard) {
@@ -302,13 +324,15 @@ impl AutoClip {
         } else {
             wake_phrases.join(", ")
         };
-        let mut _whisper_worker: Option<std::process::Child> = None;
         if whisper_isolate {
             let worker_start = Instant::now();
             *wake_start.lock().expect("wake start lock poisoned") = worker_start;
+            let reader_start_ms = now_unix_ms();
             let _reader = spawn_wake_status_reader(
                 worker_status_path.clone(),
                 status_poll,
+                reader_start_ms,
+                last_status_ms.clone(),
                 stop.clone(),
                 fired.clone(),
                 detect_ns.clone(),
@@ -321,13 +345,16 @@ impl AutoClip {
             } else {
                 Some(worker_media_url_path.as_path())
             };
-            _whisper_worker = Some(spawn_whisper_worker(
+            let worker = spawn_whisper_worker(
                 mode,
                 &worker_status_path,
                 media_path,
                 &wake_phrases,
                 self.config.log_raw_wake,
-            )?);
+            )?;
+            *whisper_worker
+                .lock()
+                .expect("whisper worker lock poisoned") = Some(worker);
             println!(
                 "whisper worker: isolating wake detection for '{}'",
                 wake_label
@@ -378,6 +405,7 @@ impl AutoClip {
         }
 
         let poll_interval = Duration::from_millis(500);
+        let mut error_backoff = Duration::ZERO;
 
         'stream_loop: loop {
             if stop.load(Ordering::Relaxed)
@@ -386,11 +414,28 @@ impl AutoClip {
             {
                 break;
             }
+            if let Some(timeout) = offline_timeout {
+                if !fired.load(Ordering::Relaxed) && after_remaining.is_none() {
+                    let now = Instant::now();
+                    let stale = now.duration_since(last_progress_at);
+                    if stale >= timeout {
+                        let msg = format!(
+                            "stream offline or stalled for {:.1}s; shutting down",
+                            stale.as_secs_f32()
+                        );
+                        eprintln!("{msg}");
+                        log_run_event(&save_root, &msg);
+                        stop.store(true, Ordering::Relaxed);
+                        break 'stream_loop;
+                    }
+                }
+            }
             if let Some(state) = live_config.as_mut() {
                 state.maybe_refresh();
             }
 
             let latency = Duration::from_nanos(max_latency_ns.load(Ordering::Relaxed));
+            let mut refreshed = false;
             if latency >= latency_refresh_threshold {
                 let now = Instant::now();
                 let can_refresh = last_latency_refresh
@@ -398,28 +443,28 @@ impl AutoClip {
                     .unwrap_or(true);
                 if can_refresh {
                     last_latency_refresh = Some(now);
-                    eprintln!(
+                    let reason = format!(
                         "processing latency {:.1}s exceeded {:.1}s; refreshing m3u8 via headless",
                         latency.as_secs_f32(),
                         latency_refresh_threshold.as_secs_f32()
                     );
-                    match hls.refresh_media_url_from_page_headless(page_url).await {
+                    match refresh_media_source(
+                        &hls,
+                        page_url,
+                        &media_url,
+                        &media_headers,
+                        &mut seen,
+                        whisper_isolate,
+                        self.config.use_mic_for_wake,
+                        &worker_media_url_path,
+                        &reason,
+                    )
+                    .await
+                    {
                         Ok(new_url) => {
-                            let mut guard = media_url
-                                .lock()
-                                .expect("media url lock poisoned while refreshing");
-                            *guard = new_url.clone();
-                            seen.clear();
-                            if whisper_isolate && !self.config.use_mic_for_wake {
-                                if let Err(err) =
-                                    write_media_url_file(&worker_media_url_path, &new_url)
-                                {
-                                    eprintln!(
-                                        "whisper worker: failed to write media url: {err:#}"
-                                    );
-                                }
-                            }
-                            eprintln!("refreshed variant: {}", new_url);
+                            media_url_last_refresh = Instant::now();
+                            media_url_expires_at = signed_url_expiry(&new_url);
+                            refreshed = true;
                         }
                         Err(err) => {
                             eprintln!("headless refresh failed: {err:#}");
@@ -427,42 +472,179 @@ impl AutoClip {
                     }
                 }
             }
-            if !self.config.use_mic_for_wake
-                && !fired.load(Ordering::Relaxed)
-                && after_remaining.is_none()
-            {
-                let now = Instant::now();
-                let last_word_val = last_word_ns.load(Ordering::Relaxed);
-                let base_start = *wake_start.lock().expect("wake start lock poisoned");
-                let last_word_at = if last_word_val == u64::MAX {
-                    base_start
-                } else {
-                    base_start + Duration::from_nanos(last_word_val)
-                };
-                let since_word = now.saturating_duration_since(last_word_at);
-                if since_word >= word_refresh_threshold {
-                    let can_refresh = last_word_refresh
-                        .map(|t| now.duration_since(t) >= word_refresh_cooldown)
-                        .unwrap_or(true);
-                    if can_refresh {
-                        last_word_refresh = Some(now);
-                        eprintln!(
-                            "no words detected for {:.1}s; refreshing m3u8 via headless",
-                            since_word.as_secs_f32()
+            if !refreshed {
+                if let Some(interval) = m3u8_refresh_interval {
+                    let now = Instant::now();
+                    if now.duration_since(media_url_last_refresh) >= interval {
+                        let reason = format!(
+                            "m3u8 refresh interval {:.1}s reached; refreshing via headless",
+                            interval.as_secs_f32()
                         );
-                        match hls.refresh_media_url_from_page_headless(page_url).await {
+                        match refresh_media_source(
+                            &hls,
+                            page_url,
+                            &media_url,
+                            &media_headers,
+                            &mut seen,
+                            whisper_isolate,
+                            self.config.use_mic_for_wake,
+                            &worker_media_url_path,
+                            &reason,
+                        )
+                        .await
+                        {
                             Ok(new_url) => {
-                                let mut guard = media_url
-                                    .lock()
-                                    .expect("media url lock poisoned while refreshing");
-                                *guard = new_url.clone();
-                                seen.clear();
-                                eprintln!("refreshed variant: {}", new_url);
+                                media_url_last_refresh = now;
+                                media_url_expires_at = signed_url_expiry(&new_url);
+                                refreshed = true;
                             }
                             Err(err) => {
                                 eprintln!("headless refresh failed: {err:#}");
                             }
                         }
+                    }
+                }
+            }
+            if !refreshed {
+                if let Some(expires_at) = media_url_expires_at {
+                    let now = SystemTime::now();
+                    let remaining = expires_at
+                        .duration_since(now)
+                        .unwrap_or_else(|_| Duration::ZERO);
+                    if remaining <= m3u8_refresh_margin {
+                        let reason = format!(
+                            "m3u8 expires in {:.1}s; refreshing via headless",
+                            remaining.as_secs_f32()
+                        );
+                        match refresh_media_source(
+                            &hls,
+                            page_url,
+                            &media_url,
+                            &media_headers,
+                            &mut seen,
+                            whisper_isolate,
+                            self.config.use_mic_for_wake,
+                            &worker_media_url_path,
+                            &reason,
+                        )
+                        .await
+                        {
+                            Ok(new_url) => {
+                                media_url_last_refresh = Instant::now();
+                                media_url_expires_at = signed_url_expiry(&new_url);
+                            }
+                            Err(err) => {
+                                eprintln!("headless refresh failed: {err:#}");
+                            }
+                        }
+                    }
+                }
+            }
+            let audio_ns_now = audio_ns.load(Ordering::Relaxed);
+            if audio_ns_now != last_audio_ns_seen {
+                last_audio_ns_seen = audio_ns_now;
+                last_audio_seen_at = Instant::now();
+            }
+
+            if let Some(stall_threshold) = read_wake_no_words_secs() {
+                if !self.config.use_mic_for_wake
+                    && !fired.load(Ordering::Relaxed)
+                    && after_remaining.is_none()
+                {
+                    let now = Instant::now();
+                    let progress_recent =
+                        now.duration_since(last_progress_at) <= Duration::from_secs(15);
+                    if progress_recent {
+                        let audio_stale =
+                            now.duration_since(last_audio_seen_at) >= stall_threshold;
+                        if whisper_isolate {
+                            let stall_ms =
+                                stall_threshold.as_millis().min(u64::MAX as u128) as u64;
+                            let now_ms = now_unix_ms();
+                            let last_ms = last_status_ms.load(Ordering::Relaxed);
+                            let status_stale = now_ms.saturating_sub(last_ms) >= stall_ms;
+                            if status_stale && !wake_stall_triggered {
+                                let buffer_ready = buffer.total_duration() >= clip_window;
+                                if !buffer_ready {
+                                    let now = Instant::now();
+                                    if last_warmup_log
+                                        .map(|t| now.duration_since(t) >= warmup_log_interval)
+                                        .unwrap_or(true)
+                                    {
+                                        last_warmup_log = Some(now);
+                                        let msg = format!(
+                                            "wake worker stalled but buffer warming: {:.1}/{:.1}s",
+                                            buffer.total_duration().as_secs_f32(),
+                                            clip_window.as_secs_f32()
+                                        );
+                                        eprintln!("{msg}");
+                                        log_run_event(&save_root, &msg);
+                                    }
+                                } else {
+                                    wake_stall_triggered = true;
+                                    let status_age =
+                                        now_ms.saturating_sub(last_ms) as f32 / 1000.0;
+                                    let msg = format!(
+                                        "wake worker status stale for {:.1}s; restarting process",
+                                        status_age
+                                    );
+                                    if restart_request.is_none() {
+                                        restart_request = Some(msg.clone());
+                                        log_run_event(
+                                            &save_root,
+                                            &format!("restart requested: {msg}"),
+                                        );
+                                    }
+                                }
+                            } else if audio_stale {
+                                if !wake_stall_logged {
+                                    wake_stall_logged = true;
+                                    let msg = format!(
+                                        "wake audio stalled for {:.1}s; stream may be silent (worker alive)",
+                                        now.duration_since(last_audio_seen_at).as_secs_f32()
+                                    );
+                                    eprintln!("{msg}");
+                                    log_run_event(&save_root, &msg);
+                                }
+                            } else {
+                                wake_stall_logged = false;
+                            }
+                        } else if audio_stale && !wake_stall_triggered {
+                            let buffer_ready = buffer.total_duration() >= clip_window;
+                            if !buffer_ready {
+                                let now = Instant::now();
+                                if last_warmup_log
+                                    .map(|t| now.duration_since(t) >= warmup_log_interval)
+                                    .unwrap_or(true)
+                                {
+                                    last_warmup_log = Some(now);
+                                    let msg = format!(
+                                        "wake audio stalled but buffer warming: {:.1}/{:.1}s",
+                                        buffer.total_duration().as_secs_f32(),
+                                        clip_window.as_secs_f32()
+                                    );
+                                    eprintln!("{msg}");
+                                    log_run_event(&save_root, &msg);
+                                }
+                            } else {
+                                wake_stall_triggered = true;
+                                let msg = format!(
+                                    "wake audio stalled for {:.1}s; restarting process",
+                                    now.duration_since(last_audio_seen_at).as_secs_f32()
+                                );
+                                if restart_request.is_none() {
+                                    restart_request = Some(msg.clone());
+                                    log_run_event(
+                                        &save_root,
+                                        &format!("restart requested: {msg}"),
+                                    );
+                                }
+                            }
+                        } else if !audio_stale {
+                            wake_stall_logged = false;
+                        }
+                    } else {
+                        wake_stall_logged = false;
                     }
                 }
             }
@@ -479,6 +661,50 @@ impl AutoClip {
                     buffer_window.as_secs_f32()
                 );
             }
+            if !restart_triggered {
+                if let Some(limit) = read_wake_buffer_restart_secs() {
+                    if buffer_window > limit {
+                        restart_triggered = true;
+                        let msg = format!(
+                            "buffer window {:.1}s exceeded restart limit {:.1}s; restarting",
+                            buffer_window.as_secs_f32(),
+                            limit.as_secs_f32()
+                        );
+                        if restart_request.is_none() {
+                            restart_request = Some(msg.clone());
+                            log_run_event(&save_root, &format!("restart requested: {msg}"));
+                        }
+                    }
+                }
+            }
+
+            pending_saves.retain(|handle| !handle.is_finished());
+            if let Some(reason) = restart_request.as_ref() {
+                let buffer_ready = buffer.total_duration() >= clip_window;
+                let wake_pending =
+                    fired.load(Ordering::Relaxed) || after_remaining.is_some();
+                let in_flight = pending_saves.len();
+                if buffer_ready && !wake_pending && in_flight == 0 {
+                    let msg = format!("restart executing: {reason}");
+                    eprintln!("{msg}");
+                    log_run_event(&save_root, &msg);
+                    spawn_self_restart(reason.clone());
+                } else {
+                    let now = Instant::now();
+                    if last_restart_defer
+                        .map(|t| now.duration_since(t) >= restart_defer_interval)
+                        .unwrap_or(true)
+                    {
+                        last_restart_defer = Some(now);
+                        let msg = format!(
+                            "restart deferred: buffer_ready={} wake_pending={} in_flight={}",
+                            buffer_ready, wake_pending, in_flight
+                        );
+                        eprintln!("{msg}");
+                        log_run_event(&save_root, &msg);
+                    }
+                }
+            }
 
             let media_url_snapshot = {
                 let guard = media_url
@@ -486,37 +712,46 @@ impl AutoClip {
                     .expect("media url lock poisoned while fetching playlist");
                 guard.clone()
             };
-            let playlist = match hls.fetch_media(media_url_snapshot.as_str()).await {
+            let headers_snapshot = {
+                let guard = media_headers
+                    .lock()
+                    .expect("media headers lock poisoned while fetching playlist");
+                guard.clone()
+            };
+            let playlist = match hls
+                .fetch_media_with_headers(media_url_snapshot.as_str(), &headers_snapshot)
+                .await
+            {
                 Ok(p) => p,
                 Err(err) => {
                     if is_http_status(&err, StatusCode::FORBIDDEN) {
-                        eprintln!("media playlist returned 403; refreshing via headless");
-                        match hls.refresh_media_url_from_page_headless(page_url).await {
+                        let reason = "media playlist returned 403; refreshing via headless";
+                        match refresh_media_source(
+                            &hls,
+                            page_url,
+                            &media_url,
+                            &media_headers,
+                            &mut seen,
+                            whisper_isolate,
+                            self.config.use_mic_for_wake,
+                            &worker_media_url_path,
+                            reason,
+                        )
+                        .await
+                        {
                             Ok(new_url) => {
-                            let mut guard = media_url
-                                .lock()
-                                .expect("media url lock poisoned while refreshing");
-                            *guard = new_url.clone();
-                            seen.clear();
-                            if whisper_isolate && !self.config.use_mic_for_wake {
-                                if let Err(err) =
-                                    write_media_url_file(&worker_media_url_path, &new_url)
-                                {
-                                    eprintln!(
-                                        "whisper worker: failed to write media url: {err:#}"
-                                    );
-                                }
+                                media_url_last_refresh = Instant::now();
+                                media_url_expires_at = signed_url_expiry(&new_url);
+                                continue 'stream_loop;
                             }
-                            eprintln!("refreshed variant: {}", new_url);
-                            continue 'stream_loop;
-                        }
                             Err(refresh_err) => {
                                 eprintln!("headless refresh failed: {refresh_err:#}");
                             }
                         }
                     }
                     eprintln!("failed to fetch media playlist: {err:#}; retrying");
-                    sleep(Duration::from_millis(800)).await;
+                    error_backoff = bump_backoff(error_backoff);
+                    sleep(error_backoff).await;
                     continue;
                 }
             };
@@ -529,7 +764,14 @@ impl AutoClip {
                     continue;
                 }
 
-                match hls.fetch_segment_from_playlist(&media_url_snapshot, &uri).await {
+                match hls
+                    .fetch_segment_from_playlist_with_headers(
+                        &media_url_snapshot,
+                        &uri,
+                        &headers_snapshot,
+                    )
+                    .await
+                {
                     Ok(bytes) => {
                         let seg_dur_playlist = Duration::from_secs_f32(seg.duration as f32);
                         let seg_dur = choose_segment_duration(
@@ -537,29 +779,29 @@ impl AutoClip {
                             seg_dur_playlist,
                         );
                         buffer.push(bytes, seg_dur);
+                        last_progress_at = Instant::now();
                         stream_time = stream_time.saturating_add(seg_dur);
                         made_progress = true;
                     }
                     Err(err) => {
                         if is_http_status(&err, StatusCode::FORBIDDEN) {
-                            eprintln!("segment fetch returned 403; refreshing via headless");
-                            match hls.refresh_media_url_from_page_headless(page_url).await {
+                            let reason = "segment fetch returned 403; refreshing via headless";
+                            match refresh_media_source(
+                                &hls,
+                                page_url,
+                                &media_url,
+                                &media_headers,
+                                &mut seen,
+                                whisper_isolate,
+                                self.config.use_mic_for_wake,
+                                &worker_media_url_path,
+                                reason,
+                            )
+                            .await
+                            {
                                 Ok(new_url) => {
-                                    let mut guard = media_url
-                                        .lock()
-                                        .expect("media url lock poisoned while refreshing");
-                                    *guard = new_url;
-                                    seen.clear();
-                                    if whisper_isolate && !self.config.use_mic_for_wake {
-                                        if let Err(err) = write_media_url_file(
-                                            &worker_media_url_path,
-                                            &*guard,
-                                        ) {
-                                            eprintln!(
-                                                "whisper worker: failed to write media url: {err:#}"
-                                            );
-                                        }
-                                    }
+                                    media_url_last_refresh = Instant::now();
+                                    media_url_expires_at = signed_url_expiry(&new_url);
                                     continue 'stream_loop;
                                 }
                                 Err(refresh_err) => {
@@ -568,13 +810,36 @@ impl AutoClip {
                             }
                         }
                         eprintln!("failed to fetch segment {}: {err:#}", uri);
+                        error_backoff = bump_backoff(error_backoff);
+                        sleep(error_backoff).await;
                         continue;
                     }
                 }
 
                 if fired.load(Ordering::Relaxed) && after_remaining.is_none() {
+                    let buffer_ready = buffer.total_duration() >= clip_window;
+                    if !buffer_ready {
+                        let now = Instant::now();
+                        if last_warmup_log
+                            .map(|t| now.duration_since(t) >= warmup_log_interval)
+                            .unwrap_or(true)
+                        {
+                            last_warmup_log = Some(now);
+                            let msg = format!(
+                                "wake detected while buffer warming: {:.1}/{:.1}s; clip will be shorter",
+                                buffer.total_duration().as_secs_f32(),
+                                clip_window.as_secs_f32()
+                            );
+                            eprintln!("{msg}");
+                            log_run_event(&save_root, &msg);
+                        }
+                    }
                     if refractory_until.map(|t| Instant::now() < t).unwrap_or(false) {
                         // Ignore rapid re-triggers until cooldown expires.
+                        log_run_event(&save_root, "wake detected during refractory; ignoring");
+                        if let Some(wake_id) = active_wake_id {
+                            log_wake_event(&save_root, wake_id, "wake_refractory", json!({}));
+                        }
                         continue;
                     }
                     let detect_ns_val = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
@@ -598,11 +863,38 @@ impl AutoClip {
                     let latency = Instant::now().saturating_duration_since(detected_instant);
                     detect_stream_time = Some(stream_time.saturating_sub(age_audio));
                     after_remaining = Some(after_tail);
+                    let wake_id = match active_wake_id {
+                        Some(id) => id,
+                        None => {
+                            wake_counter += 1;
+                            active_wake_id = Some(wake_counter);
+                            wake_counter
+                        }
+                    };
                     println!(
                         "wake detected; capturing tail to place wake at 50s into clip (latency ~{:.1}s, buffer ~{:.1}s, cooldown {:?})",
                         latency.as_secs_f32(),
                         buffer_window.as_secs_f32(),
                         refractory
+                    );
+                    log_run_event(
+                        &save_root,
+                        &format!(
+                            "wake detected: latency={:.1}s buffer={:.1}s cooldown_secs={:.1}",
+                            latency.as_secs_f32(),
+                            buffer_window.as_secs_f32(),
+                            refractory.as_secs_f32()
+                        ),
+                    );
+                    log_wake_event(
+                        &save_root,
+                        wake_id,
+                        "wake_detected",
+                        json!({
+                            "latency_secs": latency.as_secs_f32(),
+                            "buffer_secs": buffer_window.as_secs_f32(),
+                            "cooldown_secs": refractory.as_secs_f32(),
+                        }),
                     );
                 }
 
@@ -653,6 +945,32 @@ impl AutoClip {
                         snap_len.as_secs_f32(),
                         clip_len.as_secs_f32()
                     );
+                    log_run_event(
+                        &save_root,
+                        &format!(
+                            "wake clip timing: output={} detect_offset_secs={:.3} start_offset_secs={:.3} snap_len_secs={:.3} clip_len_secs={:.3}",
+                            output_path.display(),
+                            detect_offset.as_secs_f32(),
+                            start_offset.as_secs_f32(),
+                            snap_len.as_secs_f32(),
+                            clip_len.as_secs_f32()
+                        ),
+                    );
+                    let wake_id = active_wake_id.unwrap_or(0);
+                    if wake_id > 0 {
+                        log_wake_event(
+                            &save_root,
+                            wake_id,
+                            "wake_clip_timing",
+                            json!({
+                                "output": output_path.display().to_string(),
+                                "detect_offset_secs": detect_offset.as_secs_f32(),
+                                "start_offset_secs": start_offset.as_secs_f32(),
+                                "snap_len_secs": snap_len.as_secs_f32(),
+                                "clip_len_secs": clip_len.as_secs_f32(),
+                            }),
+                        );
+                    }
                     let (out_w, out_h) = parse_resolution(&resolution).unwrap_or((1080, 1920));
                     let clip_start = if start_offset > Duration::ZERO {
                         Some(start_offset.as_secs_f32())
@@ -665,9 +983,57 @@ impl AutoClip {
                             "wake detected; skipping clip save (SKIP_CLIP_SAVE=1) duration ~{:.1}s",
                             clip_len.as_secs_f32()
                         );
+                        log_run_event(
+                            &save_root,
+                            &format!(
+                                "wake clip skipped (SKIP_CLIP_SAVE=1) duration_secs={:.1}",
+                                clip_len.as_secs_f32()
+                            ),
+                        );
+                        if wake_id > 0 {
+                            log_wake_event(
+                                &save_root,
+                                wake_id,
+                                "wake_clip_skipped",
+                                json!({ "duration_secs": clip_len.as_secs_f32() }),
+                            );
+                        }
                     } else {
+                        let save_root_for_log = save_root.clone();
+                        let save_root_for_handle = save_root_for_log.clone();
+                        let wake_id_for_log = wake_id;
+                        let render_duration = clip_len.as_secs_f32();
+                        let render_start = clip_start;
                         let save_future = async move {
                             fs::write(&ts_path, &snapshot).context("writing buffered TS snapshot")?;
+                            log_run_event(
+                                &save_root_for_log,
+                                &format!(
+                                    "wake clip: wrote ts snapshot {} (secs={:.1})",
+                                    ts_path.display(),
+                                    snap_len.as_secs_f32()
+                                ),
+                            );
+                            if wake_id_for_log > 0 {
+                                log_wake_event(
+                                    &save_root_for_log,
+                                    wake_id_for_log,
+                                    "wake_ts_written",
+                                    json!({
+                                        "path": ts_path.display().to_string(),
+                                        "secs": snap_len.as_secs_f32(),
+                                    }),
+                                );
+                            }
+                            log_run_event(
+                                &save_root_for_log,
+                                &format!(
+                                    "wake clip render start: output={} duration_secs={:.1} start_offset={:.3}",
+                                    output_path.display(),
+                                    render_duration,
+                                    render_start.unwrap_or(0.0)
+                                ),
+                            );
                             run_ffmpeg_from_file(
                                 &ts_path,
                                 &output_path,
@@ -682,6 +1048,13 @@ impl AutoClip {
                                 }),
                             )
                             .await?;
+                            log_run_event(
+                                &save_root_for_log,
+                                &format!(
+                                    "wake clip render done: output={} exit_code=0",
+                                    output_path.display()
+                                ),
+                            );
                             let detected_at = last_detect_instant.map(|t| t.elapsed().as_secs_f32());
                             println!(
                                 "wrote wakeword clip: {} (duration ~{:.1}s) | wake at ~50.0s into clip | detect_elapsed_since_save_start={:?}",
@@ -689,12 +1062,43 @@ impl AutoClip {
                                 clip_len.as_secs_f32(),
                                 detected_at
                             );
+                            log_run_event(
+                                &save_root_for_log,
+                                &format!(
+                                    "wake clip saved: {} duration_secs={:.1}",
+                                    output_path.display(),
+                                    clip_len.as_secs_f32()
+                                ),
+                            );
+                            if wake_id_for_log > 0 {
+                                log_wake_event(
+                                    &save_root_for_log,
+                                    wake_id_for_log,
+                                    "wake_clip_saved",
+                                    json!({
+                                        "path": output_path.display().to_string(),
+                                        "duration_secs": clip_len.as_secs_f32(),
+                                    }),
+                                );
+                            }
                             Ok::<(), anyhow::Error>(())
                         };
 
                         let handle = tokio::spawn(async move {
                             if let Err(err) = save_future.await {
                                 eprintln!("failed to persist wakeword clip: {err:#}");
+                                log_run_event(
+                                    &save_root_for_handle,
+                                    &format!("wake clip failed: {err:#}"),
+                                );
+                                if wake_id_for_log > 0 {
+                                    log_wake_event(
+                                        &save_root_for_handle,
+                                        wake_id_for_log,
+                                        "wake_clip_failed",
+                                        json!({ "error": format!("{err:#}") }),
+                                    );
+                                }
                             }
                         });
                         pending_saves.push(handle);
@@ -704,6 +1108,11 @@ impl AutoClip {
                     detect_stream_time = None;
                     fired.store(false, Ordering::Relaxed);
                     detect_ns.store(u64::MAX, Ordering::Relaxed);
+                    log_run_event(&save_root, "wake pipeline reset");
+                    if wake_id > 0 {
+                        log_wake_event(&save_root, wake_id, "wake_pipeline_reset", json!({}));
+                    }
+                    active_wake_id = None;
                     continue;
                 }
                 if !made_progress {
@@ -713,7 +1122,28 @@ impl AutoClip {
             }
 
             if fired.load(Ordering::Relaxed) && after_remaining.is_none() {
+                let buffer_ready = buffer.total_duration() >= clip_window;
+                if !buffer_ready {
+                    let now = Instant::now();
+                    if last_warmup_log
+                        .map(|t| now.duration_since(t) >= warmup_log_interval)
+                        .unwrap_or(true)
+                    {
+                        last_warmup_log = Some(now);
+                        let msg = format!(
+                            "wake detected while buffer warming: {:.1}/{:.1}s; clip will be shorter",
+                            buffer.total_duration().as_secs_f32(),
+                            clip_window.as_secs_f32()
+                        );
+                        eprintln!("{msg}");
+                        log_run_event(&save_root, &msg);
+                    }
+                }
                 if refractory_until.map(|t| Instant::now() < t).unwrap_or(false) {
+                    log_run_event(&save_root, "wake detected during refractory; ignoring");
+                    if let Some(wake_id) = active_wake_id {
+                        log_wake_event(&save_root, wake_id, "wake_refractory", json!({}));
+                    }
                     continue;
                 }
                 let detect_ns_val = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
@@ -734,22 +1164,51 @@ impl AutoClip {
                 };
                 last_detect_instant = Some(detected_instant);
                 let latency = Instant::now().saturating_duration_since(detected_instant);
+                let wake_id = match active_wake_id {
+                    Some(id) => id,
+                    None => {
+                        wake_counter += 1;
+                        active_wake_id = Some(wake_counter);
+                        wake_counter
+                    }
+                };
                 println!(
                     "wake detected; capturing tail to place wake at 50s into clip (latency ~{:.1}s, buffer ~{:.1}s, cooldown {:?})",
                     latency.as_secs_f32(),
                     buffer_window.as_secs_f32(),
                     refractory
                 );
+                log_run_event(
+                    &save_root,
+                    &format!(
+                        "wake detected: latency={:.1}s buffer={:.1}s cooldown_secs={:.1}",
+                        latency.as_secs_f32(),
+                        buffer_window.as_secs_f32(),
+                        refractory.as_secs_f32()
+                    ),
+                );
+                log_wake_event(
+                    &save_root,
+                    wake_id,
+                    "wake_detected",
+                    json!({
+                        "latency_secs": latency.as_secs_f32(),
+                        "buffer_secs": buffer_window.as_secs_f32(),
+                        "cooldown_secs": refractory.as_secs_f32(),
+                    }),
+                );
                 // Wake fired but we have not yet started counting; ensure we do.
                 after_remaining = Some(after_tail);
+            }
+
+            if made_progress {
+                error_backoff = Duration::ZERO;
             }
 
             sleep(poll_interval).await;
         }
 
-        if let Some(mut worker) = _whisper_worker {
-            let _ = worker.kill();
-        }
+        kill_child_and_wait(&whisper_worker);
 
         if !pending_saves.is_empty() {
             eprintln!(
@@ -784,19 +1243,81 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn write_wake_worker_status(path: &Path, status: &WakeWorkerStatus) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    let payload = serde_json::to_string(status).context("serializing wake status")?;
+fn log_run_event(save_root: &str, message: &str) {
+    let base = if save_root.trim().is_empty() {
+        Path::new(".")
+    } else {
+        Path::new(save_root)
+    };
+    let path = base.join("autoclip_run.log");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "[{}] {}", now_unix_ms(), message);
+    }
+}
+
+fn log_wake_event(save_root: &str, wake_id: u64, event: &str, fields: Value) {
+    let base = if save_root.trim().is_empty() {
+        Path::new(".")
+    } else {
+        Path::new(save_root)
+    };
+    let dir = base.join("_debug");
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join(format!("wake_{wake_id:04}.jsonl"));
+    let mut obj = match fields {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("wake_id".to_string(), Value::from(wake_id));
+    obj.insert("event".to_string(), Value::from(event));
+    obj.insert("ts_ms".to_string(), Value::from(now_unix_ms()));
+    if let Ok(line) = serde_json::to_string(&Value::Object(obj)) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+fn write_atomic_file(path: &Path, payload: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let tmp_ext = format!("tmp{}", std::process::id());
+    let tmp = path.with_extension(tmp_ext);
     fs::write(&tmp, payload).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("renaming {}", path.display()))?;
-    Ok(())
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::write(path, payload).with_context(|| format!("writing {}", path.display()))?;
+            let _ = fs::remove_file(&tmp);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err).with_context(|| format!("renaming {}", path.display()))
+        }
+    }
+}
+
+fn write_wake_worker_status(path: &Path, status: &WakeWorkerStatus) -> Result<()> {
+    let payload = serde_json::to_vec(status).context("serializing wake status")?;
+    write_atomic_file(path, &payload)
 }
 
 fn write_media_url_file(path: &Path, url: &Url) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, url.as_str()).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("renaming {}", path.display()))?;
-    Ok(())
+    write_atomic_file(path, url.as_str().as_bytes())
 }
 
 fn whisper_isolate_enabled() -> bool {
@@ -806,29 +1327,35 @@ fn whisper_isolate_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn whisper_worker_status_path() -> PathBuf {
+fn whisper_worker_status_path(save_root: &str) -> PathBuf {
     std::env::var("WHISPER_WORKER_STATUS_PATH")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".whisper_wake_status.json")
+            let base = if save_root.trim().is_empty() {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            } else {
+                PathBuf::from(save_root)
+            };
+            base.join(".whisper_wake_status.json")
         })
 }
 
-fn whisper_worker_media_url_path() -> PathBuf {
+fn whisper_worker_media_url_path(save_root: &str) -> PathBuf {
     std::env::var("WHISPER_WORKER_MEDIA_URL_PATH")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".whisper_wake_media_url.txt")
+            let base = if save_root.trim().is_empty() {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            } else {
+                PathBuf::from(save_root)
+            };
+            base.join(".whisper_wake_media_url.txt")
         })
 }
 
@@ -918,6 +1445,8 @@ fn spawn_wake_status_writer(
 fn spawn_wake_status_reader(
     path: PathBuf,
     poll: Duration,
+    min_updated_unix_ms: u64,
+    last_status_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
     detect_ns: Arc<AtomicU64>,
@@ -925,7 +1454,7 @@ fn spawn_wake_status_reader(
     last_word_ns: Arc<AtomicU64>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut last_seen_ms = 0u64;
+        let mut last_seen_ms = min_updated_unix_ms;
         while !stop.load(Ordering::Relaxed) {
             if fired.load(Ordering::Relaxed) {
                 break;
@@ -933,8 +1462,13 @@ fn spawn_wake_status_reader(
             match fs::read_to_string(&path) {
                 Ok(contents) => {
                     if let Ok(status) = serde_json::from_str::<WakeWorkerStatus>(&contents) {
+                        if status.updated_unix_ms < min_updated_unix_ms {
+                            std::thread::sleep(poll);
+                            continue;
+                        }
                         if status.updated_unix_ms >= last_seen_ms {
                             last_seen_ms = status.updated_unix_ms;
+                            last_status_ms.store(status.updated_unix_ms, Ordering::Relaxed);
                             detect_ns.store(status.detect_ns, Ordering::Relaxed);
                             audio_ns.store(status.audio_ns, Ordering::Relaxed);
                             last_word_ns.store(status.last_word_ns, Ordering::Relaxed);
@@ -1228,6 +1762,23 @@ fn is_http_status(err: &anyhow::Error, status: StatusCode) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct StreamHeaders {
+    pub referer: Option<String>,
+    pub origin: Option<String>,
+    pub cookie: Option<String>,
+}
+
+impl StreamHeaders {
+    fn for_page(page_url: &str, origin: Option<String>, cookie: Option<String>) -> Self {
+        Self {
+            referer: Some(page_url.to_string()),
+            origin,
+            cookie,
+        }
+    }
+}
+
 fn collect_env_cookies() -> Option<String> {
     let mut cookie_parts: Vec<String> = Vec::new();
     for key in ["COOKIE_HEADER", "KICK_COOKIE", "TIKTOK_COOKIE", "TWITCH_COOKIE"] {
@@ -1304,9 +1855,13 @@ impl HlsClient {
     /// COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE / TWITCH_COOKIE if present. If
     /// M3U8_URL_OVERRIDE is set, use
     /// that master URL directly instead of headless extraction.
-    pub async fn fetch_master_from_page(&self, page_url: &str) -> Result<(String, MasterPlaylist)> {
+    pub async fn fetch_master_from_page_with_headers(
+        &self,
+        page_url: &str,
+    ) -> Result<(String, MasterPlaylist, StreamHeaders)> {
         let env_cookie = collect_env_cookies();
         let origin = origin_for_page(page_url).unwrap_or_else(|| "https://kick.com".to_string());
+        let base_headers = StreamHeaders::for_page(page_url, Some(origin.clone()), env_cookie.clone());
 
         let is_tiktok = page_url.contains("tiktok.com");
         let is_twitch = page_url.contains("twitch.tv");
@@ -1314,32 +1869,61 @@ impl HlsClient {
 
         if let Ok(override_url) = std::env::var("M3U8_URL_OVERRIDE") {
             let master = self
-                .fetch_master_with_headers(&override_url, Some(page_url), Some(&origin), env_cookie.as_deref())
+                .fetch_master_with_headers(
+                    &override_url,
+                    base_headers.referer.as_deref(),
+                    base_headers.origin.as_deref(),
+                    base_headers.cookie.as_deref(),
+                )
                 .await?;
-            return Ok((override_url, master));
+            return Ok((override_url, master, base_headers));
         }
 
         if is_tiktok {
-            if let Some(res) = self
+            if let Some((url, master)) = self
                 .try_fetch_tiktok_master(page_url, env_cookie.as_deref())
                 .await?
             {
-                return Ok(res);
+                return Ok((url, master, base_headers));
             }
             eprintln!("TikTok HTTP discovery failed or stream offline; falling back to headless");
         }
         if is_twitch {
-            if let Some(res) = self
+            if let Some((url, master)) = self
                 .try_fetch_twitch_master(page_url, env_cookie.as_deref())
                 .await?
             {
-                return Ok(res);
+                return Ok((url, master, base_headers));
             }
             eprintln!("Twitch HTTP discovery failed or stream offline; falling back to headless");
         }
 
-        self.fetch_master_with_headless(page_url, env_cookie.as_deref(), &headless_script)
-            .await
+        self.fetch_master_with_headless_with_headers(
+            page_url,
+            env_cookie.as_deref(),
+            &headless_script,
+        )
+        .await
+    }
+
+    pub async fn fetch_master_from_page(&self, page_url: &str) -> Result<(String, MasterPlaylist)> {
+        let (master_url, master, _headers) = self.fetch_master_from_page_with_headers(page_url).await?;
+        Ok((master_url, master))
+    }
+
+    /// Force a headless discovery pass to refresh the master playlist + headers.
+    pub async fn fetch_master_from_page_headless_with_headers(
+        &self,
+        page_url: &str,
+    ) -> Result<(String, MasterPlaylist, StreamHeaders)> {
+        let env_cookie = collect_env_cookies();
+        let headless_script = headless_script_for_page(page_url);
+        self.fetch_master_with_headless_with_headers(
+            page_url,
+            env_cookie.as_deref(),
+            &headless_script,
+        )
+        .await
     }
 
     /// Force a headless discovery pass to refresh the master playlist.
@@ -1347,10 +1931,9 @@ impl HlsClient {
         &self,
         page_url: &str,
     ) -> Result<(String, MasterPlaylist)> {
-        let env_cookie = collect_env_cookies();
-        let headless_script = headless_script_for_page(page_url);
-        self.fetch_master_with_headless(page_url, env_cookie.as_deref(), &headless_script)
-            .await
+        let (master_url, master, _headers) =
+            self.fetch_master_from_page_headless_with_headers(page_url).await?;
+        Ok((master_url, master))
     }
 
     /// Use a headless browser (Node + Playwright script) to capture an m3u8 URL.
@@ -1360,6 +1943,18 @@ impl HlsClient {
         cookie_env: Option<&str>,
         script_path: &str,
     ) -> Result<(String, MasterPlaylist)> {
+        let (master_url, master, _headers) = self
+            .fetch_master_with_headless_with_headers(page_url, cookie_env, script_path)
+            .await?;
+        Ok((master_url, master))
+    }
+
+    async fn fetch_master_with_headless_with_headers(
+        &self,
+        page_url: &str,
+        cookie_env: Option<&str>,
+        script_path: &str,
+    ) -> Result<(String, MasterPlaylist, StreamHeaders)> {
         let output = Command::new("node")
             .arg(script_path)
             .arg(page_url)
@@ -1418,7 +2013,8 @@ impl HlsClient {
             .await?;
 
         let parsed = self.parse_master_or_media(&m3u8_url, &body)?;
-        Ok((m3u8_url, parsed))
+        let headers = StreamHeaders::for_page(page_url, origin, combined_cookie);
+        Ok((m3u8_url, parsed, headers))
     }
 
     async fn try_fetch_tiktok_master(
@@ -1725,10 +2321,38 @@ impl HlsClient {
         Ok(parsed)
     }
 
+    pub async fn fetch_media_with_headers(
+        &self,
+        url: &str,
+        headers: &StreamHeaders,
+    ) -> Result<MediaPlaylist> {
+        let body = self
+            .fetch_bytes_with_headers(
+                url,
+                headers.referer.as_deref(),
+                headers.origin.as_deref(),
+                headers.cookie.as_deref(),
+            )
+            .await?;
+        let parsed = m3u8_rs::parse_media_playlist_res(&body)
+            .map_err(|e| anyhow::anyhow!("failed to parse media playlist: {e}"))?;
+        Ok(parsed)
+    }
+
     /// Refresh the best variant URL from a page using headless discovery.
     pub async fn refresh_media_url_from_page_headless(&self, page_url: &str) -> Result<Url> {
         let (master_url, master) = self.fetch_master_from_page_headless(page_url).await?;
         self.highest_variant_url(&master_url, &master)
+    }
+
+    pub async fn refresh_media_url_from_page_headless_with_headers(
+        &self,
+        page_url: &str,
+    ) -> Result<(Url, StreamHeaders)> {
+        let (master_url, master, headers) =
+            self.fetch_master_from_page_headless_with_headers(page_url).await?;
+        let media_url = self.highest_variant_url(&master_url, &master)?;
+        Ok((media_url, headers))
     }
 
     /// Fetch the first media segment bytes from a media playlist URL.
@@ -1758,6 +2382,24 @@ impl HlsClient {
             .join(segment_uri)
             .context("joining segment url")?;
         self.fetch_bytes(segment_url.as_str()).await
+    }
+
+    pub async fn fetch_segment_from_playlist_with_headers(
+        &self,
+        playlist_url: &Url,
+        segment_uri: &str,
+        headers: &StreamHeaders,
+    ) -> Result<Vec<u8>> {
+        let segment_url = playlist_url
+            .join(segment_uri)
+            .context("joining segment url")?;
+        self.fetch_bytes_with_headers(
+            segment_url.as_str(),
+            headers.referer.as_deref(),
+            headers.origin.as_deref(),
+            headers.cookie.as_deref(),
+        )
+        .await
     }
 
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
@@ -2259,6 +2901,45 @@ fn sanitize_m3u8_url(raw: &str) -> String {
         .to_string()
 }
 
+fn signed_url_expiry(url: &Url) -> Option<SystemTime> {
+    let mut best: Option<SystemTime> = None;
+    for (key, value) in url.query_pairs() {
+        let key = key.to_ascii_lowercase();
+        let key = key.as_str();
+        let is_exp = matches!(
+            key,
+            "exp"
+                | "expires"
+                | "expire"
+                | "expiry"
+                | "token_exp"
+                | "hdntl_exp"
+                | "hls_exp"
+                | "sig_exp"
+        ) || key.ends_with("_exp");
+        if !is_exp {
+            continue;
+        }
+        let raw = value.trim();
+        if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let mut secs = match raw.parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if secs > 1_000_000_000_000 {
+            secs /= 1000;
+        }
+        if secs > 10_000_000_000 {
+            secs /= 1000;
+        }
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        best = Some(best.map_or(ts, |prev| prev.min(ts)));
+    }
+    best
+}
+
 fn origin_for_page(page_url: &str) -> Option<String> {
     if let Ok(u) = Url::parse(page_url) {
         if let Some(host) = u.host_str() {
@@ -2607,18 +3288,45 @@ fn is_hw_encoder(encoder: &str) -> bool {
         || enc.contains("vaapi")
 }
 
+fn extract_output_index(stem: &str, stub: &str) -> Option<u32> {
+    let prefix = format!("{stub}_");
+    let rest = stem.strip_prefix(&prefix)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok()
+}
+
 fn next_output_path(save_dir: &str, stub: &str) -> Result<PathBuf> {
     let dir = Path::new(save_dir);
     fs::create_dir_all(dir).with_context(|| format!("creating save dir {save_dir}"))?;
 
-    let mut idx = 1;
-    loop {
-        let candidate = dir.join(format!("{stub}_{idx:03}.mp4"));
-        if !candidate.exists() {
-            return Ok(candidate);
+    let counter_path = dir.join(format!(".{stub}_counter"));
+    let counter_idx = fs::read_to_string(&counter_path)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let mut max_idx = counter_idx;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|v| v.to_str()).unwrap_or("") != "mp4" {
+                continue;
+            }
+            let stem = path.file_stem().and_then(|v| v.to_str()).unwrap_or("");
+            if let Some(idx) = extract_output_index(stem, stub) {
+                if idx > max_idx {
+                    max_idx = idx;
+                }
+            }
         }
-        idx += 1;
     }
+    let next_idx = max_idx.saturating_add(1).max(1);
+    let payload = format!("{next_idx}\n");
+    write_atomic_file(&counter_path, payload.as_bytes())
+        .with_context(|| format!("writing {}", counter_path.display()))?;
+    Ok(dir.join(format!("{stub}_{next_idx:03}.mp4")))
 }
 
 async fn run_ffmpeg_30s(input_hls: &Url, out_path: &Path, out_w: u32, out_h: u32) -> Result<()> {
@@ -2632,6 +3340,7 @@ async fn run_ffmpeg_30s(input_hls: &Url, out_path: &Path, out_w: u32, out_h: u32
         false,
         false,
         None,
+        false,
     )
     .await
 }
@@ -2708,6 +3417,7 @@ async fn run_ffmpeg_from_file(
         }
     }
     let start_offset = if start_secs > 0.0 { Some(start_secs) } else { None };
+    let live_fast = timing.is_some() && live_fast_enabled();
     run_ffmpeg_internal(
         input_path
             .to_str()
@@ -2720,6 +3430,7 @@ async fn run_ffmpeg_from_file(
         true,
         true,
         None,
+        live_fast,
     )
     .await
 }
@@ -2909,6 +3620,87 @@ fn ensure_live_detect_budgets() {
     }
 }
 
+struct LiveLayoutCache {
+    updated_at: Instant,
+    hints: ClipLayoutHints,
+}
+
+fn live_fast_enabled() -> bool {
+    std::env::var("CLIP_LIVE_FAST")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(true)
+}
+
+fn live_layout_cache_ttl() -> Duration {
+    let secs = std::env::var("CLIP_LIVE_LAYOUT_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120);
+    Duration::from_secs(secs)
+}
+
+fn live_layout_cache_state() -> &'static Mutex<Option<LiveLayoutCache>> {
+    static CACHE: OnceLock<Mutex<Option<LiveLayoutCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn take_live_layout_cache() -> Option<ClipLayoutHints> {
+    let ttl = live_layout_cache_ttl();
+    if ttl == Duration::ZERO {
+        return None;
+    }
+    let mut guard = live_layout_cache_state().lock().ok()?;
+    if let Some(cache) = guard.as_ref() {
+        if cache.updated_at.elapsed() <= ttl {
+            return Some(cache.hints.clone());
+        }
+    }
+    *guard = None;
+    None
+}
+
+fn update_live_layout_cache(hints: &ClipLayoutHints) {
+    let ttl = live_layout_cache_ttl();
+    if ttl == Duration::ZERO {
+        return;
+    }
+    if let Ok(mut guard) = live_layout_cache_state().lock() {
+        *guard = Some(LiveLayoutCache {
+            updated_at: Instant::now(),
+            hints: hints.clone(),
+        });
+    }
+}
+
+fn merge_layout_hints(target: &mut ClipLayoutHints, cached: &ClipLayoutHints) {
+    if target.face_box.is_none() {
+        target.face_box = cached.face_box;
+    }
+    if target.face_track.is_none() {
+        target.face_track = cached.face_track.clone();
+    }
+    if target.face_region.is_none() {
+        target.face_region = cached.face_region;
+    }
+    if target.face_frame_spec.is_none() {
+        target.face_frame_spec = cached.face_frame_spec;
+    }
+    if target.game_center.is_none() {
+        target.game_center = cached.game_center;
+    }
+    if target.game_region.is_none() {
+        target.game_region = cached.game_region;
+    }
+}
+
+fn min_duration(current: Option<Duration>, max: Duration) -> Duration {
+    match current {
+        Some(val) if val < max => val,
+        _ => max,
+    }
+}
+
 fn gameplay_enabled() -> bool {
     std::env::var("CLIP_GAMEPLAY")
         .ok()
@@ -2999,6 +3791,29 @@ fn closed_captions_enabled() -> bool {
         .ok()
         .and_then(|v| parse_bool(&v))
         .unwrap_or(false)
+}
+
+static LLM_BACKOFF_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn llm_backoff_secs() -> u64 {
+    std::env::var("CLIP_LLM_BACKOFF_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120)
+}
+
+fn llm_backoff_active() -> bool {
+    let until = LLM_BACKOFF_UNTIL_MS.load(Ordering::Relaxed);
+    until > now_unix_ms()
+}
+
+fn note_llm_failure() {
+    let secs = llm_backoff_secs();
+    if secs == 0 {
+        return;
+    }
+    let until = now_unix_ms().saturating_add(secs.saturating_mul(1000));
+    LLM_BACKOFF_UNTIL_MS.store(until, Ordering::Relaxed);
 }
 
 fn llm_enabled() -> bool {
@@ -3104,6 +3919,9 @@ fn read_llm_config() -> Option<LlmConfig> {
     if !llm_enabled() {
         return None;
     }
+    if llm_backoff_active() {
+        return None;
+    }
     let endpoint = std::env::var("CLIP_LLM_ENDPOINT")
         .ok()
         .map(|v| v.trim().to_string())
@@ -3114,7 +3932,7 @@ fn read_llm_config() -> Option<LlmConfig> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| {
-            "C:\\Users\\Rashi\\.cache\\lm-studio\\models\\bartowski\\gemma-2-9b-it-GGUF\\gemma-2-9b-it-Q8_0_L.gguf"
+            "gemma-2-2b-it"
                 .to_string()
         });
     let temperature = std::env::var("CLIP_LLM_TEMPERATURE")
@@ -3303,15 +4121,22 @@ based only on the transcript.",
         .timeout(cfg.timeout)
         .build()
         .context("building LLM client")?;
-    let resp = client
+    let resp = match client
         .post(&cfg.endpoint)
         .json(&payload)
         .send()
         .await
-        .context("LLM request failed")?;
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            note_llm_failure();
+            return Err(err).context("LLM request failed");
+        }
+    };
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
+        note_llm_failure();
         anyhow::bail!("LLM error {}: {}", status, truncate_str(&body, 400));
     }
     let content = match parse_llm_content(&body) {
@@ -3965,6 +4790,7 @@ async fn run_ffmpeg_internal(
     regen_pts: bool,
     force_ts_input: bool,
     progress: Option<ProgressSpec>,
+    live_fast: bool,
 ) -> Result<()> {
     let _span = profile_span("ffmpeg: encode");
     let (mut video_encoder, mut is_nvenc, mut is_hw, _encoder_forced) = ffmpeg_video_encoder();
@@ -3987,6 +4813,12 @@ async fn run_ffmpeg_internal(
     }
     let layout = read_clip_layout_config();
     let mut layout_hints = read_clip_layout_hints();
+    if live_fast {
+        if let Some(cached) = take_live_layout_cache() {
+            merge_layout_hints(&mut layout_hints, &cached);
+            eprintln!("live render: using cached layout hints");
+        }
+    }
     let mut layout_is_stacked = matches!(layout.mode, ClipLayoutMode::Stacked);
     let mut face_only = false;
     let mut fullscreen_fill = false;
@@ -3998,14 +4830,30 @@ async fn run_ffmpeg_internal(
         y: (rect.y + rect.h / 2.0).clamp(0.0, 1.0),
     };
     if layout_is_stacked {
-        let detect_cfg = read_clip_detect_config();
+        let mut detect_cfg = read_clip_detect_config();
         let need_face = layout.face_crop.is_none() && layout_hints.face_box.is_none();
         let user_game_center = layout_hints.game_center;
         let user_game_region = layout_hints.game_region;
-        let need_gameplay = user_game_center.is_none();
+        if live_fast && user_game_center.is_none() {
+            layout_hints.game_center = Some(NormalizedPoint { x: 0.5, y: 0.5 });
+        }
+        let need_gameplay = user_game_center.is_none() && !live_fast;
+        if live_fast {
+            detect_cfg.sample_count = detect_cfg.sample_count.min(2);
+            detect_cfg.scan_full_clip = false;
+            detect_cfg.track_face = false;
+            detect_cfg.face_track_step_secs = None;
+            detect_cfg.face_budget_override =
+                Some(min_duration(detect_cfg.face_budget_override, Duration::from_secs(6)));
+            detect_cfg.analysis_budget =
+                Some(min_duration(detect_cfg.analysis_budget, Duration::from_secs(8)));
+        }
         if detect_cfg.enabled && (need_face || need_gameplay) {
             match detect_layout_hints(input, &detect_cfg).await {
                 Ok(detected) => {
+                    if live_fast {
+                        update_live_layout_cache(&detected);
+                    }
                     if need_face {
                         if let Some(face) = detected.face_box {
                             layout_hints.face_box = Some(face);
@@ -4096,9 +4944,16 @@ async fn run_ffmpeg_internal(
     } else {
         None
     };
-    let caption_cfg = read_caption_config(out_h);
-    let llm_cfg = read_llm_config();
-    let closed_captions = closed_captions_enabled();
+    let caption_cfg = if live_fast {
+        None
+    } else {
+        read_caption_config(out_h)
+    };
+    let llm_cfg = if live_fast { None } else { read_llm_config() };
+    let closed_captions = if live_fast { false } else { closed_captions_enabled() };
+    if live_fast {
+        eprintln!("live render: skipping captions/LLM for faster clip output");
+    }
     let mut transcript: Option<TranscriptPayload> = None;
     if caption_cfg.is_some() || llm_cfg.is_some() || closed_captions {
         if duration_secs.is_none() {
@@ -4433,6 +5288,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FACE_RATIO", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_CROP", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_CONTEXT", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_ZOOM", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_BOX", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_REGION", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_ANCHOR", mode: EnvValueMode::Required },
@@ -4457,6 +5313,19 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FACE_FRAME_EYE_TOP_RATIO", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_FRAME_EYE_CHIN_RATIO", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_FRAME_SHOULDER_SCALE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FACE_MESH_MODEL", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH_MODEL_MIN_MB", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH_MODEL_MAX_MB", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH_LOAD_TIMEOUT_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH_BACKEND", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FACE_MESH_TRACT_OPT", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH_INPUT_SIZE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH_INPUT_MAX", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH_INPUT_SCALE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH_REGION_SCALE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH_HEADROOM", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_MESH_DEBUG", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_POSE", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_POSE_MODEL", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_POSE_MODEL_MIN_MB", mode: EnvValueMode::Required },
@@ -4499,6 +5368,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_LLM_MODEL", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_LLM_TEMPERATURE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_LLM_TIMEOUT_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_LLM_BACKOFF_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_LLM_MAX_TRANSCRIPT_CHARS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_LLM_TITLE_MAX_CHARS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_LLM_DESCRIPTION_MAX_CHARS", mode: EnvValueMode::Required },
@@ -4518,9 +5388,13 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_REGION_DETECT", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_LIVE_CONFIG", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_LIVE_CONFIG_POLL_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_LIVE_FAST", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_LIVE_LAYOUT_TTL_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_STREAMS_FILE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_STREAMS_POLL_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_STREAMS_MAX_CONCURRENT", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_M3U8_REFRESH_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_STREAM_OFFLINE_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_WAKE_WORDS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_PROFILE", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_EMOTION_ENABLE", mode: EnvValueMode::Optional },
@@ -4566,6 +5440,8 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "TWITCH_AUTH_TOKEN", mode: EnvValueMode::Required },
     EnvSpec { env: "WAKE_REFRACTORY_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "WAKE_BUFFER_HEADROOM_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "WAKE_BUFFER_RESTART_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "WAKE_NO_WORDS_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "WAKE_FF_AF", mode: EnvValueMode::Required },
     EnvSpec { env: "SKIP_CLIP_SAVE", mode: EnvValueMode::Optional },
     EnvSpec { env: "MIC_DEVICE", mode: EnvValueMode::Required },
@@ -4845,7 +5721,152 @@ fn read_streams_max_concurrent() -> usize {
         .unwrap_or(1)
 }
 
-fn spawn_ctrl_c_handler(stop: Arc<AtomicBool>) {
+fn read_wake_buffer_restart_secs() -> Option<Duration> {
+    let raw = std::env::var("WAKE_BUFFER_RESTART_SECS").ok();
+    let parsed = raw.as_deref().and_then(|v| v.parse::<f32>().ok());
+    let secs = match parsed {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(_) => return None,
+        None => 500.0,
+    };
+    Some(Duration::from_secs_f32(secs))
+}
+
+fn read_wake_no_words_secs() -> Option<Duration> {
+    let raw = std::env::var("WAKE_NO_WORDS_SECS").ok();
+    let parsed = raw.as_deref().and_then(|v| v.parse::<f32>().ok());
+    let secs = match parsed {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(_) => return None,
+        None => 300.0,
+    };
+    Some(Duration::from_secs_f32(secs))
+}
+
+fn read_m3u8_refresh_secs() -> Option<Duration> {
+    let raw = std::env::var("CLIP_M3U8_REFRESH_SECS").ok();
+    let parsed = raw.as_deref().and_then(|v| v.parse::<f32>().ok());
+    let secs = match parsed {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(_) => return None,
+        None => 240.0,
+    };
+    Some(Duration::from_secs_f32(secs))
+}
+
+fn read_stream_offline_secs() -> Option<Duration> {
+    let raw = std::env::var("CLIP_STREAM_OFFLINE_SECS").ok();
+    let parsed = raw.as_deref().and_then(|v| v.parse::<f32>().ok());
+    let secs = match parsed {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(_) => return None,
+        None => 120.0,
+    };
+    Some(Duration::from_secs_f32(secs))
+}
+
+fn bump_backoff(current: Duration) -> Duration {
+    let next_ms = if current.is_zero() {
+        500_u64
+    } else {
+        let doubled = current.as_millis().saturating_mul(2);
+        if doubled > u128::from(u64::MAX) {
+            u64::MAX
+        } else {
+            doubled as u64
+        }
+    };
+    let jitter_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| (d.subsec_millis() as u64) % 250)
+        .unwrap_or(0);
+    Duration::from_millis(next_ms.saturating_add(jitter_ms).min(5000))
+}
+
+async fn refresh_media_source(
+    hls: &HlsClient,
+    page_url: &str,
+    media_url: &Arc<Mutex<Url>>,
+    media_headers: &Arc<Mutex<StreamHeaders>>,
+    seen: &mut HashSet<String>,
+    whisper_isolate: bool,
+    use_mic_for_wake: bool,
+    worker_media_url_path: &Path,
+    reason: &str,
+) -> Result<Url> {
+    eprintln!("{reason}");
+    let (new_url, headers) = hls
+        .refresh_media_url_from_page_headless_with_headers(page_url)
+        .await?;
+    {
+        let mut guard = media_url.lock().expect("media url lock poisoned while refreshing");
+        *guard = new_url.clone();
+    }
+    {
+        let mut guard = media_headers
+            .lock()
+            .expect("media headers lock poisoned while refreshing");
+        *guard = headers;
+    }
+    seen.clear();
+    if whisper_isolate && !use_mic_for_wake {
+        if let Err(err) = write_media_url_file(worker_media_url_path, &new_url) {
+            eprintln!("whisper worker: failed to write media url: {err:#}");
+        }
+    }
+    eprintln!("refreshed variant: {}", new_url);
+    Ok(new_url)
+}
+
+fn spawn_self_restart(reason: String) {
+    static RESTARTING: AtomicBool = AtomicBool::new(false);
+    if RESTARTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    eprintln!("{reason}");
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("restart failed: unable to resolve executable: {err:#}");
+            return;
+        }
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    match StdCommand::new(&exe)
+        .args(&args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(_) => {
+            eprintln!("restarting autoclip (buffer watchdog).");
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("restart failed: {err:#}");
+        }
+    }
+}
+
+fn kill_child_now(child: &Arc<Mutex<Option<Child>>>) {
+    if let Ok(mut guard) = child.lock() {
+        if let Some(proc) = guard.as_mut() {
+            let _ = proc.kill();
+        }
+    }
+}
+
+fn kill_child_and_wait(child: &Arc<Mutex<Option<Child>>>) {
+    if let Ok(mut guard) = child.lock() {
+        if let Some(mut proc) = guard.take() {
+            let _ = proc.kill();
+            let _ = proc.wait();
+        }
+    }
+}
+
+fn spawn_ctrl_c_handler(stop: Arc<AtomicBool>, worker: Option<Arc<Mutex<Option<Child>>>>) {
     let counter = Arc::new(AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
@@ -4858,6 +5879,9 @@ fn spawn_ctrl_c_handler(stop: Arc<AtomicBool>) {
                     "Ctrl+C received; finishing in-flight work. Press Ctrl+C again to quit immediately."
                 );
                 stop.store(true, Ordering::Relaxed);
+                if let Some(child) = worker.as_ref() {
+                    kill_child_now(child);
+                }
             } else {
                 eprintln!("Ctrl+C received again; forcing exit.");
                 std::process::exit(130);
@@ -5064,7 +6088,7 @@ async fn run_streams_supervisor(
     let max_concurrent = read_streams_max_concurrent();
     let semaphore = Arc::new(Semaphore::new(max_concurrent.max(1)));
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_ctrl_c_handler(stop.clone());
+    spawn_ctrl_c_handler(stop.clone(), None);
     eprintln!(
         "streams: watching {} (poll {:.1}s, max concurrent {})",
         streams_path.display(),
@@ -5168,6 +6192,20 @@ const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("CLIP_FACE_FRAME_EYE_TOP_RATIO", "0.45"),
     ("CLIP_FACE_FRAME_EYE_CHIN_RATIO", "0.55"),
     ("CLIP_FACE_FRAME_SHOULDER_SCALE", "3.2"),
+    ("CLIP_FACE_MESH", "1"),
+    ("CLIP_FACE_MESH_MODEL", "models/face_mesh/face_mesh.onnx"),
+    ("CLIP_FACE_MESH_MODEL_MIN_MB", "1"),
+    ("CLIP_FACE_MESH_MODEL_MAX_MB", "64"),
+    ("CLIP_FACE_MESH_LOAD_TIMEOUT_SECS", "60"),
+    ("CLIP_FACE_MESH_BACKEND", ""),
+    ("CLIP_FACE_MESH_TRACT_OPT", "0"),
+    ("CLIP_FACE_MESH_INPUT_SIZE", "192"),
+    ("CLIP_FACE_MESH_INPUT_MAX", "512"),
+    ("CLIP_FACE_MESH_INPUT_SCALE", "0.003921569"),
+    ("CLIP_FACE_MESH_REGION_SCALE", "1.35"),
+    ("CLIP_FACE_MESH_HEADROOM", "0.12"),
+    ("CLIP_FACE_MESH_DEBUG", "0"),
+    ("CLIP_FACE_ZOOM", "1.0"),
     ("CLIP_POSE", "1"),
     ("CLIP_POSE_MODEL", "models/pose/movenet_singlepose_thunder.onnx"),
     ("CLIP_POSE_MODEL_MIN_MB", "1"),
@@ -5211,19 +6249,26 @@ const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("CLIP_CLOSED_CAPTIONS", "1"),
     ("CLIP_LLM_ENABLE", "1"),
     ("CLIP_LLM_ENDPOINT", "http://localhost:1234/v1/chat/completions"),
-    ("CLIP_LLM_MODEL", "C:\\Users\\Rashi\\.cache\\lm-studio\\models\\bartowski\\gemma-2-9b-it-GGUF\\gemma-2-9b-it-Q8_0_L.gguf"),
+    ("CLIP_LLM_MODEL", "gemma-2-2b-it"),
     ("CLIP_LLM_TEMPERATURE", "0.2"),
     ("CLIP_LLM_TIMEOUT_SECS", "20"),
+    ("CLIP_LLM_BACKOFF_SECS", "120"),
     ("CLIP_LLM_MAX_TRANSCRIPT_CHARS", "4000"),
     ("CLIP_LLM_TITLE_MAX_CHARS", "80"),
     ("CLIP_LLM_DESCRIPTION_MAX_CHARS", "280"),
     ("CLIP_LLM_GPU_LAYERS", "0"),
     ("CLIP_LLM_FILE_RENAME", "1"),
     ("CLIP_LLM_DEBUG", "0"),
+    ("CLIP_LIVE_FAST", "1"),
+    ("CLIP_LIVE_LAYOUT_TTL_SECS", "120"),
     ("CLIP_WAKE_WORDS", "orange"),
+    ("WAKE_BUFFER_RESTART_SECS", "500"),
+    ("WAKE_NO_WORDS_SECS", "300"),
     ("CLIP_PROFILE", "1"),
     ("CLIP_STREAMS_POLL_SECS", "5"),
     ("CLIP_STREAMS_MAX_CONCURRENT", "1"),
+    ("CLIP_M3U8_REFRESH_SECS", "240"),
+    ("CLIP_STREAM_OFFLINE_SECS", "120"),
     ("CLIP_EMOTION_ENABLE", "0"),
     ("CLIP_EMOTION_AUDIO", "1"),
     ("CLIP_EMOTION_FACE", "0"),
@@ -5421,6 +6466,26 @@ fn parse_live_config(contents: &str) -> HashMap<String, String> {
         out.insert(env_key, value);
     }
     out
+}
+
+fn apply_live_config_once(path: &Path) {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(_) => return,
+    };
+    let parsed = parse_live_config(&contents);
+    for (key, value) in parsed {
+        let existing = std::env::var(&key).ok();
+        if existing
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        std::env::set_var(key, value);
+    }
+    sync_ort_dylib_env(false);
 }
 
 fn normalize_ort_dylib_value(raw: &str) -> Option<String> {
@@ -5749,6 +6814,27 @@ async fn main() -> Result<()> {
         env_overrides.push(("CLIP_WAKE_WORDS".to_string(), phrase_list.to_string()));
     }
     let mut streams_path = streams_file.map(PathBuf::from);
+    if let Some(path) = streams_path.as_ref() {
+        let path_str = path.to_string_lossy().to_string();
+        env_overrides.retain(|(key, _)| key != "CLIP_STREAMS_FILE");
+        env_overrides.push(("CLIP_STREAMS_FILE".to_string(), path_str));
+    }
+    let wake_phrases_override = override_phrase
+        .as_deref()
+        .map(split_wake_phrases)
+        .filter(|v| !v.is_empty());
+    let live_config_path = match std::env::var("CLIP_LIVE_CONFIG") {
+        Ok(path) if !path.trim().is_empty() => PathBuf::from(path.trim()),
+        _ => {
+            let cwd = std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."));
+            let path = cwd.join("config.env");
+            std::env::set_var("CLIP_LIVE_CONFIG", path.to_string_lossy().as_ref());
+            path
+        }
+    };
+    ensure_live_config_file(&live_config_path, &env_overrides);
+    apply_live_config_once(&live_config_path);
     if streams_path.is_none() {
         if !stream_urls.is_empty() {
             streams_path = Some(default_streams_file_path());
@@ -5765,21 +6851,6 @@ async fn main() -> Result<()> {
         env_overrides.push(("CLIP_STREAMS_FILE".to_string(), path_str));
     }
     apply_env_overrides(&env_overrides);
-    let wake_phrases_override = override_phrase
-        .as_deref()
-        .map(split_wake_phrases)
-        .filter(|v| !v.is_empty());
-    let live_config_path = match std::env::var("CLIP_LIVE_CONFIG") {
-        Ok(path) if !path.trim().is_empty() => PathBuf::from(path.trim()),
-        _ => {
-            let cwd = std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."));
-            let path = cwd.join("config.env");
-            std::env::set_var("CLIP_LIVE_CONFIG", path.to_string_lossy().as_ref());
-            path
-        }
-    };
-    ensure_live_config_file(&live_config_path, &env_overrides);
     seed_ort_dylib_from_live_config(&live_config_path);
 
     // Ensure CUDA backend is preferred when available; avoid falling back to CPU due to missing env.
@@ -5867,7 +6938,7 @@ async fn main() -> Result<()> {
             return run_wakeword_mic_demo(opts).await;
         }
         if cmd.eq_ignore_ascii_case("whisper-worker") {
-            return run_whisper_worker();
+            return run_whisper_worker().await;
         }
     }
 
@@ -6031,11 +7102,11 @@ async fn run_wakeword_mic_demo(opts: MicOpts) -> Result<()> {
     app.run_until_wake_and_clip(&opts.page_url).await
 }
 
-fn run_whisper_worker() -> Result<()> {
+async fn run_whisper_worker() -> Result<()> {
     let mode = std::env::var("WHISPER_WORKER_MODE")
         .unwrap_or_else(|_| "stream".to_string())
         .to_ascii_lowercase();
-    let status_path = whisper_worker_status_path();
+    let status_path = whisper_worker_status_path("");
     let poll = whisper_worker_status_poll();
     let log_raw = std::env::var("WHISPER_WORKER_LOG_RAW")
         .ok()
@@ -6049,6 +7120,7 @@ fn run_whisper_worker() -> Result<()> {
     let model_path = stream_audio_wake::select_best_model_path();
 
     let stop = Arc::new(AtomicBool::new(false));
+    spawn_ctrl_c_handler(stop.clone(), None);
     let fired = Arc::new(AtomicBool::new(false));
     let detect_ns = Arc::new(AtomicU64::new(u64::MAX));
     let audio_ns = Arc::new(AtomicU64::new(0));
@@ -6063,39 +7135,53 @@ fn run_whisper_worker() -> Result<()> {
         last_word_ns.clone(),
     );
 
-    let start_instant = Instant::now();
-    if mode == "mic" {
-        let mic_device = std::env::var("MIC_DEVICE").ok();
-        run_wake_worker_mic(
-            mic_device.as_deref(),
-            Path::new(&model_path),
-            &wake_phrases,
-            log_raw,
-            stop.clone(),
-            fired.clone(),
-            start_instant,
-            detect_ns,
-            audio_ns,
-            last_word_ns,
-        )?;
-    } else {
-        let media_url_path = whisper_worker_media_url_path();
-        run_wake_worker_stream(
-            &media_url_path,
-            Path::new(&model_path),
-            &wake_phrases,
-            log_raw,
-            stop.clone(),
-            fired.clone(),
-            start_instant,
-            detect_ns,
-            audio_ns,
-            last_word_ns,
-        )?;
-    }
+    let mode_for_worker = mode.clone();
+    let model_path_for_worker = model_path.clone();
+    let wake_phrases_for_worker = wake_phrases.clone();
+    let stop_for_worker = stop.clone();
+    let fired_for_worker = fired.clone();
+    let detect_ns_for_worker = detect_ns.clone();
+    let audio_ns_for_worker = audio_ns.clone();
+    let last_word_ns_for_worker = last_word_ns.clone();
+    let worker_handle = tokio::task::spawn_blocking(move || {
+        let start_instant = Instant::now();
+        if mode_for_worker == "mic" {
+            let mic_device = std::env::var("MIC_DEVICE").ok();
+            run_wake_worker_mic(
+                mic_device.as_deref(),
+                Path::new(&model_path_for_worker),
+                &wake_phrases_for_worker,
+                log_raw,
+                stop_for_worker,
+                fired_for_worker,
+                start_instant,
+                detect_ns_for_worker,
+                audio_ns_for_worker,
+                last_word_ns_for_worker,
+            )?;
+        } else {
+            let media_url_path = whisper_worker_media_url_path("");
+            run_wake_worker_stream(
+                &media_url_path,
+                Path::new(&model_path_for_worker),
+                &wake_phrases_for_worker,
+                log_raw,
+                stop_for_worker,
+                fired_for_worker,
+                start_instant,
+                detect_ns_for_worker,
+                audio_ns_for_worker,
+                last_word_ns_for_worker,
+            )?;
+        }
+        Ok(())
+    });
 
+    let result = worker_handle
+        .await
+        .context("whisper worker task join failed")?;
     stop.store(true, Ordering::Relaxed);
-    Ok(())
+    result
 }
 
 /// Replay a local TS file to detect a wake phrase and cut a stacked clip.
@@ -6198,6 +7284,7 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
         Some(ProgressSpec {
             total_secs: progress_total_secs,
         }),
+        false,
     )
     .await?;
     println!("reprocessed TS clip -> {}", output_path.display());
@@ -6540,6 +7627,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_FACE_RATIO          Height ratio reserved for face panel (default 0.40)");
     println!("  CLIP_FACE_CROP           Face crop expr w:h:x:y (optional, overrides detection/anchor)");
     println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 6.0)");
+    println!("  CLIP_FACE_ZOOM           Face crop zoom factor (>1 zooms out, <1 zooms in; default 1.0)");
     println!("  CLIP_FACE_BOX            Normalized face box x:y:w:h (0..1) for auto-crop");
     println!("  CLIP_FACE_REGION         Normalized face bounds x:y:w:h (0..1) for mid-shot framing");
     println!("  CLIP_FACE_ANCHOR         Anchor for default face crop (top-left default)");
@@ -6575,6 +7663,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_LLM_MODEL           LLM model name or path");
     println!("  CLIP_LLM_TEMPERATURE     LLM temperature (default 0.2)");
     println!("  CLIP_LLM_TIMEOUT_SECS    LLM request timeout seconds (default 20)");
+    println!("  CLIP_LLM_BACKOFF_SECS    LLM backoff seconds after failure (default 120)");
     println!("  CLIP_LLM_MAX_TRANSCRIPT_CHARS Transcript truncation limit (default 4000)");
     println!("  CLIP_LLM_TITLE_MAX_CHARS LLM title max length (default 80)");
     println!("  CLIP_LLM_DESCRIPTION_MAX_CHARS LLM description max length (default 280)");
@@ -6590,6 +7679,19 @@ fn print_help(bin: &str) {
     println!("  CLIP_FACE_FRAME_EYE_TOP_RATIO Eye->top ratio for head estimate (default 0.45)");
     println!("  CLIP_FACE_FRAME_EYE_CHIN_RATIO Eye->chin ratio for head estimate (default 0.55)");
     println!("  CLIP_FACE_FRAME_SHOULDER_SCALE Shoulder width scale vs face (default 3.2)");
+    println!("  CLIP_FACE_MESH          Enable face mesh framing (default true)");
+    println!("  CLIP_FACE_MESH_MODEL    Face mesh ONNX model path");
+    println!("  CLIP_FACE_MESH_MODEL_MIN_MB Min face mesh model size in MB (default 1)");
+    println!("  CLIP_FACE_MESH_MODEL_MAX_MB Max face mesh model size in MB (default 64)");
+    println!("  CLIP_FACE_MESH_LOAD_TIMEOUT_SECS Max seconds to load face mesh model (default 60)");
+    println!("  CLIP_FACE_MESH_BACKEND  Face mesh backend: auto (default), ort, or tract");
+    println!("  CLIP_FACE_MESH_TRACT_OPT Enable tract optimizations for face mesh (default false)");
+    println!("  CLIP_FACE_MESH_INPUT_SIZE Fallback face mesh input size (default 192)");
+    println!("  CLIP_FACE_MESH_INPUT_MAX Max face mesh input side length before clamping (default 512)");
+    println!("  CLIP_FACE_MESH_INPUT_SCALE Input scale for face mesh model (default 1/255)");
+    println!("  CLIP_FACE_MESH_REGION_SCALE Face mesh crop expansion scale (default 1.35)");
+    println!("  CLIP_FACE_MESH_HEADROOM Extra headroom ratio above mesh top (default 0.12)");
+    println!("  CLIP_FACE_MESH_DEBUG    Log face mesh bounds (default false)");
     println!("  CLIP_POSE               Enable MoveNet pose framing (default true)");
     println!("  CLIP_POSE_MODEL         MoveNet Thunder ONNX model path");
     println!("  CLIP_POSE_MODEL_MIN_MB  Min pose model size in MB (default 1)");
@@ -6625,9 +7727,13 @@ fn print_help(bin: &str) {
     println!("  CLIP_REGION_DETECT       Enable CLIP region detection (default true)");
     println!("  CLIP_LIVE_CONFIG         Path to live config file for hot-reload overrides");
     println!("  CLIP_LIVE_CONFIG_POLL_SECS   Live config poll interval in seconds (default 2)");
+    println!("  CLIP_LIVE_FAST           Skip heavy detection/captions for faster live renders (default true)");
+    println!("  CLIP_LIVE_LAYOUT_TTL_SECS Reuse detected layout hints for N seconds (default 120)");
     println!("  CLIP_STREAMS_FILE        Path to streams file for multi-stream runs");
     println!("  CLIP_STREAMS_POLL_SECS   Streams file poll interval in seconds (default 5)");
     println!("  CLIP_STREAMS_MAX_CONCURRENT Max number of concurrent streams (default 1)");
+    println!("  CLIP_M3U8_REFRESH_SECS   Refresh signed m3u8 URL every N seconds (default 240)");
+    println!("  CLIP_STREAM_OFFLINE_SECS Exit if no new segments for N seconds (default 120)");
     println!("  CLIP_WAKE_WORDS          Wake phrase list (comma/pipe separated) for clip trigger");
     println!("  CLIP_PROFILE             Enable timing logs for hotspots (default false)");
     println!("  CLIP_EMOTION_ENABLE      Enable emotion triggers from audio/face (default false)");
@@ -6651,6 +7757,8 @@ fn print_help(bin: &str) {
     println!("  HEADLESS_M3U8_SCRIPT / HEADLESS_M3U8_SCRIPT_TIKTOK   Override Playwright scripts");
     println!("  WAKE_REFRACTORY_SECS     Cooldown between wake detections (default 12)");
     println!("  WAKE_BUFFER_HEADROOM_SECS   Extra buffer headroom for wake timing (default 20)");
+    println!("  WAKE_BUFFER_RESTART_SECS    Restart if buffer exceeds seconds (default 500, 0 disables)");
+    println!("  WAKE_NO_WORDS_SECS       Restart if wake worker stalls for seconds (default 300, 0 disables)");
     println!("  SKIP_CLIP_SAVE           If set to 1/true, skip writing clips");
     println!("  WHISPER_MODEL            Path to whisper model (default auto)");
     println!("  WHISPER_GPU              Enable GPU for live wake (default true)");
@@ -6709,6 +7817,35 @@ mod tests {
             stream_id_from_url("twitch.tv/SomeUser?src=live"),
             "twitch_tv_someuser"
         );
+    }
+
+    #[test]
+    fn extract_output_index_parses_variants() {
+        assert_eq!(extract_output_index("clip_001", "clip"), Some(1));
+        assert_eq!(extract_output_index("clip_010__title", "clip"), Some(10));
+        assert_eq!(extract_output_index("clip__oops", "clip"), None);
+        assert_eq!(extract_output_index("other_001", "clip"), None);
+    }
+
+    #[test]
+    fn next_output_path_skips_existing_and_counter() -> Result<()> {
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("autoclip_test_{stamp}"));
+        fs::create_dir_all(&dir)?;
+
+        let renamed = dir.join("clip_001__title.mp4");
+        fs::write(&renamed, "stub")?;
+        let counter = dir.join(".clip_counter");
+        fs::write(&counter, "2\n")?;
+
+        let next = next_output_path(dir.to_str().unwrap_or("."), "clip")?;
+        assert_eq!(next.file_name().unwrap_or_default(), "clip_003.mp4");
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]

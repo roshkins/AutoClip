@@ -178,6 +178,7 @@ pub struct ClipLayoutConfig {
     pub face_crop: Option<String>,
     pub face_anchor: FaceAnchor,
     pub face_context_scale: f32,
+    pub face_zoom: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -261,6 +262,12 @@ pub fn read_clip_layout_config() -> ClipLayoutConfig {
         .filter(|v| v.is_finite() && *v > 0.0)
         .map(|v| v.max(1.0))
         .unwrap_or(DEFAULT_FACE_CONTEXT_SCALE);
+    let face_zoom = env::var("CLIP_FACE_ZOOM")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.clamp(0.5, 4.0))
+        .unwrap_or(1.0);
 
     ClipLayoutConfig {
         mode,
@@ -268,6 +275,7 @@ pub fn read_clip_layout_config() -> ClipLayoutConfig {
         face_crop,
         face_anchor,
         face_context_scale,
+        face_zoom,
     }
 }
 
@@ -369,14 +377,12 @@ fn face_crop_rect(
         w: 1.0,
         h: 1.0,
     });
-    if let Some(spec) = hints.face_frame_spec {
-        return Some(frame_rect_for_face(face_box, spec, target_aspect, bounds));
-    }
-    Some(expand_rect_in_bounds(
-        face_box,
-        layout.face_context_scale,
-        bounds,
-    ))
+    let rect = if let Some(spec) = hints.face_frame_spec {
+        frame_rect_for_face(face_box, spec, target_aspect, bounds)
+    } else {
+        expand_rect_in_bounds(face_box, layout.face_context_scale, bounds)
+    };
+    Some(apply_face_zoom(rect, layout.face_zoom, bounds))
 }
 
 fn build_face_crop_expr(layout: &ClipLayoutConfig, rect: Option<NormalizedRect>) -> String {
@@ -684,6 +690,7 @@ fn build_tracked_face_crop(
             expand_rect_in_bounds(point.rect, layout.face_context_scale, bounds)
         };
         let rect = expand_rect_width_to_aspect(rect, target_aspect);
+        let rect = apply_face_zoom(rect, layout.face_zoom, bounds);
         samples.push(TrackSample {
             time: point.time.max(0.0),
             center: rect.center().clamp_unit(),
@@ -751,6 +758,7 @@ fn tracked_face_max_rect(
         } else {
             expand_rect_in_bounds(point.rect, layout.face_context_scale, bounds)
         };
+        let rect = apply_face_zoom(rect, layout.face_zoom, bounds);
         max_w = max_w.max(rect.w);
         max_h = max_h.max(rect.h);
     }
@@ -911,6 +919,48 @@ fn expand_rect_in_bounds(
     }
 }
 
+fn scale_rect_in_bounds(
+    rect: NormalizedRect,
+    scale: f32,
+    bounds: NormalizedRect,
+) -> NormalizedRect {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let bounds = normalize_bounds(bounds);
+    let desired_w = (rect.w * scale).clamp(MIN_CROP_RATIO, bounds.w.max(MIN_CROP_RATIO));
+    let desired_h = (rect.h * scale).clamp(MIN_CROP_RATIO, bounds.h.max(MIN_CROP_RATIO));
+    let mut x = rect.x + rect.w / 2.0 - desired_w / 2.0;
+    let mut y = rect.y + rect.h / 2.0 - desired_h / 2.0;
+    let min_x = bounds.x;
+    let max_x = (bounds.x + bounds.w - desired_w).max(min_x);
+    let min_y = bounds.y;
+    let max_y = (bounds.y + bounds.h - desired_h).max(min_y);
+    if x < min_x {
+        x = min_x;
+    }
+    if x > max_x {
+        x = max_x;
+    }
+    if y < min_y {
+        y = min_y;
+    }
+    if y > max_y {
+        y = max_y;
+    }
+    NormalizedRect {
+        x: clamp_unit(x),
+        y: clamp_unit(y),
+        w: desired_w,
+        h: desired_h,
+    }
+}
+
+fn apply_face_zoom(rect: NormalizedRect, zoom: f32, bounds: NormalizedRect) -> NormalizedRect {
+    if !zoom.is_finite() || (zoom - 1.0).abs() < 0.001 {
+        return rect;
+    }
+    scale_rect_in_bounds(rect, zoom, bounds)
+}
+
 fn normalize_bounds(bounds: NormalizedRect) -> NormalizedRect {
     if bounds.w <= 0.0 || bounds.h <= 0.0 {
         return NormalizedRect {
@@ -994,6 +1044,7 @@ mod tests {
             face_crop: None,
             face_anchor: FaceAnchor::TopLeft,
             face_context_scale: 1.5,
+            face_zoom: 1.0,
         };
         let hints = ClipLayoutHints {
             face_box: Some(NormalizedRect {

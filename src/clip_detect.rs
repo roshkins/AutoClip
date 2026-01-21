@@ -63,6 +63,7 @@ const DEFAULT_SAMPLE_STEP: f32 = 1.5;
 const DEFAULT_FRAME_WIDTH: u32 = 960;
 const DEFAULT_FRAME_HEIGHT: u32 = 540;
 const DEFAULT_FACE_MODEL_PATH: &str = "models/face_detection_yunet_2023mar.onnx";
+const DEFAULT_FACE_MESH_MODEL_PATH: &str = "models/face_mesh/face_mesh.onnx";
 const DEFAULT_FACE_SCORE: f32 = 0.6;
 const DEFAULT_FACE_TILE_MIN_SCORE: f32 = 0.60;
 const DEFAULT_FACE_TILE_MAX_DEPTH: usize = 3;
@@ -91,6 +92,15 @@ const FACE_FRAME_HEAD_TOP_MAX: f32 = 0.2;
 const FACE_FRAME_EYE_TOP_RATIO: f32 = 0.45;
 const FACE_FRAME_EYE_CHIN_RATIO: f32 = 0.55;
 const FACE_FRAME_SHOULDER_SCALE: f32 = 3.2;
+const FACE_MESH_MODEL_MIN_MB_DEFAULT: u64 = 1;
+const FACE_MESH_MODEL_MAX_MB_DEFAULT: u64 = 64;
+const FACE_MESH_INPUT_SIZE_DEFAULT: u32 = 192;
+const FACE_MESH_INPUT_MAX_DEFAULT: u32 = 512;
+const FACE_MESH_LOAD_TIMEOUT_SECS_DEFAULT: u64 = 60;
+const FACE_MESH_REGION_SCALE_DEFAULT: f32 = 1.35;
+const FACE_MESH_HEADROOM_RATIO_DEFAULT: f32 = 0.12;
+const FACE_MESH_MIN_POINTS: usize = 60;
+const FACE_MESH_MAX_CANDIDATES: usize = 3;
 const POSE_MODEL_MIN_MB_DEFAULT: u64 = 1;
 const POSE_MODEL_MAX_MB_DEFAULT: u64 = 64;
 const POSE_TRACT_OPT_DEFAULT: bool = false;
@@ -129,6 +139,19 @@ fn pose_load_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn face_mesh_load_timeout() -> Duration {
+    let secs = read_env_u64(
+        "CLIP_FACE_MESH_LOAD_TIMEOUT_SECS",
+        FACE_MESH_LOAD_TIMEOUT_SECS_DEFAULT,
+    );
+    let secs = if secs == 0 {
+        FACE_MESH_LOAD_TIMEOUT_SECS_DEFAULT
+    } else {
+        secs.min(FACE_MESH_LOAD_TIMEOUT_SECS_DEFAULT)
+    };
+    Duration::from_secs(secs)
+}
+
 fn face_frame_head_top_default() -> f32 {
     read_env_f32("CLIP_FACE_FRAME_HEAD_TOP", FACE_FRAME_HEAD_TOP_DEFAULT)
 }
@@ -153,6 +176,57 @@ fn face_frame_eye_chin_ratio() -> f32 {
 fn face_frame_shoulder_scale() -> f32 {
     let scale = read_env_f32("CLIP_FACE_FRAME_SHOULDER_SCALE", FACE_FRAME_SHOULDER_SCALE);
     if scale <= 0.0 { FACE_FRAME_SHOULDER_SCALE } else { scale }
+}
+
+fn face_mesh_enabled() -> bool {
+    std::env::var("CLIP_FACE_MESH")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(true)
+}
+
+fn face_mesh_debug_enabled() -> bool {
+    std::env::var("CLIP_FACE_MESH_DEBUG")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+fn face_mesh_headroom_ratio() -> f32 {
+    std::env::var("CLIP_FACE_MESH_HEADROOM")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(FACE_MESH_HEADROOM_RATIO_DEFAULT)
+}
+
+fn face_mesh_region_scale() -> f32 {
+    std::env::var("CLIP_FACE_MESH_REGION_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.max(1.0))
+        .unwrap_or(FACE_MESH_REGION_SCALE_DEFAULT)
+}
+
+fn face_mesh_input_scale() -> f32 {
+    std::env::var("CLIP_FACE_MESH_INPUT_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.003921569)
+}
+
+fn face_mesh_input_size() -> u32 {
+    let size = read_env_u32("CLIP_FACE_MESH_INPUT_SIZE", FACE_MESH_INPUT_SIZE_DEFAULT);
+    if size == 0 { FACE_MESH_INPUT_SIZE_DEFAULT } else { size }
+}
+
+fn face_mesh_input_max() -> u32 {
+    let max = read_env_u32("CLIP_FACE_MESH_INPUT_MAX", FACE_MESH_INPUT_MAX_DEFAULT);
+    let size = face_mesh_input_size();
+    if max == 0 { size } else { max.max(size) }
 }
 
 fn pose_enabled() -> bool {
@@ -194,6 +268,21 @@ fn pose_input_max() -> u32 {
     let max = read_env_u32("CLIP_POSE_INPUT_MAX", POSE_INPUT_MAX_DEFAULT);
     let size = pose_input_size();
     if max == 0 { size } else { max.max(size) }
+}
+
+fn face_mesh_model_min_mb() -> u64 {
+    read_env_u64("CLIP_FACE_MESH_MODEL_MIN_MB", FACE_MESH_MODEL_MIN_MB_DEFAULT)
+}
+
+fn face_mesh_model_max_mb() -> u64 {
+    read_env_u64("CLIP_FACE_MESH_MODEL_MAX_MB", FACE_MESH_MODEL_MAX_MB_DEFAULT)
+}
+
+fn face_mesh_tract_opt_enabled() -> bool {
+    std::env::var("CLIP_FACE_MESH_TRACT_OPT")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
 }
 
 #[cfg(feature = "ort")]
@@ -323,6 +412,54 @@ fn ort_device_id(min_free_mb: u64, label: &str) -> Option<i32> {
     }
 }
 
+fn face_mesh_model_path() -> Option<String> {
+    if !face_mesh_enabled() {
+        return None;
+    }
+    let path = std::env::var("CLIP_FACE_MESH_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_FACE_MESH_MODEL_PATH.to_string());
+    let path_ref = Path::new(&path);
+    if !path_ref.exists() {
+        eprintln!(
+            "clip detect: face mesh model missing at {}; skipping face mesh",
+            path
+        );
+        return None;
+    }
+    if let Ok(meta) = fs::metadata(path_ref) {
+        let bytes = meta.len();
+        let min_bytes = face_mesh_model_min_mb().saturating_mul(1024 * 1024);
+        let max_bytes = face_mesh_model_max_mb().saturating_mul(1024 * 1024);
+        if bytes < min_bytes || (max_bytes > 0 && bytes > max_bytes) {
+            let mb = bytes as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "clip detect: face mesh model size {:.1} MB out of range [{}, {}]; skipping face mesh",
+                mb,
+                face_mesh_model_min_mb(),
+                face_mesh_model_max_mb()
+            );
+            return None;
+        }
+    }
+    if let Ok(mut file) = fs::File::open(path_ref) {
+        let mut header = [0u8; 4];
+        if let Ok(read) = file.read(&mut header) {
+            if read >= 1 && header[0] == b'<' {
+                eprintln!("clip detect: face mesh model looks like text/HTML; skipping face mesh");
+                return None;
+            }
+            if read >= 2 && header[0] == b'P' && header[1] == b'K' {
+                eprintln!("clip detect: face mesh model appears to be a zip; skipping face mesh");
+                return None;
+            }
+        }
+    }
+    Some(path)
+}
+
 fn pose_model_path() -> Option<String> {
     if !pose_enabled() {
         return None;
@@ -366,6 +503,21 @@ fn pose_model_path() -> Option<String> {
         }
     }
     Some(path)
+}
+
+fn face_mesh_backend() -> FaceBackend {
+    match std::env::var("CLIP_FACE_MESH_BACKEND") {
+        Ok(value) => match parse_face_backend(&value) {
+            Some(backend) => backend,
+            None => {
+                eprintln!(
+                    "clip detect: unknown CLIP_FACE_MESH_BACKEND={value}; using auto"
+                );
+                FaceBackend::Auto
+            }
+        },
+        Err(_) => FaceBackend::Auto,
+    }
 }
 
 fn pose_backend() -> FaceBackend {
@@ -747,6 +899,7 @@ async fn build_face_sweep_inputs(
                 source_dims,
                 None,
                 None,
+                None,
                 &mut face_frame_cache,
             )
             .await;
@@ -875,6 +1028,13 @@ pub async fn detect_layout_hints(
         }
     };
     let face_id_matcher = FaceIdMatcher::from_env();
+    let face_mesh_detector = match FaceMeshDetector::new(config) {
+        Ok(detector) => detector,
+        Err(err) => {
+            eprintln!("clip detect: failed to load face mesh model: {err:#}");
+            None
+        }
+    };
     let pose_detector = match PoseDetector::new(config) {
         Ok(detector) => detector,
         Err(err) => {
@@ -995,6 +1155,7 @@ pub async fn detect_layout_hints(
                     source_dims,
                     hints.face_region,
                     face_id_matcher.as_ref(),
+                    face_mesh_detector.as_ref(),
                     &mut face_frame_cache,
                 )
                 .await;
@@ -1197,6 +1358,7 @@ pub async fn detect_layout_hints(
         }
     }
 
+    let pose_available = face_samples.iter().any(|sample| sample.pose.is_some());
     if let Some(best) = face_best {
         hints.face_box = Some(best.rect);
         hints.face_frame_spec = best.frame_spec;
@@ -1208,7 +1370,28 @@ pub async fn detect_layout_hints(
             }
         });
         if hints.face_region.is_none() {
-            hints.face_region = region;
+            if pose_available {
+                hints.face_region = Some(NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                });
+                if pose_debug_enabled() || face_debug_enabled() {
+                    eprintln!("clip detect: pose available; widening face region to full frame");
+                }
+            } else {
+                let region = region.map(|region| {
+                    let expanded = expand_rect_margins(region, 0.5, 0.5);
+                    if face_debug_enabled() || pose_debug_enabled() {
+                        eprintln!(
+                            "clip detect: no pose; expanding face region with 0.5 margin"
+                        );
+                    }
+                    expanded
+                });
+                hints.face_region = region;
+            }
         }
     }
 
@@ -1558,6 +1741,7 @@ async fn detect_face_candidates(
     source_dims: Option<(u32, u32)>,
     preferred_region: Option<NormalizedRect>,
     face_id: Option<&FaceIdMatcher>,
+    face_mesh_detector: Option<&FaceMeshDetector>,
     frame_cache: &mut FaceFrameCache,
 ) -> Vec<FaceCandidate> {
     let regions = build_face_scan_regions();
@@ -1715,6 +1899,17 @@ async fn detect_face_candidates(
         )
         .await;
         maybe_dump_face_candidates(input, seek, &all_candidates, "faces").await;
+        if let Some(detector) = face_mesh_detector {
+            apply_face_mesh_to_candidates(
+                input,
+                seek,
+                detector,
+                source_dims,
+                frame_cache,
+                &mut all_candidates,
+            )
+            .await;
+        }
         return all_candidates;
     }
 
@@ -1772,6 +1967,17 @@ async fn detect_face_candidates(
     )
     .await;
     maybe_dump_face_candidates(input, seek, &all_candidates, "faces").await;
+    if let Some(detector) = face_mesh_detector {
+        apply_face_mesh_to_candidates(
+            input,
+            seek,
+            detector,
+            source_dims,
+            frame_cache,
+            &mut all_candidates,
+        )
+        .await;
+    }
     all_candidates
 }
 
@@ -1800,6 +2006,70 @@ async fn detect_pose_observation(
     .await
     .ok()?;
     detector.detect_pose(&frame)
+}
+
+async fn detect_face_mesh_observation(
+    input: &str,
+    seek: Option<f32>,
+    detector: &FaceMeshDetector,
+    region: NormalizedRect,
+    source_dims: Option<(u32, u32)>,
+    frame_cache: &mut FaceFrameCache,
+) -> Option<FaceMeshObservation> {
+    let region = expand_rect(region, face_mesh_region_scale());
+    let frame = extract_face_frame_rgb_cached(
+        Some(frame_cache),
+        input,
+        seek,
+        detector.input_w,
+        detector.input_h,
+        region,
+        source_dims,
+    )
+    .await
+    .ok()?;
+    detector.detect_mesh(&frame)
+}
+
+async fn apply_face_mesh_to_candidates(
+    input: &str,
+    seek: Option<f32>,
+    detector: &FaceMeshDetector,
+    source_dims: Option<(u32, u32)>,
+    frame_cache: &mut FaceFrameCache,
+    candidates: &mut [FaceCandidate],
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let mut indices: Vec<usize> = (0..candidates.len()).collect();
+    indices.sort_by(|&a, &b| {
+        candidates[b]
+            .score
+            .partial_cmp(&candidates[a].score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let max_count = FACE_MESH_MAX_CANDIDATES.min(indices.len());
+    for idx in indices.into_iter().take(max_count) {
+        if candidates[idx].mesh.is_some() {
+            continue;
+        }
+        let region = candidates[idx].rect;
+        if let Some(obs) = detect_face_mesh_observation(
+            input,
+            seek,
+            detector,
+            region,
+            source_dims,
+            frame_cache,
+        )
+        .await
+        {
+            candidates[idx].mesh = Some(obs);
+        } else if face_mesh_debug_enabled() {
+            eprintln!("clip detect: face mesh failed for candidate idx={idx}");
+        }
+    }
 }
 
 async fn apply_face_tile_search(
@@ -3516,6 +3786,7 @@ impl YunetDetector {
                     score: weighted_score,
                     landmarks_ok: false,
                     landmarks: None,
+                    mesh: None,
                     region,
                 });
             }
@@ -3687,6 +3958,7 @@ impl YunetDetector {
                         score: weighted_score,
                         landmarks_ok,
                         landmarks,
+                        mesh: None,
                         region,
                     });
                 }
@@ -3755,9 +4027,14 @@ fn run_ort_session(
 fn ort_value_to_tensor(
     value: &ort::value::Value,
 ) -> Option<Tensor> {
-    let (shape, data) = value.try_extract_tensor::<f32>().ok()?;
+    if let Ok((shape, data)) = value.try_extract_tensor::<f32>() {
+        let shape = ort_shape_to_usize(shape)?;
+        return Tensor::from_shape(&shape, data).ok();
+    }
+    let (shape, data) = value.try_extract_tensor::<half::f16>().ok()?;
     let shape = ort_shape_to_usize(shape)?;
-    Tensor::from_shape(&shape, data).ok()
+    let data: Vec<f32> = data.iter().map(|v| f32::from(*v)).collect();
+    Tensor::from_shape(&shape, &data).ok()
 }
 
 #[cfg(feature = "ort")]
@@ -4123,6 +4400,350 @@ impl PoseDetector {
     }
 }
 
+enum FaceMeshBackend {
+    Tract(TypedRunnableModel<TypedModel>),
+    #[cfg(feature = "ort")]
+    Ort(std::sync::Mutex<Session>),
+}
+
+struct FaceMeshDetector {
+    backend: FaceMeshBackend,
+    input_w: u32,
+    input_h: u32,
+    layout: ModelLayout,
+    input_scale: f32,
+}
+
+impl FaceMeshDetector {
+    fn new(_config: &ClipDetectConfig) -> Result<Option<Self>> {
+        let Some(model_path) = face_mesh_model_path() else {
+            return Ok(None);
+        };
+        let mesh_start = Instant::now();
+        let mesh_timeout = face_mesh_load_timeout();
+        let mesh_deadline = mesh_start + mesh_timeout;
+        let mesh_tick = LoadingTicker::start(
+            "clip detect: loading face mesh model",
+            Duration::from_secs(5),
+        );
+        let backend_choice = face_mesh_backend();
+        let timeout_secs = mesh_timeout.as_secs_f32();
+
+        #[cfg(feature = "ort")]
+        if matches!(backend_choice, FaceBackend::Ort | FaceBackend::Auto) {
+            let Some(remaining) = mesh_deadline.checked_duration_since(Instant::now()) else {
+                drop(mesh_tick);
+                eprintln!(
+                    "clip detect: face mesh model load timed out after {:.1}s; skipping face mesh",
+                    timeout_secs
+                );
+                return Ok(None);
+            };
+            let model_path_clone = model_path.clone();
+            let fallback_size = face_mesh_input_size();
+            let max_side = face_mesh_input_max();
+            let ort_result = run_with_timeout(remaining, move || {
+                let session = build_ort_session(&model_path_clone, "face mesh")?;
+                let (input_w, input_h, layout, source) =
+                    resolve_model_input_from_ort(&session, fallback_size, max_side);
+                Ok((session, input_w, input_h, layout, source))
+            });
+            match ort_result {
+                LoadResult::Ok((session, input_w, input_h, layout, source)) => {
+                    drop(mesh_tick);
+                    eprintln!(
+                        "clip detect: face mesh model loaded in {:.1}s",
+                        mesh_start.elapsed().as_secs_f32()
+                    );
+                    if matches!(source, PoseInputSource::Fallback) {
+                        eprintln!(
+                            "clip detect: face mesh input unresolved; using {}x{}",
+                            input_w, input_h
+                        );
+                    } else if matches!(source, PoseInputSource::Clamped) {
+                        eprintln!(
+                            "clip detect: face mesh input exceeds max {}; using {}x{}",
+                            max_side, input_w, input_h
+                        );
+                    }
+                    eprintln!("clip detect: face mesh backend=ort");
+                    return Ok(Some(Self {
+                        backend: FaceMeshBackend::Ort(std::sync::Mutex::new(session)),
+                        input_w,
+                        input_h,
+                        layout,
+                        input_scale: face_mesh_input_scale(),
+                    }));
+                }
+                LoadResult::Timeout => {
+                    drop(mesh_tick);
+                    eprintln!(
+                        "clip detect: face mesh model load timed out after {:.1}s; skipping face mesh",
+                        timeout_secs
+                    );
+                    return Ok(None);
+                }
+                LoadResult::Err(err) => {
+                    if matches!(backend_choice, FaceBackend::Ort) {
+                        return Err(err);
+                    }
+                    eprintln!(
+                        "clip detect: face mesh ORT init failed ({err:#}); falling back to tract"
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(feature = "ort"))]
+        if matches!(backend_choice, FaceBackend::Ort) {
+            anyhow::bail!(
+                "face mesh backend 'ort' requested but autoclip was built without the ort feature"
+            );
+        }
+
+        let Some(remaining) = mesh_deadline.checked_duration_since(Instant::now()) else {
+            drop(mesh_tick);
+            eprintln!(
+                "clip detect: face mesh model load timed out after {:.1}s; skipping face mesh",
+                timeout_secs
+            );
+            return Ok(None);
+        };
+        let fallback_size = face_mesh_input_size();
+        let max_side = face_mesh_input_max();
+        let model_path_clone = model_path.clone();
+        let tract_result = run_with_timeout(remaining, move || {
+            let model = tract_onnx::onnx()
+                .model_for_path(&model_path_clone)
+                .with_context(|| format!("loading face mesh model at {model_path_clone}"))?;
+            let (input_w, input_h, layout, source) = match model.input_fact(0) {
+                Ok(fact) => {
+                    let dims: Vec<Option<usize>> = fact
+                        .shape
+                        .dims()
+                        .map(|d| d.concretize().and_then(|d| d.to_usize().ok()))
+                        .collect();
+                    resolve_pose_input_from_dims(&dims, fallback_size, max_side)
+                }
+                Err(_) => (
+                    fallback_size,
+                    fallback_size,
+                    ModelLayout::Nchw,
+                    PoseInputSource::Fallback,
+                ),
+            };
+            let input_shape = match layout {
+                ModelLayout::Nchw => tvec!(1, 3, input_h as usize, input_w as usize),
+                ModelLayout::Nhwc => tvec!(1, input_h as usize, input_w as usize, 3),
+            };
+            let model = model.with_input_fact(
+                0,
+                InferenceFact::dt_shape(f32::datum_type(), input_shape),
+            )?;
+            let model = if face_mesh_tract_opt_enabled() {
+                model.into_optimized()?
+            } else {
+                model.into_typed()?
+            };
+            let backend = FaceMeshBackend::Tract(model.into_runnable()?);
+            Ok((backend, input_w, input_h, layout, source))
+        });
+        match tract_result {
+            LoadResult::Ok((backend, input_w, input_h, layout, source)) => {
+                drop(mesh_tick);
+                eprintln!(
+                    "clip detect: face mesh model loaded in {:.1}s",
+                    mesh_start.elapsed().as_secs_f32()
+                );
+                if matches!(source, PoseInputSource::Fallback) {
+                    eprintln!(
+                        "clip detect: face mesh input unresolved; using {}x{}",
+                        input_w, input_h
+                    );
+                } else if matches!(source, PoseInputSource::Clamped) {
+                    eprintln!(
+                        "clip detect: face mesh input exceeds max {}; using {}x{}",
+                        max_side, input_w, input_h
+                    );
+                }
+                eprintln!("clip detect: face mesh backend=tract");
+                Ok(Some(Self {
+                    backend,
+                    input_w,
+                    input_h,
+                    layout,
+                    input_scale: face_mesh_input_scale(),
+                }))
+            }
+            LoadResult::Timeout => {
+                drop(mesh_tick);
+                eprintln!(
+                    "clip detect: face mesh model load timed out after {:.1}s; skipping face mesh",
+                    timeout_secs
+                );
+                Ok(None)
+            }
+            LoadResult::Err(err) => {
+                drop(mesh_tick);
+                Err(err)
+            }
+        }
+    }
+
+    fn detect_mesh(&self, frame: &FaceFrame) -> Option<FaceMeshObservation> {
+        let rgb = &frame.rgb;
+        let input = match self.layout {
+            ModelLayout::Nchw => rgb_to_rgb_chw_scaled(
+                rgb,
+                self.input_w as usize,
+                self.input_h as usize,
+                self.input_scale,
+            ),
+            ModelLayout::Nhwc => rgb_to_rgb_hwc_scaled(
+                rgb,
+                self.input_w as usize,
+                self.input_h as usize,
+                self.input_scale,
+            ),
+        };
+        let Some(input) = input else { return None };
+        let outputs = match &self.backend {
+            FaceMeshBackend::Tract(model) => {
+                let tensor = match self.layout {
+                    ModelLayout::Nchw => Tensor::from_shape(
+                        &[1usize, 3, self.input_h as usize, self.input_w as usize],
+                        &input,
+                    )
+                    .ok(),
+                    ModelLayout::Nhwc => Tensor::from_shape(
+                        &[1usize, self.input_h as usize, self.input_w as usize, 3],
+                        &input,
+                    )
+                    .ok(),
+                };
+                let Some(tensor) = tensor else { return None };
+                model.run(tvec!(tensor.into())).ok()
+            }
+            #[cfg(feature = "ort")]
+            FaceMeshBackend::Ort(session) => {
+                session
+                    .lock()
+                    .ok()
+                    .and_then(|mut guard| {
+                        run_ort_session(
+                            &mut *guard,
+                            &input,
+                            self.input_w,
+                            self.input_h,
+                            self.layout,
+                        )
+                    })
+            }
+        }?;
+        if outputs.is_empty() {
+            return None;
+        }
+        let output = select_face_mesh_output(&outputs)?;
+        let (mut top_y, mut bottom_y) =
+            decode_face_mesh_bounds(output, self.input_w, self.input_h)?;
+        if let Some(mapping) = frame.mapping.as_ref() {
+            let top = mapping.map_point(NormalizedPoint { x: 0.5, y: top_y })?;
+            let bottom = mapping.map_point(NormalizedPoint { x: 0.5, y: bottom_y })?;
+            top_y = top.y;
+            bottom_y = bottom.y;
+        }
+        if !top_y.is_finite() || !bottom_y.is_finite() || bottom_y <= top_y {
+            return None;
+        }
+        let observation = FaceMeshObservation {
+            top_y,
+            bottom_y,
+        };
+        if face_mesh_debug_enabled() {
+            eprintln!(
+                "clip detect: face mesh top={:.3} bottom={:.3}",
+                observation.top_y, observation.bottom_y
+            );
+        }
+        Some(observation)
+    }
+}
+
+fn select_face_mesh_output(outputs: &[TValue]) -> Option<&TValue> {
+    let mut best: Option<&TValue> = None;
+    let mut best_len = 0usize;
+    for output in outputs {
+        let Ok(data) = output.as_slice::<f32>() else { continue; };
+        let len = data.len();
+        if len < FACE_MESH_MIN_POINTS.saturating_mul(3) || len % 3 != 0 {
+            continue;
+        }
+        if len > best_len {
+            best = Some(output);
+            best_len = len;
+        }
+    }
+    best
+}
+
+fn decode_face_mesh_bounds(
+    output: &TValue,
+    _input_w: u32,
+    input_h: u32,
+) -> Option<(f32, f32)> {
+    let data = output.as_slice::<f32>().ok()?;
+    if data.len() < FACE_MESH_MIN_POINTS.saturating_mul(3) {
+        return None;
+    }
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for chunk in data.chunks_exact(3) {
+        let x = chunk[0];
+        let y = chunk[1];
+        if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+    }
+    if !min_y.is_finite() || !max_y.is_finite() {
+        return None;
+    }
+    let max_abs = min_x
+        .abs()
+        .max(max_x.abs())
+        .max(min_y.abs())
+        .max(max_y.abs());
+    if max_abs > 2.0 {
+        let h = input_h as f32;
+        if h > 0.0 {
+            min_y /= h;
+            max_y /= h;
+        }
+    } else if min_y < -0.5 || max_y > 1.5 || min_x < -0.5 || max_x > 1.5 {
+        min_y = (min_y + 1.0) * 0.5;
+        max_y = (max_y + 1.0) * 0.5;
+    }
+    min_y = clamp_unit(min_y);
+    max_y = clamp_unit(max_y);
+    if max_y <= min_y {
+        return None;
+    }
+    Some((min_y, max_y))
+}
+
 fn decode_movenet_keypoints(output: &Tensor) -> Option<[PoseKeypoint; POSE_KEYPOINT_COUNT]> {
     let data = output.as_slice::<f32>().ok()?;
     if data.len() < POSE_KEYPOINT_COUNT * 3 {
@@ -4447,6 +5068,9 @@ fn face_frame_spec_for_candidate(
     candidate: &FaceCandidate,
     pose: Option<&PoseObservation>,
 ) -> Option<FaceFrameSpec> {
+    if candidate.mesh.is_some() {
+        return Some(face_frame_spec_from_landmarks(candidate));
+    }
     if let Some(pose) = pose {
         return pose_frame_spec_for_candidate(candidate, pose);
     }
@@ -4455,7 +5079,22 @@ fn face_frame_spec_for_candidate(
 
 fn face_frame_spec_from_landmarks(candidate: &FaceCandidate) -> FaceFrameSpec {
     let mut head_top_offset = face_frame_head_top_default();
-    if candidate.landmarks_ok {
+    let min_offset = face_frame_head_top_min();
+    let max_offset = face_frame_head_top_max();
+    let (min_offset, max_offset) = if min_offset <= max_offset {
+        (min_offset, max_offset)
+    } else {
+        (max_offset, min_offset)
+    };
+    if let Some(mesh) = candidate.mesh {
+        let span = (mesh.bottom_y - mesh.top_y).max(1e-4);
+        let head_top = mesh.top_y - span * face_mesh_headroom_ratio();
+        let denom = candidate.rect.h.max(1e-4);
+        let offset = (head_top - candidate.rect.y) / denom;
+        if offset.is_finite() {
+            head_top_offset = offset;
+        }
+    } else if candidate.landmarks_ok {
         if let Some(points) = candidate.landmarks {
             if let Some(landmarks) = classify_landmarks(&points) {
                 let eye_mid = midpoint(landmarks.left_eye, landmarks.right_eye);
@@ -4469,14 +5108,15 @@ fn face_frame_spec_from_landmarks(candidate: &FaceCandidate) -> FaceFrameSpec {
                     let denom = candidate.rect.h.max(1e-4);
                     let offset = (head_top - candidate.rect.y) / denom;
                     if offset.is_finite() {
-                        let min_offset = face_frame_head_top_min();
-                        let max_offset = face_frame_head_top_max().max(min_offset);
-                        head_top_offset = offset.clamp(min_offset, max_offset);
+                        head_top_offset = offset;
                     }
                 }
             }
         }
+    } else if head_top_offset > min_offset {
+        head_top_offset = min_offset;
     }
+    head_top_offset = head_top_offset.clamp(min_offset, max_offset);
     FaceFrameSpec {
         head_top_offset,
         shoulder_width_scale: face_frame_shoulder_scale(),
@@ -4508,6 +5148,14 @@ fn pose_frame_spec_for_candidate(
             }
         }
     }
+    let min_offset = face_frame_head_top_min();
+    let max_offset = face_frame_head_top_max();
+    let (min_offset, max_offset) = if min_offset <= max_offset {
+        (min_offset, max_offset)
+    } else {
+        (max_offset, min_offset)
+    };
+    head_top_offset = head_top_offset.clamp(min_offset, max_offset);
 
     if let Some(width) = pose_shoulder_width(pose, min_score) {
         let denom = candidate.rect.w.max(1e-4);
@@ -5292,6 +5940,12 @@ fn parse_dims_token(token: &str) -> Option<(u32, u32)> {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct FaceMeshObservation {
+    top_y: f32,
+    bottom_y: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct FaceCandidate {
     rect: NormalizedRect,
     model_rect: NormalizedRect,
@@ -5299,6 +5953,7 @@ struct FaceCandidate {
     score: f32,
     landmarks_ok: bool,
     landmarks: Option<[NormalizedPoint; 5]>,
+    mesh: Option<FaceMeshObservation>,
     region: NormalizedRect,
 }
 
@@ -5424,6 +6079,23 @@ fn expand_rect(rect: NormalizedRect, scale: f32) -> NormalizedRect {
         },
         center,
     )
+}
+
+fn expand_rect_margins(rect: NormalizedRect, x_margin: f32, y_margin: f32) -> NormalizedRect {
+    let x_margin = if x_margin.is_finite() { x_margin.max(0.0) } else { 0.0 };
+    let y_margin = if y_margin.is_finite() { y_margin.max(0.0) } else { 0.0 };
+    let extra_w = rect.w * x_margin;
+    let extra_h = rect.h * y_margin;
+    let left = (rect.x - extra_w).max(0.0);
+    let right = (rect.x + rect.w + extra_w).min(1.0);
+    let top = (rect.y - extra_h).max(0.0);
+    let bottom = (rect.y + rect.h + extra_h).min(1.0);
+    NormalizedRect {
+        x: left,
+        y: top,
+        w: (right - left).max(0.0),
+        h: (bottom - top).max(0.0),
+    }
 }
 
 fn select_consensus_face(observations: &[FaceObservation]) -> Option<FaceConsensus> {
@@ -6079,6 +6751,7 @@ mod tests {
             score: 0.9,
             landmarks_ok: false,
             landmarks: None,
+            mesh: None,
             region: NormalizedRect {
                 x: 0.0,
                 y: 0.0,

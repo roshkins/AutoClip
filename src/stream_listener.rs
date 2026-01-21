@@ -1,10 +1,39 @@
-use std::io::{BufRead, BufReader, Read};
+use std::env;
+use std::io::{BufRead, BufReader, IsTerminal, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+
+fn parse_bool_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn ansi_alert_enabled() -> bool {
+    if env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if let Ok(value) = env::var("CLIP_COLOR") {
+        if let Some(enabled) = parse_bool_env(&value) {
+            return enabled;
+        }
+    }
+    std::io::stderr().is_terminal()
+}
+
+fn format_wake_alert(message: &str) -> String {
+    if ansi_alert_enabled() {
+        format!("\x1b[1;31m{message}\x1b[0m")
+    } else {
+        message.to_string()
+    }
+}
 
 /// Start a background listener that invokes whisper.cpp `stream` binary with VAD and watches stdout for the wake phrase.
 pub fn start_stream_listener(
@@ -79,7 +108,8 @@ fn run_stream_listener(
         if matches_phrase(&norm, phrases) {
             let already = fired.swap(true, Ordering::Relaxed);
             if !already {
-                eprintln!("wake phrase detected via stream: {norm}");
+                let msg = format!("wake phrase detected via stream: {norm}");
+                eprintln!("{}", format_wake_alert(&msg));
             }
         }
     }

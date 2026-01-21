@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::ffi::CStr;
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, IsTerminal, Read};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -115,6 +115,26 @@ fn parse_bool_env(value: &str) -> Option<bool> {
         "1" | "true" | "yes" | "y" | "on" => Some(true),
         "0" | "false" | "no" | "n" | "off" => Some(false),
         _ => None,
+    }
+}
+
+fn ansi_alert_enabled() -> bool {
+    if env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if let Ok(value) = env::var("CLIP_COLOR") {
+        if let Some(enabled) = parse_bool_env(&value) {
+            return enabled;
+        }
+    }
+    std::io::stderr().is_terminal()
+}
+
+fn format_wake_alert(message: &str) -> String {
+    if ansi_alert_enabled() {
+        format!("\x1b[1;31m{message}\x1b[0m")
+    } else {
+        message.to_string()
     }
 }
 
@@ -594,7 +614,8 @@ where
                         let matched = matched_phrase
                             .map(|p| p.raw.as_str())
                             .unwrap_or("unknown");
-                        eprintln!("wake phrase detected via stream audio: {matched}");
+                        let msg = format!("wake phrase detected via stream audio: {matched}");
+                        eprintln!("{}", format_wake_alert(&msg));
                     }
                 }
             }
@@ -1129,7 +1150,8 @@ fn run_wake_loop_file(
                 let matched = matched_phrase
                     .map(|p| p.raw.as_str())
                     .unwrap_or("unknown");
-                eprintln!("wake phrase detected in file audio: {matched}");
+                let msg = format!("wake phrase detected in file audio: {matched}");
+                eprintln!("{}", format_wake_alert(&msg));
                 return Ok(Some(abs_t0_secs));
             }
         }
