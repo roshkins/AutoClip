@@ -1245,16 +1245,35 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn log_run_event(save_root: &str, message: &str) {
-    let base = if save_root.trim().is_empty() {
-        Path::new(".")
+const NON_VIDEO_SUBDIR: &str = "_non_video";
+
+fn resolve_save_root(save_root: &str) -> PathBuf {
+    if save_root.trim().is_empty() {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     } else {
-        Path::new(save_root)
-    };
-    let path = base.join("autoclip_run.log");
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        PathBuf::from(save_root)
     }
+}
+
+fn non_video_dir(save_root: &str) -> PathBuf {
+    let base = resolve_save_root(save_root);
+    let dir = if base
+        .file_name()
+        .and_then(|v| v.to_str())
+        .map(|v| v.eq_ignore_ascii_case(NON_VIDEO_SUBDIR))
+        .unwrap_or(false)
+    {
+        base
+    } else {
+        base.join(NON_VIDEO_SUBDIR)
+    };
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn log_run_event(save_root: &str, message: &str) {
+    let base = non_video_dir(save_root);
+    let path = base.join("autoclip_run.log");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1336,11 +1355,7 @@ fn whisper_worker_status_path(save_root: &str) -> PathBuf {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let base = if save_root.trim().is_empty() {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            } else {
-                PathBuf::from(save_root)
-            };
+            let base = non_video_dir(save_root);
             base.join(".whisper_wake_status.json")
         })
 }
@@ -1352,11 +1367,7 @@ fn whisper_worker_media_url_path(save_root: &str) -> PathBuf {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let base = if save_root.trim().is_empty() {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            } else {
-                PathBuf::from(save_root)
-            };
+            let base = non_video_dir(save_root);
             base.join(".whisper_wake_media_url.txt")
         })
 }
@@ -2853,6 +2864,42 @@ fn face_rect_from_hints(hints: &clip_layout::ClipLayoutHints) -> Option<Normaliz
         })
 }
 
+fn face_rect_for_gameplay_guess(hints: &clip_layout::ClipLayoutHints) -> Option<NormalizedRect> {
+    hints.face_box.or_else(|| {
+        hints
+            .face_track
+            .as_ref()
+            .and_then(|track| track.points.first().map(|p| p.rect))
+    })
+}
+
+fn guess_gameplay_low_resource(
+    hints: &clip_layout::ClipLayoutHints,
+    face_only_area_threshold: f32,
+) -> Option<(bool, f32, f32)> {
+    let rect = face_rect_for_gameplay_guess(hints)?;
+    let area = rect_area(rect);
+    if !area.is_finite() {
+        return None;
+    }
+    let center_x = (rect.x + rect.w / 2.0).clamp(0.0, 1.0);
+    let center_y = (rect.y + rect.h / 2.0).clamp(0.0, 1.0);
+    let edge_bias = center_x
+        .min(center_y)
+        .min(1.0 - center_x)
+        .min(1.0 - center_y);
+    const TINY_FACE_AREA: f32 = 0.03;
+    const EDGE_BIAS_THRESHOLD: f32 = 0.22;
+    if area >= face_only_area_threshold {
+        return Some((false, area, edge_bias));
+    }
+    if area <= TINY_FACE_AREA {
+        let gameplay_present = edge_bias <= EDGE_BIAS_THRESHOLD;
+        return Some((gameplay_present, area, edge_bias));
+    }
+    None
+}
+
 fn rect_contains_rect(outer: NormalizedRect, inner: NormalizedRect, margin: f32) -> bool {
     let margin = margin.max(0.0);
     let left = outer.x - margin;
@@ -3304,7 +3351,8 @@ fn next_output_path(save_dir: &str, stub: &str) -> Result<PathBuf> {
     let dir = Path::new(save_dir);
     fs::create_dir_all(dir).with_context(|| format!("creating save dir {save_dir}"))?;
 
-    let counter_path = dir.join(format!(".{stub}_counter"));
+    let counter_dir = non_video_dir(save_dir);
+    let counter_path = counter_dir.join(format!(".{stub}_counter"));
     let counter_idx = fs::read_to_string(&counter_path)
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
@@ -3869,12 +3917,95 @@ fn merge_layout_hints(target: &mut ClipLayoutHints, cached: &ClipLayoutHints) {
     if target.face_frame_spec.is_none() {
         target.face_frame_spec = cached.face_frame_spec;
     }
+    if target.face_focus.is_none() {
+        target.face_focus = cached.face_focus;
+    }
     if target.game_center.is_none() {
         target.game_center = cached.game_center;
     }
     if target.game_region.is_none() {
         target.game_region = cached.game_region;
     }
+}
+
+struct EnvSnapshot {
+    key: &'static str,
+    value: Option<String>,
+}
+
+fn set_env_for_scope(key: &'static str, value: &str, snapshot: &mut Vec<EnvSnapshot>) {
+    if !snapshot.iter().any(|entry| entry.key == key) {
+        snapshot.push(EnvSnapshot {
+            key,
+            value: std::env::var(key).ok(),
+        });
+    }
+    std::env::set_var(key, value);
+}
+
+fn restore_env_snapshot(snapshot: Vec<EnvSnapshot>) {
+    for entry in snapshot {
+        match entry.value {
+            Some(value) => std::env::set_var(entry.key, value),
+            None => std::env::remove_var(entry.key),
+        }
+    }
+}
+
+async fn refine_face_hints_low_resource(input: &str, hints: &mut ClipLayoutHints) {
+    if !low_resource_enabled() {
+        return;
+    }
+    let baseline_area = if let Some(face_rect) = face_rect_for_gameplay_guess(hints) {
+        let area = rect_area(face_rect);
+        if area >= 0.02 {
+            return;
+        }
+        area
+    } else {
+        0.0
+    };
+
+    let mut cfg = read_clip_detect_config();
+    cfg.enabled = true;
+    cfg.sample_count = 1;
+    cfg.sample_start_secs = cfg.sample_start_secs.max(1.0);
+    cfg.sample_step_secs = cfg.sample_step_secs.max(1.0);
+    cfg.scan_full_clip = false;
+    cfg.track_face = false;
+    cfg.face_track_step_secs = None;
+    cfg.face_budget_override = Some(Duration::from_secs(2));
+    cfg.analysis_budget = Some(Duration::from_secs(2));
+
+    let mut snapshot = Vec::new();
+    set_env_for_scope("CLIP_REGION_DETECT", "0", &mut snapshot);
+    set_env_for_scope("CLIP_GAMEPLAY_DETECT", "0", &mut snapshot);
+    set_env_for_scope("CLIP_GAMEPLAY", "0", &mut snapshot);
+
+    let refined = detect_layout_hints(input, &cfg).await;
+    restore_env_snapshot(snapshot);
+
+    let Ok(refined) = refined else {
+        return;
+    };
+    let Some(refined_box) = refined.face_box else {
+        return;
+    };
+    let refined_area = rect_area(refined_box);
+    if refined_area <= baseline_area {
+        return;
+    }
+    hints.face_box = Some(refined_box);
+    if hints.face_frame_spec.is_none() {
+        hints.face_frame_spec = refined.face_frame_spec;
+    }
+    if hints.face_region.is_none() {
+        hints.face_region = refined.face_region;
+    }
+    eprintln!(
+        "clip layout: low-resource refined face box x={:.3} y={:.3} w={:.3} h={:.3}",
+        refined_box.x, refined_box.y, refined_box.w, refined_box.h
+    );
 }
 
 fn min_duration(current: Option<Duration>, max: Duration) -> Duration {
@@ -5023,11 +5154,15 @@ async fn run_ffmpeg_internal(
             eprintln!("live render: using cached layout hints");
         }
     }
+    if !live_fast {
+        refine_face_hints_low_resource(input, &mut layout_hints).await;
+    }
     let mut layout_is_stacked = matches!(layout.mode, ClipLayoutMode::Stacked);
     let mut face_only = false;
     let mut fullscreen_fill = false;
     let mut fullscreen_track = None;
     let mut fullscreen_center_override = None;
+    let face_focus = layout_hints.face_focus;
     let face_only_area_threshold = 0.40;
     let face_center = |rect: crate::clip_layout::NormalizedRect| NormalizedPoint {
         x: (rect.x + rect.w / 2.0).clamp(0.0, 1.0),
@@ -5096,15 +5231,41 @@ async fn run_ffmpeg_internal(
             || layout_hints.face_box.is_some()
             || layout_hints.face_track.is_some();
         let mut gameplay_found = gameplay_enabled() && layout_hints.game_center.is_some();
+        let mut low_resource_guess: Option<bool> = None;
         let face_area = face_area_from_hints(&layout_hints).unwrap_or(0.0);
         let face_large = face_area >= face_only_area_threshold;
+        if low_resource_enabled() && !gameplay_found {
+            if let Some((guess, area, edge)) =
+                guess_gameplay_low_resource(&layout_hints, face_only_area_threshold)
+            {
+                gameplay_found = guess;
+                low_resource_guess = Some(guess);
+                if guess {
+                    eprintln!(
+                        "clip layout: low-resource guess -> gameplay present (face area {:.3}, edge {:.3})",
+                        area, edge
+                    );
+                } else {
+                    eprintln!(
+                        "clip layout: low-resource guess -> no gameplay (face area {:.3}, edge {:.3})",
+                        area, edge
+                    );
+                }
+            }
+        }
         if face_found && !gameplay_found && !face_large {
-            gameplay_found = true;
-            eprintln!(
-                "clip layout: gameplay not detected; face area {:.3} below {:.2}; assuming gameplay present for stacked layout",
-                face_area,
-                face_only_area_threshold
-            );
+            if low_resource_enabled() && low_resource_guess == Some(false) {
+                eprintln!(
+                    "clip layout: low-resource guess suggests no gameplay; skipping stacked fallback"
+                );
+            } else {
+                gameplay_found = true;
+                eprintln!(
+                    "clip layout: gameplay not detected; face area {:.3} below {:.2}; assuming gameplay present for stacked layout",
+                    face_area,
+                    face_only_area_threshold
+                );
+            }
         }
         let face_rect = face_rect_from_hints(&layout_hints);
         let face_inside_game = gameplay_found
@@ -5126,9 +5287,18 @@ async fn run_ffmpeg_internal(
             } else {
                 fullscreen_fill = true;
                 fullscreen_track = layout_hints.face_track.clone();
-                fullscreen_center_override = layout_hints
-                    .face_box
-                    .map(face_center)
+                if fullscreen_track.is_none() {
+                    if let Some(face_box) = layout_hints.face_box {
+                        let rect = if let Some(focus) = face_focus {
+                            clip_layout::recenter_rect_x(face_box, focus.x)
+                        } else {
+                            face_box
+                        };
+                        fullscreen_track = Some(clip_layout::synthesize_face_track(rect));
+                    }
+                }
+                fullscreen_center_override = face_focus
+                    .or_else(|| layout_hints.face_box.map(face_center))
                     .or_else(|| {
                         layout_hints
                             .face_track
@@ -8166,7 +8336,8 @@ mod tests {
 
         let renamed = dir.join("clip_001__title.mp4");
         fs::write(&renamed, "stub")?;
-        let counter = dir.join(".clip_counter");
+        let counter_dir = non_video_dir(dir.to_str().unwrap_or("."));
+        let counter = counter_dir.join(".clip_counter");
         fs::write(&counter, "2\n")?;
 
         let next = next_output_path(dir.to_str().unwrap_or("."), "clip")?;
@@ -8304,6 +8475,101 @@ mod tests {
         let srt = build_srt_from_payload(&payload, Some(2.0)).unwrap();
         assert!(srt.contains("00:00:00,000 --> 00:00:01,000"));
         assert!(srt.contains("Hello world"));
+    }
+
+    #[test]
+    fn non_video_files_use_subdir() -> Result<()> {
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("autoclip_nv_{stamp}"));
+        fs::create_dir_all(&dir)?;
+        let dir_str = dir.to_string_lossy().to_string();
+
+        let mut env = EnvGuard::new();
+        env.set("WHISPER_WORKER_STATUS_PATH", "");
+        env.set("WHISPER_WORKER_MEDIA_URL_PATH", "");
+
+        let status_path = whisper_worker_status_path(&dir_str);
+        let media_path = whisper_worker_media_url_path(&dir_str);
+        let expected_dir = dir.join(NON_VIDEO_SUBDIR);
+        assert_eq!(
+            status_path,
+            expected_dir.join(".whisper_wake_status.json")
+        );
+        assert_eq!(
+            media_path,
+            expected_dir.join(".whisper_wake_media_url.txt")
+        );
+
+        log_run_event(&dir_str, "test");
+        assert!(expected_dir.join("autoclip_run.log").exists());
+
+        let _ = next_output_path(&dir_str, "clip")?;
+        assert!(expected_dir.join(".clip_counter").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn low_resource_face_box_still_uses_kalman_for_fullscreen_track() {
+        let original_low = std::env::var("CLIP_LOW_RESOURCES").ok();
+        let mut env = EnvGuard::new();
+        env.set("CLIP_LOW_RESOURCES", "1");
+        refresh_low_resource_state();
+        env.set("CLIP_FACE_BOX", "0.1,0.1,0.8,0.8");
+
+        let hints = read_clip_layout_hints();
+        let face_box = hints.face_box.expect("expected face box");
+        let track = clip_layout::synthesize_face_track(face_box);
+        let FilterGraph::Vf(chain) =
+            build_tracked_full_frame_fill_filter_graph(1080, 1920, &track)
+                .expect("expected tracked full-frame graph")
+        else {
+            panic!("expected Vf filter graph");
+        };
+        assert!(
+            chain.contains("between(t"),
+            "expected kalman-driven tracked crop expression"
+        );
+
+        match original_low {
+            Some(value) => std::env::set_var("CLIP_LOW_RESOURCES", value),
+            None => std::env::remove_var("CLIP_LOW_RESOURCES"),
+        }
+        refresh_low_resource_state();
+    }
+
+    #[test]
+    fn low_resource_guess_rejects_small_center_face() {
+        let hints = ClipLayoutHints {
+            face_box: Some(NormalizedRect {
+                x: 0.42,
+                y: 0.24,
+                w: 0.03,
+                h: 0.05,
+            }),
+            ..ClipLayoutHints::default()
+        };
+        let guess = guess_gameplay_low_resource(&hints, 0.40);
+        assert_eq!(guess.map(|(value, _, _)| value), Some(false));
+    }
+
+    #[test]
+    fn low_resource_guess_accepts_small_edge_face() {
+        let hints = ClipLayoutHints {
+            face_box: Some(NormalizedRect {
+                x: 0.02,
+                y: 0.02,
+                w: 0.04,
+                h: 0.05,
+            }),
+            ..ClipLayoutHints::default()
+        };
+        let guess = guess_gameplay_low_resource(&hints, 0.40);
+        assert_eq!(guess.map(|(value, _, _)| value), Some(true));
     }
 
     #[tokio::test]

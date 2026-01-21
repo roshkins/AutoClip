@@ -1362,6 +1362,17 @@ pub async fn detect_layout_hints(
     if let Some(best) = face_best {
         hints.face_box = Some(best.rect);
         hints.face_frame_spec = best.frame_spec;
+        if hints.face_focus.is_none() {
+            hints.face_focus = best.focus;
+        }
+        if (face_debug_enabled() || face_mesh_debug_enabled()) && hints.face_focus.is_some() {
+            if let Some(focus) = hints.face_focus {
+                eprintln!(
+                    "clip detect: face focus x={:.3} y={:.3}",
+                    focus.x, focus.y
+                );
+            }
+        }
         let region = pick_face_region(best.rect).or_else(|| {
             if best.region.w >= 0.25 && best.region.h >= 0.25 {
                 Some(best.region)
@@ -2372,12 +2383,14 @@ fn select_face_with_relaxation(
         let mut observations = Vec::new();
         for sample in samples {
             if let Some(best) = select_best_candidate_for_pass(sample, detector, &pass) {
+                let rect = recentered_rect_from_candidate(&best);
                 observations.push(FaceObservation {
-                    rect: best.rect,
+                    rect,
                     score: best.score,
                     time: sample.time,
                     region: best.region,
                     frame_spec: face_frame_spec_for_candidate(&best, sample.pose.as_ref()),
+                    focus: face_focus_from_candidate(&best),
                 });
             }
         }
@@ -2416,11 +2429,12 @@ fn select_best_raw_candidate(
             .candidates
             .iter()
             .any(|c| c.landmarks_ok && c.raw_score.is_finite() && c.raw_score >= min_score);
+        let enforce_landmarks = has_landmarks && !low_resource_enabled();
         for candidate in &sample.candidates {
             if !candidate.raw_score.is_finite() || candidate.raw_score < min_score {
                 continue;
             }
-            if has_landmarks && !candidate.landmarks_ok {
+            if enforce_landmarks && !candidate.landmarks_ok {
                 continue;
             }
             let weighted =
@@ -2444,12 +2458,14 @@ fn select_best_raw_candidate(
             }
         }
         if let Some((_area, _weighted, raw, best)) = best {
+            let rect = recentered_rect_from_candidate(&best);
             observations.push(FaceObservation {
-                rect: best.rect,
+                rect,
                 score: raw,
                 time: sample.time,
                 region: best.region,
                 frame_spec: face_frame_spec_for_candidate(&best, sample.pose.as_ref()),
+                focus: face_focus_from_candidate(&best),
             });
         }
     }
@@ -4644,25 +4660,40 @@ impl FaceMeshDetector {
             return None;
         }
         let output = select_face_mesh_output(&outputs)?;
-        let (mut top_y, mut bottom_y) =
+        let (mut left_x, mut right_x, mut top_y, mut bottom_y) =
             decode_face_mesh_bounds(output, self.input_w, self.input_h)?;
         if let Some(mapping) = frame.mapping.as_ref() {
+            let left = mapping.map_point(NormalizedPoint { x: left_x, y: 0.5 })?;
+            let right = mapping.map_point(NormalizedPoint { x: right_x, y: 0.5 })?;
             let top = mapping.map_point(NormalizedPoint { x: 0.5, y: top_y })?;
             let bottom = mapping.map_point(NormalizedPoint { x: 0.5, y: bottom_y })?;
+            left_x = left.x;
+            right_x = right.x;
             top_y = top.y;
             bottom_y = bottom.y;
         }
-        if !top_y.is_finite() || !bottom_y.is_finite() || bottom_y <= top_y {
+        if !left_x.is_finite()
+            || !right_x.is_finite()
+            || !top_y.is_finite()
+            || !bottom_y.is_finite()
+            || right_x <= left_x
+            || bottom_y <= top_y
+        {
             return None;
         }
         let observation = FaceMeshObservation {
+            left_x,
+            right_x,
             top_y,
             bottom_y,
         };
         if face_mesh_debug_enabled() {
             eprintln!(
-                "clip detect: face mesh top={:.3} bottom={:.3}",
-                observation.top_y, observation.bottom_y
+                "clip detect: face mesh bounds x={:.3}->{:.3} y={:.3}->{:.3}",
+                observation.left_x,
+                observation.right_x,
+                observation.top_y,
+                observation.bottom_y
             );
         }
         Some(observation)
@@ -4688,9 +4719,9 @@ fn select_face_mesh_output(outputs: &[TValue]) -> Option<&TValue> {
 
 fn decode_face_mesh_bounds(
     output: &TValue,
-    _input_w: u32,
+    input_w: u32,
     input_h: u32,
-) -> Option<(f32, f32)> {
+) -> Option<(f32, f32, f32, f32)> {
     let data = output.as_slice::<f32>().ok()?;
     if data.len() < FACE_MESH_MIN_POINTS.saturating_mul(3) {
         return None;
@@ -4718,7 +4749,7 @@ fn decode_face_mesh_bounds(
             max_y = y;
         }
     }
-    if !min_y.is_finite() || !max_y.is_finite() {
+    if !min_x.is_finite() || !max_x.is_finite() || !min_y.is_finite() || !max_y.is_finite() {
         return None;
     }
     let max_abs = min_x
@@ -4727,21 +4758,30 @@ fn decode_face_mesh_bounds(
         .max(min_y.abs())
         .max(max_y.abs());
     if max_abs > 2.0 {
+        let w = input_w as f32;
         let h = input_h as f32;
+        if w > 0.0 {
+            min_x /= w;
+            max_x /= w;
+        }
         if h > 0.0 {
             min_y /= h;
             max_y /= h;
         }
     } else if min_y < -0.5 || max_y > 1.5 || min_x < -0.5 || max_x > 1.5 {
+        min_x = (min_x + 1.0) * 0.5;
+        max_x = (max_x + 1.0) * 0.5;
         min_y = (min_y + 1.0) * 0.5;
         max_y = (max_y + 1.0) * 0.5;
     }
+    min_x = clamp_unit(min_x);
+    max_x = clamp_unit(max_x);
     min_y = clamp_unit(min_y);
     max_y = clamp_unit(max_y);
-    if max_y <= min_y {
+    if max_x <= min_x || max_y <= min_y {
         return None;
     }
-    Some((min_y, max_y))
+    Some((min_x, max_x, min_y, max_y))
 }
 
 fn decode_movenet_keypoints(output: &Tensor) -> Option<[PoseKeypoint; POSE_KEYPOINT_COUNT]> {
@@ -4936,6 +4976,107 @@ fn points_center(points: &[NormalizedPoint; 5]) -> NormalizedPoint {
     NormalizedPoint {
         x: clamp_unit(sum_x / denom),
         y: clamp_unit(sum_y / denom),
+    }
+}
+
+fn low_resource_enabled() -> bool {
+    std::env::var("CLIP_LOW_RESOURCES")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+fn recenter_rect_x(rect: NormalizedRect, center_x: f32) -> NormalizedRect {
+    let w = rect.w.clamp(0.0, 1.0);
+    let h = rect.h.clamp(0.0, 1.0);
+    let mut x = center_x - w / 2.0;
+    if x < 0.0 {
+        x = 0.0;
+    }
+    if x + w > 1.0 {
+        x = 1.0 - w;
+    }
+    NormalizedRect {
+        x: clamp_unit(x),
+        y: rect.y.clamp(0.0, 1.0),
+        w,
+        h,
+    }
+}
+
+fn recentered_rect_from_candidate(candidate: &FaceCandidate) -> NormalizedRect {
+    if !low_resource_enabled() {
+        return candidate.rect;
+    }
+    if let Some(mesh) = candidate.mesh {
+        let center_x = (mesh.left_x + mesh.right_x) * 0.5;
+        if center_x.is_finite() {
+            let rect_center = rect_center(candidate.rect);
+            let dx = (center_x - rect_center.x).abs();
+            if dx > candidate.rect.w * 0.05 {
+                return recenter_rect_x(candidate.rect, center_x);
+            }
+        }
+    }
+    let Some(points) = candidate.landmarks else {
+        return candidate.rect;
+    };
+    if !landmarks_within_rect(&points, candidate.rect) {
+        return candidate.rect;
+    }
+    let landmarks = classify_landmarks(&points);
+    let mut center_x = landmarks
+        .map(|landmarks| midpoint(landmarks.left_eye, landmarks.right_eye).x)
+        .unwrap_or_else(|| points_center(&points).x);
+    if !center_x.is_finite() {
+        return candidate.rect;
+    }
+    if let Some(landmarks) = landmarks {
+        let eye_mid = midpoint(landmarks.left_eye, landmarks.right_eye);
+        let eye_dx = (landmarks.right_eye.x - landmarks.left_eye.x).abs().max(1e-4);
+        let nose_bias = (landmarks.nose.x - eye_mid.x) / eye_dx;
+        if nose_bias.is_finite() && nose_bias.abs() > 0.08 {
+            let shift = (-nose_bias).clamp(-1.0, 1.0) * candidate.rect.w * 0.6;
+            center_x = (center_x + shift).clamp(0.0, 1.0);
+        }
+    }
+    let rect_center = rect_center(candidate.rect);
+    let dx = (center_x - rect_center.x).abs();
+    if dx <= candidate.rect.w * 0.05 {
+        return candidate.rect;
+    }
+    recenter_rect_x(candidate.rect, center_x)
+}
+
+fn face_focus_from_candidate(candidate: &FaceCandidate) -> Option<NormalizedPoint> {
+    if let Some(mesh) = candidate.mesh {
+        let center_x = (mesh.left_x + mesh.right_x) * 0.5;
+        let center_y = (mesh.top_y + mesh.bottom_y) * 0.5;
+        if center_x.is_finite() && center_y.is_finite() {
+            return Some(NormalizedPoint {
+                x: clamp_unit(center_x),
+                y: clamp_unit(center_y),
+            });
+        }
+    }
+    let points = candidate.landmarks?;
+    if let Some(landmarks) = classify_landmarks(&points) {
+        let eye_mid = midpoint(landmarks.left_eye, landmarks.right_eye);
+        let mouth_mid = midpoint(landmarks.left_mouth, landmarks.right_mouth);
+        let center_y = (eye_mid.y + mouth_mid.y) * 0.5;
+        return Some(NormalizedPoint {
+            x: clamp_unit(eye_mid.x),
+            y: clamp_unit(center_y),
+        });
+    }
+    let center = points_center(&points);
+    if center.x.is_finite() && center.y.is_finite() {
+        Some(NormalizedPoint {
+            x: clamp_unit(center.x),
+            y: clamp_unit(center.y),
+        })
+    } else {
+        None
     }
 }
 
@@ -5941,6 +6082,8 @@ fn parse_dims_token(token: &str) -> Option<(u32, u32)> {
 
 #[derive(Clone, Copy, Debug)]
 struct FaceMeshObservation {
+    left_x: f32,
+    right_x: f32,
     top_y: f32,
     bottom_y: f32,
 }
@@ -5999,6 +6142,7 @@ struct FaceObservation {
     time: f32,
     region: NormalizedRect,
     frame_spec: Option<FaceFrameSpec>,
+    focus: Option<NormalizedPoint>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6010,6 +6154,7 @@ struct FaceConsensus {
     max_dist: f32,
     region: NormalizedRect,
     frame_spec: Option<FaceFrameSpec>,
+    focus: Option<NormalizedPoint>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6190,6 +6335,9 @@ struct FaceCluster {
     rect_sum_h: f32,
     center_sum_x: f32,
     center_sum_y: f32,
+    focus_sum_x: f32,
+    focus_sum_y: f32,
+    focus_weight: f32,
     dist_sum: f32,
     dist_count: usize,
     max_dist: f32,
@@ -6201,6 +6349,15 @@ impl FaceCluster {
         let center = rect_center(obs.rect);
         let weight = obs.score.max(0.0);
         let area = rect_area(obs.rect);
+        let (focus_sum_x, focus_sum_y, focus_weight) = if weight > 0.0 {
+            if let Some(focus) = obs.focus {
+                (focus.x * weight, focus.y * weight, weight)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        } else {
+            (0.0, 0.0, 0.0)
+        };
         Self {
             score_sum: weight,
             count: 1,
@@ -6211,6 +6368,9 @@ impl FaceCluster {
             rect_sum_h: obs.rect.h * weight,
             center_sum_x: center.x * weight,
             center_sum_y: center.y * weight,
+            focus_sum_x,
+            focus_sum_y,
+            focus_weight,
             dist_sum: 0.0,
             dist_count: 0,
             max_dist: 0.0,
@@ -6232,6 +6392,11 @@ impl FaceCluster {
             let center = rect_center(obs.rect);
             self.center_sum_x += center.x * weight;
             self.center_sum_y += center.y * weight;
+            if let Some(focus) = obs.focus {
+                self.focus_sum_x += focus.x * weight;
+                self.focus_sum_y += focus.y * weight;
+                self.focus_weight += weight;
+            }
             let dist = (center.x - center_before.x)
                 .abs()
                 .max((center.y - center_before.y).abs());
@@ -6261,6 +6426,14 @@ impl FaceCluster {
     }
 
     fn to_consensus(&self) -> FaceConsensus {
+        let focus = if self.focus_weight > 0.0 {
+            Some(NormalizedPoint {
+                x: clamp_unit(self.focus_sum_x / self.focus_weight),
+                y: clamp_unit(self.focus_sum_y / self.focus_weight),
+            })
+        } else {
+            self.best.focus
+        };
         if self.score_sum > 0.0 {
             let rect = NormalizedRect {
                 x: clamp_unit(self.rect_sum_x / self.score_sum),
@@ -6276,6 +6449,7 @@ impl FaceCluster {
                 max_dist: self.max_dist,
                 region: self.best.region,
                 frame_spec: self.best.frame_spec,
+                focus,
             }
         } else {
             FaceConsensus {
@@ -6286,6 +6460,7 @@ impl FaceCluster {
                 max_dist: self.max_dist,
                 region: self.best.region,
                 frame_spec: self.best.frame_spec,
+                focus,
             }
         }
     }
@@ -6480,6 +6655,7 @@ mod tests {
                 head_top_offset: 0.0,
                 shoulder_width_scale: 1.0,
             }),
+            focus: None,
         }
     }
 

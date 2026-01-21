@@ -85,6 +85,24 @@ impl NormalizedRect {
     }
 }
 
+pub fn recenter_rect_x(rect: NormalizedRect, center_x: f32) -> NormalizedRect {
+    let w = rect.w.clamp(0.0, 1.0);
+    let h = rect.h.clamp(0.0, 1.0);
+    let mut x = center_x - w / 2.0;
+    if x < 0.0 {
+        x = 0.0;
+    }
+    if x + w > 1.0 {
+        x = 1.0 - w;
+    }
+    NormalizedRect {
+        x: clamp_unit(x),
+        y: rect.y.clamp(0.0, 1.0),
+        w,
+        h,
+    }
+}
+
 fn expand_rect_width_to_aspect(rect: NormalizedRect, target_aspect: f32) -> NormalizedRect {
     let target_aspect = if target_aspect.is_finite() && target_aspect > 0.0 {
         target_aspect
@@ -133,7 +151,11 @@ fn frame_rect_for_face(
             width = (height * target_aspect).min(bounds.w);
         }
     }
-    let center_x = face_rect.x + face_rect.w / 2.0;
+    let mut center_x = face_rect.x + face_rect.w / 2.0;
+    let eye_mid_x = face_rect.x + face_rect.w * 0.52;
+    if eye_mid_x.is_finite() {
+        center_x = center_x * 0.6 + eye_mid_x * 0.4;
+    }
     let mut x = center_x - width / 2.0;
     let mut y = head_top;
     let min_x = bounds.x;
@@ -171,6 +193,18 @@ pub struct FaceTrack {
     pub points: Vec<FaceTrackPoint>,
 }
 
+pub fn synthesize_face_track(rect: NormalizedRect) -> FaceTrack {
+    FaceTrack {
+        points: vec![
+            FaceTrackPoint { time: 0.0, rect },
+            FaceTrackPoint {
+                time: MIN_FACE_REFRAME_SECS,
+                rect,
+            },
+        ],
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClipLayoutConfig {
     pub mode: ClipLayoutMode,
@@ -193,6 +227,7 @@ pub struct ClipLayoutHints {
     pub face_track: Option<FaceTrack>,
     pub face_region: Option<NormalizedRect>,
     pub face_frame_spec: Option<FaceFrameSpec>,
+    pub face_focus: Option<NormalizedPoint>,
     pub game_center: Option<NormalizedPoint>,
     pub game_region: Option<NormalizedRect>,
 }
@@ -290,6 +325,7 @@ pub fn read_clip_layout_hints() -> ClipLayoutHints {
         face_track: None,
         face_region,
         face_frame_spec: None,
+        face_focus: None,
         game_center,
         game_region,
     }
@@ -488,11 +524,8 @@ pub fn build_tracked_full_frame_fill_filter_graph(
     out_h: u32,
     track: &FaceTrack,
 ) -> Option<FilterGraph> {
-    if track.points.len() < 2 {
-        return None;
-    }
-    let mut samples: Vec<TrackSample> = track
-        .points
+    let points = ensure_track_points(&track.points)?;
+    let mut samples: Vec<TrackSample> = points
         .iter()
         .map(|point| TrackSample {
             time: point.time.max(0.0),
@@ -662,17 +695,42 @@ fn downsample_track_samples(samples: &[TrackSample], min_interval: f32) -> Vec<T
     out
 }
 
+fn ensure_track_points(points: &[FaceTrackPoint]) -> Option<Vec<FaceTrackPoint>> {
+    match points.len() {
+        0 => None,
+        1 => {
+            let first = points[0].clone();
+            Some(vec![
+                first.clone(),
+                FaceTrackPoint {
+                    time: first.time + MIN_FACE_REFRAME_SECS,
+                    rect: first.rect,
+                },
+            ])
+        }
+        _ => Some(points.to_vec()),
+    }
+}
+
 fn build_tracked_face_crop(
     layout: &ClipLayoutConfig,
     hints: &ClipLayoutHints,
     target_aspect: f32,
 ) -> Option<TrackedFaceCrop> {
-    let track = hints.face_track.as_ref()?;
-    if track.points.len() < 2 || layout.face_crop.is_some() {
+    if layout.face_crop.is_some() {
         return None;
     }
 
-    let mut points = track.points.clone();
+    let mut points = hints
+        .face_track
+        .as_ref()
+        .and_then(|track| ensure_track_points(&track.points));
+    if points.is_none() {
+        if let Some(face_box) = hints.face_box {
+            points = Some(synthesize_face_track(face_box).points);
+        }
+    }
+    let mut points = points?;
     points.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
     let bounds = hints.face_region.unwrap_or(NormalizedRect {
         x: 0.0,
@@ -1056,6 +1114,7 @@ mod tests {
             face_track: None,
             face_region: None,
             face_frame_spec: None,
+            face_focus: None,
             game_center: Some(NormalizedPoint { x: 0.5, y: 0.6 }),
             game_region: None,
         };
@@ -1066,8 +1125,8 @@ mod tests {
         };
         assert_eq!(output, "v");
         assert!(
-            graph.contains("crop=iw*0.3000:ih*0.3000:iw*0.0500:ih*0.0500"),
-            "face crop should expand around the detected face"
+            graph.contains("if(between(t"),
+            "face crop should use tracked expression around the detected face"
         );
         assert!(
             graph.contains("crop=1080:840:max(min(iw*0.5000-540.0\\, iw-1080)\\, 0):max(min(ih*0.6000-420.0\\, ih-840)\\, 0)"),
@@ -1117,5 +1176,61 @@ mod tests {
             chain.contains("if(between(t"),
             "expected dynamic center expression"
         );
+    }
+
+    #[test]
+    fn face_only_uses_kalman_for_face_box_only() {
+        let layout = ClipLayoutConfig {
+            mode: ClipLayoutMode::Full,
+            face_ratio: 0.4,
+            face_crop: None,
+            face_anchor: FaceAnchor::TopLeft,
+            face_context_scale: 2.0,
+            face_zoom: 1.0,
+        };
+        let hints = ClipLayoutHints {
+            face_box: Some(NormalizedRect {
+                x: 0.2,
+                y: 0.2,
+                w: 0.3,
+                h: 0.3,
+            }),
+            face_track: None,
+            face_region: None,
+            face_frame_spec: None,
+            face_focus: None,
+            game_center: None,
+            game_region: None,
+        };
+        let FilterGraph::Vf(chain) = build_face_only_filter_graph(1080, 1920, &layout, &hints)
+        else {
+            panic!("expected Vf filter graph");
+        };
+        assert!(
+            chain.contains("between(t"),
+            "expected kalman-driven tracked crop expression"
+        );
+    }
+
+    #[test]
+    fn tracked_full_frame_accepts_single_point_track() {
+        let track = FaceTrack {
+            points: vec![FaceTrackPoint {
+                time: 1.0,
+                rect: NormalizedRect {
+                    x: 0.3,
+                    y: 0.3,
+                    w: 0.2,
+                    h: 0.2,
+                },
+            }],
+        };
+        let FilterGraph::Vf(chain) =
+            build_tracked_full_frame_fill_filter_graph(1080, 1920, &track)
+                .expect("expected tracked full-frame graph")
+        else {
+            panic!("expected Vf filter graph");
+        };
+        assert!(chain.contains("between(t"));
     }
 }
