@@ -261,6 +261,7 @@ impl AutoClip {
         if let Some(state) = live_config.as_mut() {
             state.maybe_refresh();
         }
+        refresh_low_resource_state();
 
         let hls = HlsClient::new()?;
         let (master_url, master, headers) =
@@ -433,6 +434,7 @@ impl AutoClip {
             if let Some(state) = live_config.as_mut() {
                 state.maybe_refresh();
             }
+            refresh_low_resource_state();
 
             let latency = Duration::from_nanos(max_latency_ns.load(Ordering::Relaxed));
             let mut refreshed = false;
@@ -3579,6 +3581,105 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+const LOW_RESOURCE_OVERRIDES: &[(&str, &str)] = &[
+    ("CLIP_LIVE_FAST", "1"),
+    ("CLIP_POSE", "0"),
+    ("CLIP_FACE_TRACK", "0"),
+    ("CLIP_DETECT", "0"),
+    ("CLIP_GAMEPLAY", "0"),
+    ("CLIP_REGION_DETECT", "0"),
+    ("CLIP_CAPTIONS", "0"),
+    ("CLIP_CLOSED_CAPTIONS", "0"),
+    ("CLIP_LLM_ENABLE", "0"),
+    ("CLIP_EMOTION_ENABLE", "0"),
+    ("CLIP_EMOTION_AUDIO", "0"),
+    ("CLIP_EMOTION_FACE", "0"),
+    ("CLIP_FACE_BUDGET_SECS", "6"),
+    ("CLIP_DETECT_BUDGET_SECS", "6"),
+    ("CLIP_DETECT_SAMPLES", "1"),
+    ("CLIP_DETECT_STEP", "2.5"),
+    ("CLIP_LIVE_LAYOUT_TTL_SECS", "300"),
+    ("WHISPER_GPU", "0"),
+    ("WHISPER_CLIP_GPU", "0"),
+    ("WHISPER_RT_TARGET", "0.5"),
+    ("WHISPER_MODEL_CANDIDATES", "ggml-tiny.en.bin"),
+    ("WHISPER_WORKER_STATUS_MS", "1000"),
+];
+
+fn low_resource_enabled() -> bool {
+    std::env::var("CLIP_LOW_RESOURCES")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+struct LowResourceState {
+    enabled: bool,
+    baseline: HashMap<String, Option<String>>,
+}
+
+impl LowResourceState {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            baseline: HashMap::new(),
+        }
+    }
+
+    fn refresh(&mut self) {
+        let enabled = low_resource_enabled();
+        match (self.enabled, enabled) {
+            (false, true) => self.apply(),
+            (true, false) => self.restore(),
+            (true, true) => self.enforce(),
+            (false, false) => {}
+        }
+    }
+
+    fn apply(&mut self) {
+        for (key, value) in LOW_RESOURCE_OVERRIDES {
+            if !self.baseline.contains_key(*key) {
+                self.baseline.insert((*key).to_string(), std::env::var(*key).ok());
+            }
+            std::env::set_var(key, value);
+        }
+        self.enabled = true;
+        eprintln!("low resource mode enabled");
+    }
+
+    fn enforce(&self) {
+        for (key, value) in LOW_RESOURCE_OVERRIDES {
+            if std::env::var(key).ok().as_deref() != Some(*value) {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+
+    fn restore(&mut self) {
+        let keys: Vec<String> = self.baseline.keys().cloned().collect();
+        for key in keys {
+            match self.baseline.get(&key).cloned().unwrap_or(None) {
+                Some(value) => std::env::set_var(&key, value),
+                None => std::env::remove_var(&key),
+            }
+        }
+        self.baseline.clear();
+        self.enabled = false;
+        eprintln!("low resource mode disabled");
+    }
+}
+
+fn low_resource_state() -> &'static Mutex<LowResourceState> {
+    static STATE: OnceLock<Mutex<LowResourceState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(LowResourceState::new()))
+}
+
+fn refresh_low_resource_state() {
+    if let Ok(mut state) = low_resource_state().lock() {
+        state.refresh();
+    }
+}
+
 fn ensure_live_detect_budgets() {
     let mut face_secs = std::env::var("CLIP_FACE_BUDGET_SECS")
         .ok()
@@ -3617,6 +3718,90 @@ fn ensure_live_detect_budgets() {
             "clip detect: live budgets face={:.0}s gameplay={:.0}s (total {:.0}s)",
             face, gameplay, total
         );
+    }
+}
+
+fn single_instance_enabled(single_mode: bool) -> bool {
+    std::env::var("CLIP_SINGLE_INSTANCE")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(single_mode)
+}
+
+fn single_mode_from_env() -> bool {
+    std::env::var("CLIP_STREAMS_FILE")
+        .ok()
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true)
+}
+
+#[cfg(windows)]
+mod single_instance {
+    use anyhow::{anyhow, Result};
+    use std::ffi::OsStr;
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    pub struct SingleInstanceGuard {
+        handle: isize,
+    }
+
+    impl Drop for SingleInstanceGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+
+    pub fn acquire(name: &str) -> Result<SingleInstanceGuard> {
+        let wide: Vec<u16> = OsStr::new(name)
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, wide.as_ptr()) };
+        if handle == 0 {
+            return Err(anyhow!("failed to create mutex"));
+        }
+        let err = unsafe { GetLastError() };
+        if err == ERROR_ALREADY_EXISTS {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(anyhow!("another AutoClip instance is already running"));
+        }
+        Ok(SingleInstanceGuard { handle })
+    }
+}
+
+#[cfg(not(windows))]
+mod single_instance {
+    use anyhow::{anyhow, Result};
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+
+    pub struct SingleInstanceGuard {
+        _file: std::fs::File,
+    }
+
+    pub fn acquire(name: &str) -> Result<SingleInstanceGuard> {
+        let mut lock_path = std::env::temp_dir();
+        let sanitized: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        lock_path.push(format!("{sanitized}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        if let Err(_) = file.try_lock_exclusive() {
+            return Err(anyhow!("another AutoClip instance is already running"));
+        }
+        Ok(SingleInstanceGuard { _file: file })
     }
 }
 
@@ -5390,6 +5575,8 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_LIVE_CONFIG_POLL_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_LIVE_FAST", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_LIVE_LAYOUT_TTL_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_LOW_RESOURCES", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_SINGLE_INSTANCE", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_STREAMS_FILE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_STREAMS_POLL_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_STREAMS_MAX_CONCURRENT", mode: EnvValueMode::Required },
@@ -5490,6 +5677,7 @@ fn parse_cli_args(args: &[String]) -> Result<ParsedCli> {
     let mut override_phrase = None;
     let mut log_raw_wake = true;
     let mut log_raw_wake_set = false;
+    let mut low_resources_override: Option<bool> = None;
     let mut mic_device = None;
     let mut stream_urls: Vec<String> = Vec::new();
     let mut streams_file: Option<String> = None;
@@ -5560,6 +5748,16 @@ fn parse_cli_args(args: &[String]) -> Result<ParsedCli> {
             i += 1;
             continue;
         }
+        if arg == "--low-resources" {
+            low_resources_override = Some(true);
+            i += 1;
+            continue;
+        }
+        if arg == "--no-low-resources" {
+            low_resources_override = Some(false);
+            i += 1;
+            continue;
+        }
 
         let mut handled_env = false;
         if let Some(raw_flag) = arg.strip_prefix("--") {
@@ -5610,6 +5808,13 @@ fn parse_cli_args(args: &[String]) -> Result<ParsedCli> {
 
         positionals.push(arg.clone());
         i += 1;
+    }
+
+    if let Some(value) = low_resources_override {
+        env_overrides.push((
+            "CLIP_LOW_RESOURCES".to_string(),
+            if value { "1".to_string() } else { "0".to_string() },
+        ));
     }
 
     Ok(ParsedCli {
@@ -6261,6 +6466,7 @@ const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("CLIP_LLM_DEBUG", "0"),
     ("CLIP_LIVE_FAST", "1"),
     ("CLIP_LIVE_LAYOUT_TTL_SECS", "120"),
+    ("CLIP_LOW_RESOURCES", "0"),
     ("CLIP_WAKE_WORDS", "orange"),
     ("WAKE_BUFFER_RESTART_SECS", "500"),
     ("WAKE_NO_WORDS_SECS", "300"),
@@ -6808,6 +7014,7 @@ async fn main() -> Result<()> {
         .into_iter()
         .filter_map(|url| normalize_stream_url(&url))
         .collect::<Vec<String>>();
+    let single_mode_hint = streams_file.is_none() && stream_urls.len() <= 1;
     let mut env_overrides = env_overrides;
     if let Some(phrase_list) = override_phrase.as_deref().filter(|v| !v.trim().is_empty()) {
         env_overrides.retain(|(key, _)| key != "CLIP_WAKE_WORDS");
@@ -6835,6 +7042,8 @@ async fn main() -> Result<()> {
     };
     ensure_live_config_file(&live_config_path, &env_overrides);
     apply_live_config_once(&live_config_path);
+    let single_mode = single_mode_hint && single_mode_from_env();
+    let single_instance_requested = single_instance_enabled(single_mode);
     if streams_path.is_none() {
         if !stream_urls.is_empty() {
             streams_path = Some(default_streams_file_path());
@@ -6852,6 +7061,7 @@ async fn main() -> Result<()> {
     }
     apply_env_overrides(&env_overrides);
     seed_ort_dylib_from_live_config(&live_config_path);
+    refresh_low_resource_state();
 
     // Ensure CUDA backend is preferred when available; avoid falling back to CPU due to missing env.
     if std::env::var("WHISPER_CUBLAS").is_err() {
@@ -6941,6 +7151,15 @@ async fn main() -> Result<()> {
             return run_whisper_worker().await;
         }
     }
+
+    let _single_instance_guard = if single_instance_requested {
+        let name = "Local\\AutoClipSingleInstance";
+        let guard = single_instance::acquire(name)?;
+        eprintln!("single instance lock acquired ({name})");
+        Some(guard)
+    } else {
+        None
+    };
 
     let face_id_page = page_url_arg
         .map(|s| s.to_string())
@@ -7613,6 +7832,8 @@ fn print_help(bin: &str) {
     println!("  --streams PATH          Streams file to sync/watch for multi-stream runs");
     println!("  --log-raw-wake         Log raw/normalized transcripts (default on)");
     println!("  --no-log-raw-wake      Disable transcript logging");
+    println!("  --low-resources        Enable low-resource mode overrides");
+    println!("  --no-low-resources     Disable low-resource mode overrides");
     println!("  --mic-device NAME      Microphone device for mic wake mode");
     println!("  -h, --help             Show this help");
     println!("");
@@ -7729,6 +7950,8 @@ fn print_help(bin: &str) {
     println!("  CLIP_LIVE_CONFIG_POLL_SECS   Live config poll interval in seconds (default 2)");
     println!("  CLIP_LIVE_FAST           Skip heavy detection/captions for faster live renders (default true)");
     println!("  CLIP_LIVE_LAYOUT_TTL_SECS Reuse detected layout hints for N seconds (default 120)");
+    println!("  CLIP_LOW_RESOURCES       Force low-resource overrides (default false)");
+    println!("  CLIP_SINGLE_INSTANCE     Require single instance in single-mode runs (default true)");
     println!("  CLIP_STREAMS_FILE        Path to streams file for multi-stream runs");
     println!("  CLIP_STREAMS_POLL_SECS   Streams file poll interval in seconds (default 5)");
     println!("  CLIP_STREAMS_MAX_CONCURRENT Max number of concurrent streams (default 1)");

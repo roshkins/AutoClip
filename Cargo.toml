@@ -24,6 +24,12 @@ default = ["whisper", "ort"]
 whisper = ["whisper-rs"]
 ort = ["dep:ort"]
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
+
+[target.'cfg(not(windows))'.dependencies]
+fs2 = "0.4"
+
 [dev-dependencies]
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }

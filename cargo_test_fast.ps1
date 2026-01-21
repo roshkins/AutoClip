@@ -41,13 +41,21 @@ function Import-VsDevEnv {
         return $false
     }
     $cmdLine = "`"$vsDevCmd`" -arch=x64 -host_arch=x64 && set"
+    $prevErr = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     $output = & cmd /c $cmdLine 2>&1
-    $needsFallback = ($LASTEXITCODE -ne 0) -or ($output | Select-String -SimpleMatch -Pattern "input line is too long" -Quiet)
+    $exitCode = $LASTEXITCODE
+    $ErrorActionPreference = $prevErr
+    $needsFallback = ($exitCode -ne 0) -or ($output | Select-String -SimpleMatch -Pattern "input line is too long" -Quiet)
     if ($needsFallback -and $FallbackPath) {
         $cmdLine = "set `"PATH=$FallbackPath`" && `"$vsDevCmd`" -arch=x64 -host_arch=x64 && set"
+        $prevErr = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         $output = & cmd /c $cmdLine 2>&1
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevErr
     }
-    if ($LASTEXITCODE -ne 0) {
+    if ($exitCode -ne 0) {
         return $false
     }
     foreach ($line in $output) {
@@ -148,6 +156,10 @@ function Resolve-CudaPath {
 
 $cpu = [Environment]::ProcessorCount
 if ($cpu -lt 1) { $cpu = 1 }
+$lowResources = $env:CLIP_LOW_RESOURCES
+if ($lowResources -and $lowResources.Trim().ToLowerInvariant() -notin @("0", "false", "no", "off")) {
+    $cpu = [Math]::Min($cpu, 2)
+}
 
 $fallbackPath = Get-BasePath -ExtraPath $cargoDir
 $loadedVs = Import-VsDevEnv -FallbackPath $fallbackPath
