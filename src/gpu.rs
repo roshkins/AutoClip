@@ -145,6 +145,32 @@ pub fn pick_best_nvidia_device(min_free_mb: u64, label: &str) -> Option<u32> {
     entries.first().map(|(idx, _)| *idx)
 }
 
+/// Pick the NVIDIA device with the most free VRAM excluding a specific device.
+pub fn pick_best_nvidia_device_excluding(
+    min_free_mb: u64,
+    exclude: Option<u32>,
+    label: &str,
+) -> Option<u32> {
+    let reserve = gpu_vram_reserve_mb();
+    let required = min_free_mb.saturating_add(reserve);
+    let mut entries = query_nvidia_free_vram_all()?;
+    entries.retain(|(idx, mem)| *mem >= required && Some(*idx) != exclude);
+    if entries.is_empty() {
+        if let Some(exclude) = exclude {
+            eprintln!(
+                "gpu vram guard: no GPU meets {required} MB excluding device {exclude} for {label}"
+            );
+        } else {
+            eprintln!(
+                "gpu vram guard: no GPU meets {required} MB (min {min_free_mb} + reserve {reserve}) for {label}"
+            );
+        }
+        return None;
+    }
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.first().map(|(idx, _)| *idx)
+}
+
 fn gpu_vram_reserve_mb() -> u64 {
     env::var("GPU_VRAM_RESERVE_MB")
         .ok()
@@ -266,5 +292,24 @@ mod tests {
         env.set("GPU_VRAM_RESERVE_MB", "512");
         let best = pick_best_nvidia_device(3000, "test").expect("expected device");
         assert_eq!(best, 1);
+    }
+
+    #[test]
+    fn pick_best_device_excluding_prefers_other_gpu() {
+        let mut env = EnvGuard::new();
+        env.set("GPU_VRAM_OVERRIDE_LIST", "0:6000,1:4000");
+        env.set("GPU_VRAM_RESERVE_MB", "0");
+        let best = pick_best_nvidia_device_excluding(1000, Some(0), "test")
+            .expect("expected device");
+        assert_eq!(best, 1);
+    }
+
+    #[test]
+    fn pick_best_device_excluding_returns_none_when_only_excluded_meets() {
+        let mut env = EnvGuard::new();
+        env.set("GPU_VRAM_OVERRIDE_LIST", "0:800,1:200");
+        env.set("GPU_VRAM_RESERVE_MB", "0");
+        let best = pick_best_nvidia_device_excluding(500, Some(0), "test");
+        assert!(best.is_none());
     }
 }

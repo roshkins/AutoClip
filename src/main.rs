@@ -1681,10 +1681,17 @@ fn auto_assign_gpus_for_tools() {
     let user_hwaccel = std::env::var("FFMPEG_HWACCEL")
         .ok()
         .filter(|v| !v.trim().is_empty());
+    let user_hwaccel_device = std::env::var("FFMPEG_HWACCEL_DEVICE")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let user_encoder = std::env::var("FFMPEG_ENCODER")
         .ok()
         .filter(|v| !v.trim().is_empty());
-    let user_whisper = std::env::var("WHISPER_GPU")
+    let user_whisper_flag = std::env::var("WHISPER_GPU").ok();
+    let user_whisper = user_whisper_flag
+        .as_deref()
+        .filter(|v| !v.trim().is_empty());
+    let user_whisper_device = std::env::var("WHISPER_GPU_DEVICE")
         .ok()
         .filter(|v| !v.trim().is_empty());
     #[cfg(feature = "ort")]
@@ -1698,19 +1705,49 @@ fn auto_assign_gpus_for_tools() {
 
     let gpus = detect_nvidia_gpus();
     if !gpus.is_empty() {
-        // Sort by memory already done in detect; pick biggest for whisper, second for ffmpeg if present.
-        let whisper_gpu = gpus[0].0;
-        let ffmpeg_gpu = if gpus.len() > 1 { gpus[1].0 } else { whisper_gpu };
+        let whisper_disabled = user_whisper_flag
+            .as_deref()
+            .and_then(|v| parse_bool(v))
+            .map(|v| !v)
+            .unwrap_or(false);
+        let whisper_min_free = std::env::var("WHISPER_MIN_FREE_VRAM_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2048);
+        let mut whisper_device = user_whisper_device
+            .as_deref()
+            .and_then(parse_device_index);
+        if whisper_device.is_none() && !whisper_disabled {
+            whisper_device = gpu::pick_best_nvidia_device(whisper_min_free, "whisper");
+        }
+        if !whisper_disabled {
+            if user_whisper.is_none() {
+                if whisper_device.is_some() {
+                    std::env::set_var("WHISPER_GPU", "1");
+                }
+            }
+            if user_whisper_device.is_none() {
+                if let Some(device) = whisper_device {
+                    std::env::set_var("WHISPER_GPU_DEVICE", device.to_string());
+                    eprintln!("auto GPU assign for whisper: {device}");
+                }
+            }
+        }
 
-        if user_whisper.is_none() {
-            std::env::set_var("WHISPER_GPU", whisper_gpu.to_string());
-            eprintln!("auto GPU assign for whisper: {}", whisper_gpu);
+        let mut ffmpeg_device = user_hwaccel_device
+            .as_deref()
+            .and_then(parse_device_index);
+        if user_hwaccel.is_none() && ffmpeg_device.is_none() {
+            let min_free = ffmpeg_min_free_vram_mb();
+            ffmpeg_device = gpu::pick_best_nvidia_device_excluding(min_free, whisper_device, "ffmpeg")
+                .or_else(|| gpu::pick_best_nvidia_device(min_free, "ffmpeg"));
+            if let Some(device) = ffmpeg_device {
+                std::env::set_var("FFMPEG_HWACCEL", "cuda");
+                std::env::set_var("FFMPEG_HWACCEL_DEVICE", device.to_string());
+                eprintln!("auto GPU assign for ffmpeg: {device}");
+            }
         }
-        if user_hwaccel.is_none() {
-            std::env::set_var("FFMPEG_HWACCEL", "cuda");
-            std::env::set_var("FFMPEG_HWACCEL_DEVICE", ffmpeg_gpu.to_string());
-        }
-        if user_encoder.is_none() && ffmpeg_has_encoder("h264_nvenc") {
+        if user_encoder.is_none() && ffmpeg_device.is_some() && ffmpeg_has_encoder("h264_nvenc") {
             std::env::set_var("FFMPEG_ENCODER", "h264_nvenc");
         }
         #[cfg(feature = "ort")]
@@ -1722,9 +1759,6 @@ fn auto_assign_gpus_for_tools() {
         if user_pose_backend.is_none() {
             std::env::set_var("CLIP_POSE_BACKEND", "auto");
             eprintln!("auto GPU assign: pose backend auto");
-        }
-        if user_hwaccel.is_none() {
-            eprintln!("auto GPU assign for ffmpeg: {}", ffmpeg_gpu);
         }
         return;
     }
@@ -1841,25 +1875,7 @@ fn detect_best_encoder() -> Option<String> {
 }
 
 fn detect_nvidia_gpus() -> Vec<(u32, u64)> {
-    let output = std::process::Command::new("nvidia-smi")
-        .arg("--query-gpu=index,memory.total")
-        .arg("--format=csv,noheader,nounits")
-        .output();
-
-    let Ok(out) = output else { return Vec::new() };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut gpus = Vec::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-        if parts.len() >= 2 {
-            if let (Ok(idx), Ok(mem)) = (parts[0].parse::<u32>(), parts[1].parse::<u64>()) {
-                gpus.push((idx, mem));
-            }
-        }
-    }
+    let mut gpus = gpu::query_nvidia_free_vram_all().unwrap_or_default();
     gpus.sort_by(|a, b| b.1.cmp(&a.1));
     gpus
 }
@@ -7316,6 +7332,33 @@ mod tests {
     }
 
     #[test]
+    fn auto_assigns_distinct_gpus_for_whisper_and_ffmpeg() {
+        let mut env = EnvGuard::new();
+        env.set("GPU_VRAM_OVERRIDE_LIST", "0:6000,1:4000");
+        env.set("GPU_VRAM_RESERVE_MB", "0");
+        env.set("WHISPER_MIN_FREE_VRAM_MB", "1000");
+        env.set("FFMPEG_MIN_FREE_VRAM_MB", "500");
+        env.set("FFMPEG_ENCODER", "libx264");
+        env.remove("WHISPER_GPU");
+        env.remove("WHISPER_GPU_DEVICE");
+        env.remove("FFMPEG_HWACCEL");
+        env.remove("FFMPEG_HWACCEL_DEVICE");
+
+        auto_assign_gpus_for_tools();
+
+        assert_eq!(std::env::var("WHISPER_GPU").ok().as_deref(), Some("1"));
+        assert_eq!(
+            std::env::var("WHISPER_GPU_DEVICE").ok().as_deref(),
+            Some("0")
+        );
+        assert_eq!(std::env::var("FFMPEG_HWACCEL").ok().as_deref(), Some("cuda"));
+        assert_eq!(
+            std::env::var("FFMPEG_HWACCEL_DEVICE").ok().as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn non_video_files_use_subdir() -> Result<()> {
         let stamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -7353,26 +7396,26 @@ mod tests {
 
     #[test]
     fn low_resource_face_box_still_uses_kalman_for_fullscreen_track() {
-        {
-            let mut env = EnvGuard::new();
-            env.set("CLIP_LOW_RESOURCES", "1");
-            refresh_low_resource_state();
-            env.set("CLIP_FACE_BOX", "0.1,0.1,0.8,0.8");
+        let mut env = EnvGuard::new();
+        env.set("CLIP_LOW_RESOURCES", "1");
+        refresh_low_resource_state();
+        env.set("CLIP_FACE_BOX", "0.1,0.1,0.8,0.8");
 
-            let hints = read_clip_layout_hints();
-            let face_box = hints.face_box.expect("expected face box");
-            let track = clip_layout::synthesize_face_track(face_box);
-            let FilterGraph::Vf(chain) =
-                build_tracked_full_frame_fill_filter_graph(1080, 1920, &track)
-                    .expect("expected tracked full-frame graph")
-            else {
-                panic!("expected Vf filter graph");
-            };
-            assert!(
-                chain.contains("between(t"),
-                "expected kalman-driven tracked crop expression"
-            );
-        }
+        let hints = read_clip_layout_hints();
+        let face_box = hints.face_box.expect("expected face box");
+        let track = clip_layout::synthesize_face_track(face_box);
+        let FilterGraph::Vf(chain) =
+            build_tracked_full_frame_fill_filter_graph(1080, 1920, &track)
+                .expect("expected tracked full-frame graph")
+        else {
+            panic!("expected Vf filter graph");
+        };
+        assert!(
+            chain.contains("between(t"),
+            "expected kalman-driven tracked crop expression"
+        );
+
+        env.set("CLIP_LOW_RESOURCES", "0");
         refresh_low_resource_state();
     }
 

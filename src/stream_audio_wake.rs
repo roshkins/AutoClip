@@ -203,6 +203,7 @@ struct WhisperHandle {
     model_path: PathBuf,
     state: whisper_rs::WhisperState,
     use_gpu: bool,
+    gpu_device: Option<u32>,
     cpu_ctx: Option<&'static WhisperContext>,
     cpu_state: Option<whisper_rs::WhisperState>,
 }
@@ -226,7 +227,7 @@ impl WhisperHandle {
                 eprintln!("whisper: GPU disabled via {reason}; using CPU");
             }
         }
-        if prefer_gpu && !whisper_gpu_allowed("whisper") {
+        if prefer_gpu && !whisper_gpu_allowed("whisper", gpu_device.and_then(|v| u32::try_from(v).ok())) {
             let min_free = whisper_min_free_vram_mb();
             let free = gpu::query_nvidia_free_vram_mb(None);
             if let Some(free) = free {
@@ -256,6 +257,7 @@ impl WhisperHandle {
             model_path,
             state,
             use_gpu,
+            gpu_device: gpu_device.and_then(|v| u32::try_from(v).ok()),
             cpu_ctx: None,
             cpu_state: None,
         })
@@ -280,7 +282,7 @@ impl WhisperHandle {
         single_segment: bool,
     ) -> Result<Option<TranscriptWindow>> {
         if self.use_gpu {
-            if !whisper_gpu_allowed("whisper") {
+            if !whisper_gpu_allowed("whisper", self.gpu_device) {
                 let state = self.ensure_cpu_state()?;
                 return transcribe_audio(state, audio, single_segment);
             }
@@ -421,9 +423,9 @@ fn whisper_gpu_device_override() -> Option<u32> {
         .and_then(|v| v.trim().parse::<u32>().ok())
 }
 
-fn whisper_gpu_allowed(label: &str) -> bool {
+fn whisper_gpu_allowed(label: &str, device: Option<u32>) -> bool {
     let min_free = whisper_min_free_vram_mb();
-    gpu::gpu_vram_allows(min_free, None, label)
+    gpu::gpu_vram_allows(min_free, device, label)
 }
 
 fn whisper_clip_vram_requirement_mb(model_path: &Path) -> Option<u64> {
