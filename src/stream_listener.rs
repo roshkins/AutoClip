@@ -1,3 +1,8 @@
+//! Whisper stream listener for wake phrase detection.
+//!
+//! This module shells out to the `whisper.cpp` stream binary and monitors
+//! transcripts for configured wake phrases.
+
 use std::env;
 use std::io::{BufRead, BufReader, IsTerminal, Read};
 use std::path::Path;
@@ -35,7 +40,11 @@ fn format_wake_alert(message: &str) -> String {
     }
 }
 
-/// Start a background listener that invokes whisper.cpp `stream` binary with VAD and watches stdout for the wake phrase.
+/// Start a background listener that invokes whisper.cpp `stream` with VAD.
+///
+/// The listener watches transcripts for any of the provided phrases and sets
+/// `fired` when a match is detected. The `stop` flag can be used to terminate
+/// the loop.
 pub fn start_stream_listener(
     stream_exe: &Path,
     model_path: &Path,

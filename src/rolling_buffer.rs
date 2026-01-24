@@ -1,3 +1,8 @@
+//! Simple rolling buffer for time-based media chunks.
+//!
+//! This is a small in-memory helper used for buffering stream segments in
+//! tests and demos. It is not thread-safe and does not attempt zero-copy.
+
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -18,6 +23,7 @@ struct Chunk {
 }
 
 impl RollingBuffer {
+    /// Create a new buffer with a capacity duration.
     pub fn new(capacity: Duration) -> Self {
         Self {
             capacity,
@@ -114,6 +120,7 @@ impl RollingBuffer {
         self.total_bytes
     }
 
+    /// Update the capacity and evict as needed.
     pub fn set_capacity(&mut self, capacity: Duration) {
         self.capacity = capacity;
         self.evict();

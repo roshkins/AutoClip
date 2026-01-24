@@ -34,7 +34,7 @@ set CUDAToolkit_ROOT=%CUDA_PATH%
 set PATH=%CUDA_PATH%\bin;%CUDA_PATH%\bin\x64;%PATH%
 
 cmake -S vendor\whisper-rs-sys\whisper.cpp -B target\manual_whisper\build -G Ninja ^
-  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_CUBLAS=ON ^
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON ^
   -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF ^
   -DGGML_CUDA_ARCHITECTURES=86 -DWHISPER_EXTRA_FLAGS=-DGGML_CUDA_FORCE_MMQ ^
   -DCUDAToolkit_ROOT=%CUDA_PATH% -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl ^
@@ -48,4 +48,4 @@ ninja -C target\manual_whisper\build -v -j1 install
 ## Integration Notes
 - `scripts/setup_gpu_build.ps1` now loads the VS dev environment, sets explicit
   compiler/tool paths, trims PATH for build, and defaults build parallelism to 1.
-- `vendor/whisper-rs-sys/build.rs` passes those paths (including ASM) to CMake.
+- `whisper-rs-sys/build.rs` passes those paths (including ASM) to CMake.

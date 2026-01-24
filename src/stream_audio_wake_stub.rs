@@ -1,3 +1,7 @@
+//! Stub implementations for wake-word features when the `whisper` feature is disabled.
+//!
+//! These functions return helpful errors so the rest of the binary can compile.
+
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -5,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use url::Url;
 
+/// Word-level timing placeholder (no-op when whisper is disabled).
 #[derive(Clone, Debug)]
 pub struct WordTiming {
     pub text: String,
@@ -13,12 +18,14 @@ pub struct WordTiming {
     pub t1: f32,
 }
 
+/// Transcript payload placeholder (no-op when whisper is disabled).
 #[derive(Clone, Debug)]
 pub struct TranscriptPayload {
     pub text: String,
     pub words: Vec<WordTiming>,
 }
 
+/// Pick a fallback model path or honor `WHISPER_MODEL` when whisper is disabled.
 pub fn select_best_model_path() -> PathBuf {
     if let Ok(explicit) = std::env::var("WHISPER_MODEL") {
         let p = PathBuf::from(explicit);
@@ -33,6 +40,7 @@ pub fn select_best_model_path() -> PathBuf {
     fallback
 }
 
+/// Stub for stream wake-word listening.
 pub fn start_stream_wake_from_hls(
     _media_url: Arc<Mutex<Url>>,
     _model_path: &Path,
@@ -48,6 +56,7 @@ pub fn start_stream_wake_from_hls(
     bail!("whisper support disabled; rebuild with `--features whisper`");
 }
 
+/// Stub for stream wake-word worker loop.
 pub fn run_wake_worker_stream(
     _media_url_path: &Path,
     _model_path: &Path,
@@ -63,6 +72,7 @@ pub fn run_wake_worker_stream(
     bail!("whisper support disabled; rebuild with `--features whisper`");
 }
 
+/// Stub for wake detection in local media files.
 pub fn detect_wake_in_file(
     _input_path: &Path,
     _model_path: &Path,
@@ -72,6 +82,7 @@ pub fn detect_wake_in_file(
     bail!("whisper support disabled; rebuild with `--features whisper`");
 }
 
+/// Stub for microphone wake-word listening.
 pub fn start_mic_wake_with_ffmpeg(
     _mic_device: Option<&str>,
     _model_path: &Path,
@@ -87,6 +98,7 @@ pub fn start_mic_wake_with_ffmpeg(
     bail!("whisper support disabled; rebuild with `--features whisper`");
 }
 
+/// Stub for microphone wake-word worker loop.
 pub fn run_wake_worker_mic(
     _mic_device: Option<&str>,
     _model_path: &Path,
@@ -107,6 +119,7 @@ pub(crate) fn list_system_mics() -> Vec<String> {
     Vec::new()
 }
 
+/// Stub for transcription from an input file.
 pub fn transcribe_words_from_input(
     _input: &str,
     _start_offset_secs: Option<f32>,
@@ -116,6 +129,7 @@ pub fn transcribe_words_from_input(
     bail!("whisper support disabled; rebuild with `--features whisper`");
 }
 
+/// Stub for clip transcription.
 pub fn transcribe_clip_audio(
     _input: &str,
     _start_offset_secs: Option<f32>,

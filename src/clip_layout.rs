@@ -1,11 +1,20 @@
+//! Layout selection and filter graph builders for clip rendering.
+//!
+//! This module decides between stacked vs full-frame layouts and produces
+//! FFmpeg filter graphs to crop, pad, and track faces.
+
 use std::env;
 
+use crate::parse_bool;
+
+/// High-level layout mode for clip rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClipLayoutMode {
     Full,
     Stacked,
 }
 
+/// Anchor position used for face-only framing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaceAnchor {
     TopLeft,
@@ -15,6 +24,7 @@ pub enum FaceAnchor {
     Center,
 }
 
+/// A normalized point in frame coordinates (0..=1).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NormalizedPoint {
     pub x: f32,
@@ -30,12 +40,29 @@ impl NormalizedPoint {
     }
 }
 
+/// A normalized rectangle in frame coordinates (0..=1).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NormalizedRect {
     pub x: f32,
     pub y: f32,
     pub w: f32,
     pub h: f32,
+}
+
+/// Return whether face-detection fallbacks (face box -> track/crop) are enabled.
+pub fn face_fallback_enabled() -> bool {
+    env::var("CLIP_FACE_FALLBACK")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+/// When enabled, lock crop centers directly to detected face positions.
+pub fn face_lock_center_enabled() -> bool {
+    env::var("CLIP_FACE_LOCK_CENTER")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
 }
 
 impl NormalizedRect {
@@ -85,6 +112,7 @@ impl NormalizedRect {
     }
 }
 
+/// Recenter a normalized rect horizontally around `center_x`.
 pub fn recenter_rect_x(rect: NormalizedRect, center_x: f32) -> NormalizedRect {
     let w = rect.w.clamp(0.0, 1.0);
     let h = rect.h.clamp(0.0, 1.0);
@@ -128,6 +156,7 @@ fn frame_rect_for_face(
     if !head_top.is_finite() {
         head_top = face_rect.y;
     }
+    let center_face = face_center_enabled();
     let mut width = if spec.shoulder_width_scale.is_finite() && spec.shoulder_width_scale > 0.0 {
         face_rect.w * spec.shoulder_width_scale
     } else {
@@ -152,9 +181,23 @@ fn frame_rect_for_face(
         }
     }
     let mut center_x = face_rect.x + face_rect.w / 2.0;
-    let eye_mid_x = face_rect.x + face_rect.w * 0.52;
-    if eye_mid_x.is_finite() {
-        center_x = center_x * 0.6 + eye_mid_x * 0.4;
+    if !center_face {
+        let eye_mid_x = face_rect.x + face_rect.w * 0.52;
+        if eye_mid_x.is_finite() {
+            center_x = center_x * 0.6 + eye_mid_x * 0.4;
+        }
+    }
+    if center_face {
+        let center_y = face_rect.y + face_rect.h / 2.0;
+        return centered_rect_in_bounds(
+            NormalizedPoint {
+                x: center_x,
+                y: center_y,
+            },
+            width,
+            height,
+            bounds,
+        );
     }
     let mut x = center_x - width / 2.0;
     let mut y = head_top;
@@ -182,17 +225,20 @@ fn frame_rect_for_face(
     }
 }
 
+/// A single face tracking sample at a time offset (seconds).
 #[derive(Clone, Debug)]
 pub struct FaceTrackPoint {
     pub time: f32,
     pub rect: NormalizedRect,
 }
 
+/// Sequence of face tracking points over time.
 #[derive(Clone, Debug)]
 pub struct FaceTrack {
     pub points: Vec<FaceTrackPoint>,
 }
 
+/// Create a minimal face track with a start and end point.
 pub fn synthesize_face_track(rect: NormalizedRect) -> FaceTrack {
     FaceTrack {
         points: vec![
@@ -205,6 +251,7 @@ pub fn synthesize_face_track(rect: NormalizedRect) -> FaceTrack {
     }
 }
 
+/// Layout configuration read from environment variables.
 #[derive(Clone, Debug)]
 pub struct ClipLayoutConfig {
     pub mode: ClipLayoutMode,
@@ -215,12 +262,14 @@ pub struct ClipLayoutConfig {
     pub face_zoom: f32,
 }
 
+/// Overrides to refine the face framing window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FaceFrameSpec {
     pub head_top_offset: f32,
     pub shoulder_width_scale: f32,
 }
 
+/// Runtime hints produced by detection and tracking.
 #[derive(Clone, Debug, Default)]
 pub struct ClipLayoutHints {
     pub face_box: Option<NormalizedRect>,
@@ -233,12 +282,14 @@ pub struct ClipLayoutHints {
 }
 
 #[derive(Clone, Debug)]
+/// FFmpeg filter graph fragments for video processing.
 pub enum FilterGraph {
     Vf(String),
     Complex { graph: String, output: String },
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Computed dimensions for stacked layout output.
 pub struct StackedLayoutDims {
     pub face_h: u32,
     pub game_h: u32,
@@ -255,6 +306,7 @@ const MIN_FACE_REFRAME_SECS: f32 = 6.0;
 const KALMAN_PROCESS_VAR: f32 = 0.0005;
 const KALMAN_MEASURE_VAR: f32 = 0.0025;
 
+/// Read layout configuration from environment variables.
 pub fn read_clip_layout_config() -> ClipLayoutConfig {
     let mode = env::var("CLIP_LAYOUT")
         .ok()
@@ -314,6 +366,7 @@ pub fn read_clip_layout_config() -> ClipLayoutConfig {
     }
 }
 
+/// Read layout hints from environment variables (mainly for debugging).
 pub fn read_clip_layout_hints() -> ClipLayoutHints {
     let face_box = env::var("CLIP_FACE_BOX").ok().and_then(|v| parse_rect(&v));
     let face_region = env::var("CLIP_FACE_REGION").ok().and_then(|v| parse_rect(&v));
@@ -331,6 +384,7 @@ pub fn read_clip_layout_hints() -> ClipLayoutHints {
     }
 }
 
+/// Resolve face/game heights for a stacked output given a ratio.
 pub fn resolve_layout_heights(out_h: u32, face_ratio: f32) -> (u32, u32) {
     let mut face_h = (out_h as f32 * face_ratio).round() as u32;
     if face_h < 2 {
@@ -350,6 +404,7 @@ pub fn resolve_layout_heights(out_h: u32, face_ratio: f32) -> (u32, u32) {
     (face_h.max(2), game_h.max(2))
 }
 
+/// Compute stacked layout dimensions based on config and detection hints.
 pub fn resolve_stacked_layout_dims(
     out_w: u32,
     out_h: u32,
@@ -406,6 +461,9 @@ fn face_crop_rect(
     if layout.face_crop.is_some() {
         return None;
     }
+    if !face_fallback_enabled() && hints.face_track.is_none() {
+        return None;
+    }
     let face_box = hints.face_box?;
     let bounds = hints.face_region.unwrap_or(NormalizedRect {
         x: 0.0,
@@ -418,7 +476,16 @@ fn face_crop_rect(
     } else {
         expand_rect_in_bounds(face_box, layout.face_context_scale, bounds)
     };
-    Some(apply_face_zoom(rect, layout.face_zoom, bounds))
+    let mut rect = apply_face_zoom(rect, layout.face_zoom, bounds);
+    if face_center_enabled() {
+        if let Some(focus) = hints.face_focus {
+            rect = centered_rect_in_bounds(focus, rect.w, rect.h, bounds);
+        }
+    }
+    if let Some(face_box) = hints.face_box {
+        rect = ensure_rect_contains_face(rect, face_box, bounds);
+    }
+    Some(rect)
 }
 
 fn build_face_crop_expr(layout: &ClipLayoutConfig, rect: Option<NormalizedRect>) -> String {
@@ -448,6 +515,7 @@ fn axis_center_expr(axis: &str, crop_dim: u32, center: f32) -> String {
     )
 }
 
+/// Build the stacked layout filter graph (face + gameplay).
 pub fn build_stacked_filter_graph(
     out_w: u32,
     out_h: u32,
@@ -485,6 +553,7 @@ pub fn build_stacked_filter_graph(
     }
 }
 
+/// Build a face-only filter graph for full-frame output.
 pub fn build_face_only_filter_graph(
     out_w: u32,
     out_h: u32,
@@ -506,6 +575,7 @@ pub fn build_face_only_filter_graph(
     FilterGraph::Vf(chain)
 }
 
+/// Build a full-frame fill filter graph without face tracking.
 pub fn build_full_frame_fill_filter_graph(
     out_w: u32,
     out_h: u32,
@@ -519,6 +589,7 @@ pub fn build_full_frame_fill_filter_graph(
     FilterGraph::Vf(chain)
 }
 
+/// Build a full-frame fill filter graph with face tracking.
 pub fn build_tracked_full_frame_fill_filter_graph(
     out_w: u32,
     out_h: u32,
@@ -549,14 +620,31 @@ pub fn build_tracked_full_frame_fill_filter_graph(
         return None;
     }
 
-    let smoothed = kalman_smooth_samples(&deduped);
-    let downsampled = downsample_track_samples(&smoothed, MIN_FACE_REFRAME_SECS);
+    let lock_center = face_lock_center_enabled();
+    let smoothed = if lock_center {
+        deduped.clone()
+    } else {
+        kalman_smooth_samples(&deduped)
+    };
+    let mut downsampled = if lock_center {
+        smoothed.clone()
+    } else {
+        downsample_track_samples(&smoothed, face_reframe_secs())
+    };
+    if downsampled.len() < 2 {
+        downsampled = smoothed;
+    }
     if downsampled.len() < 2 {
         return None;
     }
 
-    let center_x_expr = piecewise_lerp_expr(&downsampled, |s| s.center.x);
-    let center_y_expr = piecewise_lerp_expr(&downsampled, |s| s.center.y);
+    let center_fn = if lock_center {
+        piecewise_step_expr
+    } else {
+        piecewise_lerp_expr
+    };
+    let center_x_expr = center_fn(&downsampled, |s| s.center.x);
+    let center_y_expr = center_fn(&downsampled, |s| s.center.y);
     let x_expr = axis_center_expr_expr("iw", out_w, &center_x_expr);
     let y_expr = axis_center_expr_expr("ih", out_h, &center_y_expr);
     let chain = format!(
@@ -675,6 +763,15 @@ fn kalman_smooth_samples(samples: &[TrackSample]) -> Vec<TrackSample> {
     out
 }
 
+fn face_reframe_secs() -> f32 {
+    env::var("CLIP_FACE_REFRAME_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.clamp(0.1, 30.0))
+        .unwrap_or(MIN_FACE_REFRAME_SECS)
+}
+
 fn downsample_track_samples(samples: &[TrackSample], min_interval: f32) -> Vec<TrackSample> {
     if samples.is_empty() {
         return Vec::new();
@@ -703,7 +800,7 @@ fn ensure_track_points(points: &[FaceTrackPoint]) -> Option<Vec<FaceTrackPoint>>
             Some(vec![
                 first.clone(),
                 FaceTrackPoint {
-                    time: first.time + MIN_FACE_REFRAME_SECS,
+                    time: first.time + face_reframe_secs(),
                     rect: first.rect,
                 },
             ])
@@ -725,7 +822,7 @@ fn build_tracked_face_crop(
         .face_track
         .as_ref()
         .and_then(|track| ensure_track_points(&track.points));
-    if points.is_none() {
+    if points.is_none() && face_fallback_enabled() {
         if let Some(face_box) = hints.face_box {
             points = Some(synthesize_face_track(face_box).points);
         }
@@ -773,16 +870,38 @@ fn build_tracked_face_crop(
         return None;
     }
 
-    let smoothed = kalman_smooth_samples(&deduped);
-    let downsampled = downsample_track_samples(&smoothed, MIN_FACE_REFRAME_SECS);
+    let lock_center = face_lock_center_enabled();
+    let smoothed = if lock_center {
+        deduped.clone()
+    } else {
+        kalman_smooth_samples(&deduped)
+    };
+    let mut downsampled = if lock_center {
+        smoothed.clone()
+    } else {
+        downsample_track_samples(&smoothed, face_reframe_secs())
+    };
+    if downsampled.len() < 2 {
+        downsampled = smoothed;
+    }
     if downsampled.len() < 2 {
         return None;
     }
 
-    let center_x_expr = piecewise_lerp_expr(&downsampled, |s| s.center.x);
-    let center_y_expr = piecewise_lerp_expr(&downsampled, |s| s.center.y);
-    let width_expr = clamp_ratio_expr(&piecewise_lerp_expr(&downsampled, |s| s.w));
-    let height_expr = clamp_ratio_expr(&piecewise_lerp_expr(&downsampled, |s| s.h));
+    let center_fn = if lock_center {
+        piecewise_step_expr
+    } else {
+        piecewise_lerp_expr
+    };
+    let size_fn = if lock_center {
+        piecewise_step_expr
+    } else {
+        piecewise_lerp_expr
+    };
+    let center_x_expr = center_fn(&downsampled, |s| s.center.x);
+    let center_y_expr = center_fn(&downsampled, |s| s.center.y);
+    let width_expr = clamp_ratio_expr(&size_fn(&downsampled, |s| s.w));
+    let height_expr = clamp_ratio_expr(&size_fn(&downsampled, |s| s.h));
     let x_expr = axis_center_expr_ratio_expr("iw", &width_expr, &center_x_expr);
     let y_expr = axis_center_expr_ratio_expr("ih", &height_expr, &center_y_expr);
     let crop_expr = format!(
@@ -849,9 +968,9 @@ fn axis_center_expr_expr(axis: &str, crop_dim: u32, center_expr: &str) -> String
 }
 
 fn piecewise_lerp_expr(samples: &[TrackSample], getter: fn(&TrackSample) -> f32) -> String {
-    let last = samples
-        .last()
-        .expect("piecewise_lerp_expr expects at least one sample");
+    let Some(last) = samples.last() else {
+        return "0.5".to_string();
+    };
     let mut expr = format!("{:.4}", getter(last));
     if samples.len() < 2 {
         return expr;
@@ -873,6 +992,27 @@ fn piecewise_lerp_expr(samples: &[TrackSample], getter: fn(&TrackSample) -> f32)
         };
         expr = format!(
             "if(between(t\\,{start_t:.3}\\,{end_t:.3})\\,{segment_expr}\\,{expr})"
+        );
+    }
+    expr
+}
+
+fn piecewise_step_expr(samples: &[TrackSample], getter: fn(&TrackSample) -> f32) -> String {
+    let Some(last) = samples.last() else {
+        return "0.5".to_string();
+    };
+    let mut expr = format!("{:.4}", getter(last));
+    if samples.len() < 2 {
+        return expr;
+    }
+    for idx in (0..samples.len() - 1).rev() {
+        let start = &samples[idx];
+        let end = &samples[idx + 1];
+        let start_t = start.time;
+        let end_t = end.time;
+        let start_val = getter(start);
+        expr = format!(
+            "if(between(t\\,{start_t:.3}\\,{end_t:.3})\\,{start_val:.4}\\,{expr})"
         );
     }
     expr
@@ -951,6 +1091,9 @@ fn expand_rect_in_bounds(
     let desired_h = (rect.h * scale)
         .max(rect.h)
         .clamp(MIN_CROP_RATIO, bounds.h.max(MIN_CROP_RATIO));
+    if face_center_enabled() {
+        return centered_rect_in_bounds(rect.center(), desired_w, desired_h, bounds);
+    }
     let mut x = rect.x + rect.w / 2.0 - desired_w / 2.0;
     let mut y = rect.y + rect.h / 2.0 - desired_h / 2.0;
     let min_x = bounds.x;
@@ -986,6 +1129,9 @@ fn scale_rect_in_bounds(
     let bounds = normalize_bounds(bounds);
     let desired_w = (rect.w * scale).clamp(MIN_CROP_RATIO, bounds.w.max(MIN_CROP_RATIO));
     let desired_h = (rect.h * scale).clamp(MIN_CROP_RATIO, bounds.h.max(MIN_CROP_RATIO));
+    if face_center_enabled() {
+        return centered_rect_in_bounds(rect.center(), desired_w, desired_h, bounds);
+    }
     let mut x = rect.x + rect.w / 2.0 - desired_w / 2.0;
     let mut y = rect.y + rect.h / 2.0 - desired_h / 2.0;
     let min_x = bounds.x;
@@ -1013,10 +1159,159 @@ fn scale_rect_in_bounds(
 }
 
 fn apply_face_zoom(rect: NormalizedRect, zoom: f32, bounds: NormalizedRect) -> NormalizedRect {
-    if !zoom.is_finite() || (zoom - 1.0).abs() < 0.001 {
+    let zoom = if zoom.is_finite() { zoom } else { 1.0 };
+    if face_center_enabled() || (zoom - 1.0).abs() >= 0.001 {
+        return scale_rect_in_bounds(rect, zoom, bounds);
+    }
+    rect
+}
+
+fn centered_rect_in_bounds(
+    center: NormalizedPoint,
+    desired_w: f32,
+    desired_h: f32,
+    bounds: NormalizedRect,
+) -> NormalizedRect {
+    let bounds = normalize_bounds(bounds);
+    let min_w = MIN_CROP_RATIO.min(bounds.w);
+    let min_h = MIN_CROP_RATIO.min(bounds.h);
+    let mut w = desired_w
+        .clamp(min_w, bounds.w.max(min_w))
+        .max(min_w);
+    let mut h = desired_h
+        .clamp(min_h, bounds.h.max(min_h))
+        .max(min_h);
+
+    let mut cx = if center.x.is_finite() {
+        center.x
+    } else {
+        bounds.x + bounds.w / 2.0
+    };
+    let mut cy = if center.y.is_finite() {
+        center.y
+    } else {
+        bounds.y + bounds.h / 2.0
+    };
+    cx = cx.clamp(bounds.x, bounds.x + bounds.w);
+    cy = cy.clamp(bounds.y, bounds.y + bounds.h);
+
+    let max_w = (2.0 * (cx - bounds.x).min(bounds.x + bounds.w - cx)).max(min_w);
+    let max_h = (2.0 * (cy - bounds.y).min(bounds.y + bounds.h - cy)).max(min_h);
+    if max_w.is_finite() && max_w > 0.0 {
+        w = w.min(max_w);
+    }
+    if max_h.is_finite() && max_h > 0.0 {
+        h = h.min(max_h);
+    }
+    w = w.clamp(min_w, bounds.w.max(min_w));
+    h = h.clamp(min_h, bounds.h.max(min_h));
+
+    let min_cx = bounds.x + w / 2.0;
+    let max_cx = bounds.x + bounds.w - w / 2.0;
+    if min_cx <= max_cx {
+        cx = cx.clamp(min_cx, max_cx);
+    } else {
+        cx = bounds.x + bounds.w / 2.0;
+    }
+    let min_cy = bounds.y + h / 2.0;
+    let max_cy = bounds.y + bounds.h - h / 2.0;
+    if min_cy <= max_cy {
+        cy = cy.clamp(min_cy, max_cy);
+    } else {
+        cy = bounds.y + bounds.h / 2.0;
+    }
+
+    let mut x = cx - w / 2.0;
+    let mut y = cy - h / 2.0;
+    let max_x = (bounds.x + bounds.w - w).max(bounds.x);
+    let max_y = (bounds.y + bounds.h - h).max(bounds.y);
+    if x < bounds.x {
+        x = bounds.x;
+    }
+    if x > max_x {
+        x = max_x;
+    }
+    if y < bounds.y {
+        y = bounds.y;
+    }
+    if y > max_y {
+        y = max_y;
+    }
+    NormalizedRect {
+        x: clamp_unit(x),
+        y: clamp_unit(y),
+        w,
+        h,
+    }
+}
+
+fn ensure_rect_contains_face(
+    rect: NormalizedRect,
+    face_box: NormalizedRect,
+    bounds: NormalizedRect,
+) -> NormalizedRect {
+    const FACE_BOX_MARGIN: f32 = 0.06;
+    let bounds = normalize_bounds(bounds);
+    let mut face = clamp_rect_to_bounds(face_box, bounds);
+    if face.w <= 0.0 || face.h <= 0.0 {
         return rect;
     }
-    scale_rect_in_bounds(rect, zoom, bounds)
+    face = expand_rect_margins_in_bounds(face, FACE_BOX_MARGIN, FACE_BOX_MARGIN, bounds);
+    if rect_contains_rect(rect, face, 0.0) {
+        return rect;
+    }
+    let desired_w = rect.w.max(face.w);
+    let desired_h = rect.h.max(face.h);
+    centered_rect_in_bounds(face.center(), desired_w, desired_h, bounds)
+}
+
+fn expand_rect_margins_in_bounds(
+    rect: NormalizedRect,
+    x_margin: f32,
+    y_margin: f32,
+    bounds: NormalizedRect,
+) -> NormalizedRect {
+    let bounds = normalize_bounds(bounds);
+    let x_margin = if x_margin.is_finite() { x_margin.max(0.0) } else { 0.0 };
+    let y_margin = if y_margin.is_finite() { y_margin.max(0.0) } else { 0.0 };
+    let extra_w = rect.w * x_margin;
+    let extra_h = rect.h * y_margin;
+    let left = (rect.x - extra_w).max(bounds.x);
+    let right = (rect.x + rect.w + extra_w).min(bounds.x + bounds.w);
+    let top = (rect.y - extra_h).max(bounds.y);
+    let bottom = (rect.y + rect.h + extra_h).min(bounds.y + bounds.h);
+    NormalizedRect {
+        x: clamp_unit(left),
+        y: clamp_unit(top),
+        w: (right - left).max(0.0),
+        h: (bottom - top).max(0.0),
+    }
+}
+
+fn clamp_rect_to_bounds(rect: NormalizedRect, bounds: NormalizedRect) -> NormalizedRect {
+    let bounds = normalize_bounds(bounds);
+    let left = rect.x.max(bounds.x);
+    let top = rect.y.max(bounds.y);
+    let right = (rect.x + rect.w).min(bounds.x + bounds.w);
+    let bottom = (rect.y + rect.h).min(bounds.y + bounds.h);
+    NormalizedRect {
+        x: clamp_unit(left),
+        y: clamp_unit(top),
+        w: (right - left).max(0.0),
+        h: (bottom - top).max(0.0),
+    }
+}
+
+fn rect_contains_rect(outer: NormalizedRect, inner: NormalizedRect, margin: f32) -> bool {
+    let margin = margin.max(0.0);
+    let left = outer.x - margin;
+    let top = outer.y - margin;
+    let right = outer.x + outer.w + margin;
+    let bottom = outer.y + outer.h + margin;
+    inner.x >= left
+        && inner.y >= top
+        && (inner.x + inner.w) <= right
+        && (inner.y + inner.h) <= bottom
 }
 
 fn normalize_bounds(bounds: NormalizedRect) -> NormalizedRect {
@@ -1057,6 +1352,13 @@ fn parse_unit_value(value: f32) -> Option<f32> {
     }
 }
 
+fn face_center_enabled() -> bool {
+    std::env::var("CLIP_FACE_CENTER")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
 fn clamp_unit(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
@@ -1068,6 +1370,7 @@ fn format_ratio(value: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::EnvGuard;
 
     #[test]
     fn resolve_layout_heights_returns_even_sizes() {
@@ -1096,6 +1399,8 @@ mod tests {
 
     #[test]
     fn stacked_graph_uses_face_box_and_game_center() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_FACE_FALLBACK", "1");
         let layout = ClipLayoutConfig {
             mode: ClipLayoutMode::Stacked,
             face_ratio: 0.4,
@@ -1131,6 +1436,41 @@ mod tests {
         assert!(
             graph.contains("crop=1080:840:max(min(iw*0.5000-540.0\\, iw-1080)\\, 0):max(min(ih*0.6000-420.0\\, ih-840)\\, 0)"),
             "game crop should center on the provided reticle hint"
+        );
+    }
+
+    #[test]
+    fn face_focus_never_pushes_face_box_outside_crop() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_FACE_CENTER", "1");
+        env.set("CLIP_FACE_FALLBACK", "1");
+        let layout = ClipLayoutConfig {
+            mode: ClipLayoutMode::Stacked,
+            face_ratio: 0.4,
+            face_crop: None,
+            face_anchor: FaceAnchor::TopLeft,
+            face_context_scale: 1.6,
+            face_zoom: 1.0,
+        };
+        let face_box = NormalizedRect {
+            x: 0.05,
+            y: 0.08,
+            w: 0.22,
+            h: 0.30,
+        };
+        let hints = ClipLayoutHints {
+            face_box: Some(face_box),
+            face_track: None,
+            face_region: None,
+            face_frame_spec: None,
+            face_focus: Some(NormalizedPoint { x: 0.92, y: 0.18 }),
+            game_center: None,
+            game_region: None,
+        };
+        let rect = face_crop_rect(&layout, &hints, 9.0 / 16.0).expect("rect");
+        assert!(
+            rect_contains_rect(rect, face_box, 0.0),
+            "face crop should always contain face box"
         );
     }
 
@@ -1180,6 +1520,8 @@ mod tests {
 
     #[test]
     fn face_only_uses_kalman_for_face_box_only() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_FACE_FALLBACK", "1");
         let layout = ClipLayoutConfig {
             mode: ClipLayoutMode::Full,
             face_ratio: 0.4,
@@ -1232,5 +1574,37 @@ mod tests {
             panic!("expected Vf filter graph");
         };
         assert!(chain.contains("between(t"));
+    }
+
+    #[test]
+    fn tracked_full_frame_falls_back_when_reframe_too_sparse() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_FACE_REFRAME_SECS", "60");
+        let track = FaceTrack {
+            points: vec![
+                FaceTrackPoint {
+                    time: 0.0,
+                    rect: NormalizedRect {
+                        x: 0.2,
+                        y: 0.2,
+                        w: 0.2,
+                        h: 0.2,
+                    },
+                },
+                FaceTrackPoint {
+                    time: 1.0,
+                    rect: NormalizedRect {
+                        x: 0.6,
+                        y: 0.3,
+                        w: 0.2,
+                        h: 0.2,
+                    },
+                },
+            ],
+        };
+        assert!(
+            build_tracked_full_frame_fill_filter_graph(1080, 1920, &track).is_some(),
+            "expected fallback to preserve tracked crop"
+        );
     }
 }

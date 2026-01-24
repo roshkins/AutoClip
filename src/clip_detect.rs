@@ -1,3 +1,8 @@
+//! Face and gameplay detection pipelines.
+//!
+//! This module loads face detection/pose models, runs sampling across clips,
+//! and produces layout hints for downstream rendering.
+
 use anyhow::{Context, Result};
 use std::cmp::{max, min};
 use std::collections::{HashMap, VecDeque};
@@ -19,6 +24,7 @@ use crate::clip_gameplay::{
 };
 use crate::clip_layout::{ClipLayoutHints, FaceFrameSpec, NormalizedPoint, NormalizedRect};
 use crate::loading::LoadingTicker;
+use crate::low_resource::low_resource_enabled;
 use crate::profile::profile_span;
 
 #[cfg(feature = "ort")]
@@ -32,6 +38,7 @@ use ort::session::Session;
 #[cfg(feature = "ort")]
 use ort::value::TensorRef;
 
+/// Backend selection for face detection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaceBackend {
     Auto,
@@ -39,6 +46,7 @@ pub enum FaceBackend {
     Ort,
 }
 
+/// Configuration for face detection and clip sampling.
 #[derive(Clone, Debug)]
 pub struct ClipDetectConfig {
     pub enabled: bool,
@@ -544,6 +552,7 @@ fn parse_face_backend(value: &str) -> Option<FaceBackend> {
     }
 }
 
+/// Read face detection configuration from the environment with defaults.
 pub fn read_clip_detect_config() -> ClipDetectConfig {
     let enabled = std::env::var("CLIP_DETECT")
         .ok()
@@ -655,6 +664,7 @@ pub fn read_clip_detect_config() -> ClipDetectConfig {
     }
 }
 
+/// Summary statistics for a face-score sweep run.
 #[derive(Clone, Copy, Debug)]
 pub struct FaceSweepStats {
     pub score: f32,
@@ -702,6 +712,7 @@ fn split_analysis_budget(
     (Some(face_budget), gameplay_budget)
 }
 
+/// Run a sweep over face-score thresholds to evaluate model behavior.
 pub async fn run_face_threshold_sweep(
     positives: &[String],
     negatives: &[String],
@@ -1227,11 +1238,9 @@ pub async fn detect_layout_hints(
     if let (Some(matcher), Some(best)) = (face_id_matcher.as_ref(), face_best) {
         if matcher.require_motion && best.max_dist < matcher.motion_threshold {
             eprintln!(
-                "face id: motion {:.4} below {:.4}; ignoring face match",
+                "face id: motion {:.4} below {:.4}; keeping face for framing but skipping face-id gating",
                 best.max_dist, matcher.motion_threshold
             );
-            face_best = None;
-            face_observations.clear();
         }
     }
     if gameplay_detection && gameplay_total_samples > 0 {
@@ -1424,11 +1433,16 @@ pub async fn detect_layout_hints(
                     } else {
                         None
                     }
-                })
-                .collect();
+            })
+            .collect();
             points.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
             if points.len() >= 2 {
                 hints.face_track = Some(crate::clip_layout::FaceTrack { points });
+            } else if face_debug_enabled() {
+                eprintln!(
+                    "clip detect: face track has {}/2 points; using face box only",
+                    points.len()
+                );
             }
         }
     }
@@ -4977,13 +4991,6 @@ fn points_center(points: &[NormalizedPoint; 5]) -> NormalizedPoint {
         x: clamp_unit(sum_x / denom),
         y: clamp_unit(sum_y / denom),
     }
-}
-
-fn low_resource_enabled() -> bool {
-    std::env::var("CLIP_LOW_RESOURCES")
-        .ok()
-        .and_then(|v| parse_bool(&v))
-        .unwrap_or(false)
 }
 
 fn recenter_rect_x(rect: NormalizedRect, center_x: f32) -> NormalizedRect {

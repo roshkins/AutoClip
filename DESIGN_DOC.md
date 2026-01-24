@@ -1,23 +1,41 @@
-Voice Activated Video Clipper
-Dataflow
-•	Inputs:
-    •	kick_url := The URL to the streamer you want to AutoClip
-    •	activation_phrase := Phrase to trigger the automatic clip
-    •	before_buffer_length := amount of video to keep on a rolling buffer
-    •	after_buffer_length := how much to record after
-    •	resolution := Output video resolution to format video
-    •	vram_allocation:= Amount of GPU VRAM to use before offloading buffer to CPU RAM
-    •	save_path := where to save
-    •	file_name_stub := filename to prepend to incrementor.
-•	Outputs:
-    •	Mp3 video file of said clip
-•	Process
-    1.	Url gets pasted, the m3u8 playlist gets extracted from the page and the highest resolution video feed gets extracted. The video gets loaded and the buffer starts filling up, A CPU-bound Whisper model listens for the wake word in the stream audio.
-    2.	When the wake word is detected, the after_buffer_length is waited, and then the buffer is deep-copied, and sent for post processing in a queue.
-    3.	Post processing using FFMPEG to shrink it for vertical video.
-    4.	Save it at the save_path, incrementing the highest pathname number by 1.
-    5.	Free deep copy and continue.
-    6.	If the playlist ends, try refreshing periodically to see if the stream restarts, or alternatively see if the m3u8 URI has changed.
+AutoClip Design Overview
 
-Coding Language:
-Use Rust for low-level optimization, and bare-to-the-metal RAM and VRAM management. 
+Summary
+- AutoClip discovers an HLS stream from a page URL, buffers audio/video, detects a wake phrase, and renders a vertical clip via FFmpeg.
+- Layout decisions can stack face/gameplay or render full-frame based on detected hints (face, reticle, gameplay).
+- Configuration is driven by config.env and can be hot-reloaded for live tuning.
+
+Core Flow
+1) Discover HLS
+   - Headless script (Playwright) or platform-specific HTTP logic resolves a master playlist.
+   - Highest-variant stream is selected and periodically refreshed.
+2) Buffer
+   - RollingBuffer stores recent TS segments for before/after clipping.
+   - Buffer length is adjusted for wake detection latency to avoid drift.
+3) Wake Detection
+   - Whisper listens to stream audio (or mic) for configured wake phrases.
+   - On detection, a window of before/after audio+video is cut.
+4) Layout Hints
+   - Face detection + optional face mesh/pose for headroom framing.
+   - Gameplay detection / reticle hints to decide stacked vs full-frame.
+   - Low-resource mode skips heavy detection and uses heuristics.
+5) Render
+   - FFmpeg encodes to a vertical output, optionally stacked.
+   - Captions/LLM metadata can be added if enabled.
+6) Save
+   - Output files are named with an incrementing counter and saved to clips/.
+
+Key Modules
+- src/main.rs: Orchestration, CLI/env parsing, main pipeline, and FFmpeg render entrypoints.
+- src/clip_detect.rs: Face, mesh, pose, and gameplay detection; layout hint extraction.
+- src/clip_layout.rs: Layout decisions, crop math, tracking/Kalman smoothing.
+- src/rolling_buffer.rs: Rolling buffer for segments.
+- src/stream_audio_wake.rs: Whisper wake-word detection and audio handling.
+
+Configuration
+- config.env is the primary live config file.
+- env vars can be overridden via CLI flags (lowercase + dash).
+
+Performance/Resource Modes
+- CLIP_LOW_RESOURCES lowers detection budgets and disables heavy features.
+- GPU use is preferred for Whisper and ONNX runtime when available and allowed.

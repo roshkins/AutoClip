@@ -1,15 +1,14 @@
-//! AutoClip MVP stub.
-//! Current behavior: headless-grab an m3u8 from a page (Kick-style), pick the
-//! top variant, and save a 30s vertical clip via FFmpeg. Everything else (rolling
-//! buffering, wake-word detection, VRAM budgeting) is logged-only scaffolding.
+//! AutoClip: headless stream discovery + rolling buffer + wake-word clipping.
+//! This binary handles stream discovery, buffering, wake detection, layout selection,
+//! and FFmpeg-based rendering (stacked or full-frame). Configuration lives in config.env.
 
 use anyhow::{Context, Result};
-use m3u8_rs::{MasterPlaylist, MediaPlaylist, VariantStream};
-use reqwest::{header, Client, StatusCode};
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio};
@@ -21,6 +20,7 @@ use tokio::time::sleep;
 use url::Url;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::collections::HashMap;
@@ -28,20 +28,57 @@ use std::collections::HashMap;
 mod clip_detect;
 mod clip_gameplay;
 mod clip_layout;
+mod layout_utils;
+mod hls_client;
+mod low_resource;
+mod captions;
 mod gpu;
 mod loading;
+mod face_id;
 mod profile;
 mod rolling_buffer;
+mod stream_utils;
+mod text_utils;
+mod url_utils;
+mod storage_utils;
+#[cfg(test)]
+pub mod test_util;
 use clip_detect::{detect_layout_hints, read_clip_detect_config, run_face_threshold_sweep};
 use clip_gameplay::{read_clip_gameplay_config, ClipGameplayDetector};
 use clip_layout::{
     build_face_only_filter_graph, build_full_frame_fill_filter_graph,
-    build_stacked_filter_graph, build_tracked_full_frame_fill_filter_graph,
-    read_clip_layout_config, read_clip_layout_hints, resolve_stacked_layout_dims, ClipLayoutMode,
-    ClipLayoutHints, FilterGraph, NormalizedPoint, NormalizedRect, StackedLayoutDims,
+    build_stacked_filter_graph, build_tracked_full_frame_fill_filter_graph, read_clip_layout_config,
+    read_clip_layout_hints, resolve_stacked_layout_dims, ClipLayoutConfig, ClipLayoutMode,
+    ClipLayoutHints, FilterGraph, NormalizedPoint,
+};
+use layout_utils::{
+    face_rect_for_gameplay_guess, face_rect_from_hints, guess_gameplay_low_resource,
+    parse_resolution, rect_area, rect_contains_rect,
+};
+use hls_client::{HlsClient, StreamHeaders, is_http_status};
+use low_resource::{ensure_live_detect_budgets, low_resource_enabled, refresh_low_resource_state};
+use captions::{
+    SubtitleSpec, TempSubtitle, build_caption_drawtext_chain, build_caption_words,
+    build_srt_from_payload, caption_y_for_layout, closed_captions_enabled,
+    read_caption_config, subtitle_codec_for_output, write_temp_srt,
 };
 use profile::profile_span;
 use rolling_buffer::RollingBuffer;
+use face_id::{face_id_enabled, maybe_auto_enroll_face_id};
+use storage_utils::{
+    log_run_event, log_wake_event, non_video_dir, now_unix_ms, write_atomic_file,
+    write_media_url_file, write_wake_worker_status, whisper_worker_media_url_path,
+    whisper_worker_status_path, whisper_worker_status_poll,
+};
+use stream_utils::{
+    default_streams_file_path, normalize_stream_url, read_streams_file, split_stream_list,
+    split_wake_phrases, sync_streams_file,
+};
+use text_utils::{
+    fallback_title_from_transcript, normalize_title_whitespace, sanitize_title_for_filename,
+    trim_transcript,
+};
+use url_utils::{normalize_page_url, signed_url_expiry, stream_id_from_url};
 #[cfg(feature = "whisper")]
 mod stream_audio_wake;
 #[cfg(not(feature = "whisper"))]
@@ -50,7 +87,7 @@ mod stream_audio_wake;
 use stream_audio_wake::{
     detect_wake_in_file, run_wake_worker_mic, run_wake_worker_stream,
     start_mic_wake_with_ffmpeg, start_stream_wake_from_hls, transcribe_clip_audio,
-    TranscriptPayload, WordTiming,
+    TranscriptPayload,
 };
 
 #[derive(Debug, Clone)]
@@ -82,6 +119,7 @@ pub struct Config {
 }
 
 impl Config {
+    /// Build a minimal example configuration for tests and demos.
     pub fn example() -> Self {
         Self {
             kick_url: "https://example.com/stream".to_string(),
@@ -100,12 +138,13 @@ impl Config {
     }
 }
 
-/// Core application placeholder.
+/// Main application wrapper that wires configuration into the runtime.
 pub struct AutoClip {
     pub config: Config,
 }
 
 impl AutoClip {
+    /// Construct an AutoClip instance from a config.
     pub fn new(config: Config) -> Self {
         Self { config }
     }
@@ -198,7 +237,7 @@ impl AutoClip {
         spawn_ctrl_c_handler(stop.clone(), Some(whisper_worker.clone()));
         let mut last_detect_instant: Option<Instant> = None;
         let wake_start = Arc::new(Mutex::new(Instant::now()));
-        let _start_instant = *wake_start.lock().expect("wake start lock poisoned");
+        let _start_instant = *lock_or_recover(&wake_start, "wake start");
         let detect_ns = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let audio_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let last_word_ns = Arc::new(AtomicU64::new(u64::MAX));
@@ -216,7 +255,7 @@ impl AutoClip {
             while !monitor_stop.load(Ordering::Relaxed) {
                 let audio_ns_now = monitor_audio_ns.load(Ordering::Relaxed);
                 if audio_ns_now > 0 {
-                    let start_instant = *monitor_start.lock().expect("wake start lock poisoned");
+                    let start_instant = *lock_or_recover(&monitor_start, "wake start");
                     let audio_instant = start_instant + Duration::from_nanos(audio_ns_now);
                     let now = Instant::now();
                     if now > audio_instant {
@@ -272,7 +311,7 @@ impl AutoClip {
         let media_headers = Arc::new(Mutex::new(headers));
         let mut media_url_last_refresh = Instant::now();
         let mut media_url_expires_at = {
-            let guard = media_url.lock().expect("media url lock poisoned");
+            let guard = lock_or_recover(&media_url, "media url");
             signed_url_expiry(&guard)
         };
         let m3u8_refresh_interval = read_m3u8_refresh_secs();
@@ -310,7 +349,7 @@ impl AutoClip {
         let worker_media_url_path = whisper_worker_media_url_path(&self.config.save_path);
         let last_status_ms = Arc::new(AtomicU64::new(now_unix_ms()));
         if whisper_isolate && !self.config.use_mic_for_wake {
-            let guard = media_url.lock().expect("media url lock poisoned");
+            let guard = lock_or_recover(&media_url, "media url");
             if let Err(err) = write_media_url_file(&worker_media_url_path, &guard) {
                 eprintln!("whisper worker: failed to write media url: {err:#}");
             }
@@ -327,7 +366,7 @@ impl AutoClip {
         };
         if whisper_isolate {
             let worker_start = Instant::now();
-            *wake_start.lock().expect("wake start lock poisoned") = worker_start;
+            *lock_or_recover(&wake_start, "wake start") = worker_start;
             let reader_start_ms = now_unix_ms();
             let _reader = spawn_wake_status_reader(
                 worker_status_path.clone(),
@@ -353,9 +392,7 @@ impl AutoClip {
                 &wake_phrases,
                 self.config.log_raw_wake,
             )?;
-            *whisper_worker
-                .lock()
-                .expect("whisper worker lock poisoned") = Some(worker);
+            *lock_or_recover(&whisper_worker, "whisper worker") = Some(worker);
             println!(
                 "whisper worker: isolating wake detection for '{}'",
                 wake_label
@@ -366,7 +403,7 @@ impl AutoClip {
                 .mic_device
                 .clone()
                 .or_else(|| std::env::var("MIC_DEVICE").ok());
-            let start_instant = *wake_start.lock().expect("wake start lock poisoned");
+            let start_instant = *lock_or_recover(&wake_start, "wake start");
             start_mic_wake_with_ffmpeg(
                 mic_device.as_deref(),
                 Path::new(&model_path),
@@ -385,7 +422,7 @@ impl AutoClip {
                 model_path.display(),
             );
         } else {
-            let start_instant = *wake_start.lock().expect("wake start lock poisoned");
+            let start_instant = *lock_or_recover(&wake_start, "wake start");
             start_stream_wake_from_hls(
                 media_url.clone(),
                 Path::new(&model_path),
@@ -708,18 +745,14 @@ impl AutoClip {
                 }
             }
 
-            let media_url_snapshot = {
-                let guard = media_url
-                    .lock()
-                    .expect("media url lock poisoned while fetching playlist");
-                guard.clone()
-            };
-            let headers_snapshot = {
-                let guard = media_headers
-                    .lock()
-                    .expect("media headers lock poisoned while fetching playlist");
-                guard.clone()
-            };
+                let media_url_snapshot = {
+                    let guard = lock_or_recover(&media_url, "media url fetch");
+                    guard.clone()
+                };
+                let headers_snapshot = {
+                    let guard = lock_or_recover(&media_headers, "media headers fetch");
+                    guard.clone()
+                };
             let playlist = match hls
                 .fetch_media_with_headers(media_url_snapshot.as_str(), &headers_snapshot)
                 .await
@@ -855,7 +888,7 @@ impl AutoClip {
                     // Wait exactly 10s of post-wake audio to place wake at 50s and end at +10s.
                     refractory_until = Some(Instant::now() + refractory);
                     let ns = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
-                    let base_start = *wake_start.lock().expect("wake start lock poisoned");
+                    let base_start = *lock_or_recover(&wake_start, "wake start");
                     let detected_instant = if ns != u64::MAX {
                         base_start + Duration::from_nanos(ns)
                     } else {
@@ -1158,7 +1191,7 @@ impl AutoClip {
                 refractory_until = Some(Instant::now() + refractory);
                 detect_stream_time = Some(stream_time.saturating_sub(age_audio));
                 let ns = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
-                let base_start = *wake_start.lock().expect("wake start lock poisoned");
+                let base_start = *lock_or_recover(&wake_start, "wake start");
                 let detected_instant = if ns != u64::MAX {
                     base_start + Duration::from_nanos(ns)
                 } else {
@@ -1238,146 +1271,11 @@ struct WakeWorkerStatus {
     updated_unix_ms: u64,
 }
 
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-const NON_VIDEO_SUBDIR: &str = "_non_video";
-
-fn resolve_save_root(save_root: &str) -> PathBuf {
-    if save_root.trim().is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    } else {
-        PathBuf::from(save_root)
-    }
-}
-
-fn non_video_dir(save_root: &str) -> PathBuf {
-    let base = resolve_save_root(save_root);
-    let dir = if base
-        .file_name()
-        .and_then(|v| v.to_str())
-        .map(|v| v.eq_ignore_ascii_case(NON_VIDEO_SUBDIR))
-        .unwrap_or(false)
-    {
-        base
-    } else {
-        base.join(NON_VIDEO_SUBDIR)
-    };
-    let _ = fs::create_dir_all(&dir);
-    dir
-}
-
-fn log_run_event(save_root: &str, message: &str) {
-    let base = non_video_dir(save_root);
-    let path = base.join("autoclip_run.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "[{}] {}", now_unix_ms(), message);
-    }
-}
-
-fn log_wake_event(save_root: &str, wake_id: u64, event: &str, fields: Value) {
-    let base = if save_root.trim().is_empty() {
-        Path::new(".")
-    } else {
-        Path::new(save_root)
-    };
-    let dir = base.join("_debug");
-    let _ = fs::create_dir_all(&dir);
-    let path = dir.join(format!("wake_{wake_id:04}.jsonl"));
-    let mut obj = match fields {
-        Value::Object(map) => map,
-        _ => serde_json::Map::new(),
-    };
-    obj.insert("wake_id".to_string(), Value::from(wake_id));
-    obj.insert("event".to_string(), Value::from(event));
-    obj.insert("ts_ms".to_string(), Value::from(now_unix_ms()));
-    if let Ok(line) = serde_json::to_string(&Value::Object(obj)) {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(file, "{line}");
-        }
-    }
-}
-
-fn write_atomic_file(path: &Path, payload: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let tmp_ext = format!("tmp{}", std::process::id());
-    let tmp = path.with_extension(tmp_ext);
-    fs::write(&tmp, payload).with_context(|| format!("writing {}", tmp.display()))?;
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::write(path, payload).with_context(|| format!("writing {}", path.display()))?;
-            let _ = fs::remove_file(&tmp);
-            Ok(())
-        }
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
-            Err(err).with_context(|| format!("renaming {}", path.display()))
-        }
-    }
-}
-
-fn write_wake_worker_status(path: &Path, status: &WakeWorkerStatus) -> Result<()> {
-    let payload = serde_json::to_vec(status).context("serializing wake status")?;
-    write_atomic_file(path, &payload)
-}
-
-fn write_media_url_file(path: &Path, url: &Url) -> Result<()> {
-    write_atomic_file(path, url.as_str().as_bytes())
-}
-
 fn whisper_isolate_enabled() -> bool {
     std::env::var("WHISPER_ISOLATE")
         .ok()
         .and_then(|v| parse_bool(&v))
         .unwrap_or(false)
-}
-
-fn whisper_worker_status_path(save_root: &str) -> PathBuf {
-    std::env::var("WHISPER_WORKER_STATUS_PATH")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let base = non_video_dir(save_root);
-            base.join(".whisper_wake_status.json")
-        })
-}
-
-fn whisper_worker_media_url_path(save_root: &str) -> PathBuf {
-    std::env::var("WHISPER_WORKER_MEDIA_URL_PATH")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let base = non_video_dir(save_root);
-            base.join(".whisper_wake_media_url.txt")
-        })
-}
-
-fn whisper_worker_status_poll() -> Duration {
-    std::env::var("WHISPER_WORKER_STATUS_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(500))
 }
 
 fn spawn_whisper_worker(
@@ -1518,13 +1416,26 @@ fn duration_to_ns(d: Duration) -> u64 {
 }
 
 fn choose_segment_duration(pts: Option<Duration>, playlist: Duration) -> Duration {
+    let playlist_secs = playlist.as_secs_f32();
+    let playlist_valid = playlist_secs.is_finite() && playlist_secs > 0.0;
     if let Some(pts_dur) = pts {
-        let secs = pts_dur.as_secs_f32();
-        if secs.is_finite() && secs > 0.0 {
+        let pts_secs = pts_dur.as_secs_f32();
+        if pts_secs.is_finite() && pts_secs > 0.0 {
+            if playlist_valid {
+                let min_ok = playlist_secs * 0.5;
+                let max_ok = playlist_secs * 4.0;
+                if pts_secs < min_ok || pts_secs > max_ok {
+                    return playlist;
+                }
+            }
             return pts_dur;
         }
     }
-    playlist
+    if playlist_valid {
+        playlist
+    } else {
+        pts.unwrap_or(Duration::ZERO)
+    }
 }
 
 // Extract a best-effort PTS span from a TS segment to align clip timing to real stream time.
@@ -1701,7 +1612,8 @@ fn duration_from_span(start: u64, end: u64, wrap: u64, hz: f64) -> Option<Durati
         return None;
     }
     Some(Duration::from_secs_f64(secs))
-}
+}
+
 
 fn find_ts_sync(data: &[u8]) -> Option<usize> {
     let max_scan = usize::min(data.len(), TS_PACKET_SIZE * 4);
@@ -1746,1259 +1658,17 @@ fn parse_pts(data: &[u8]) -> Option<u64> {
     Some(pts)
 }
 
-#[derive(Debug)]
-struct HttpStatusError {
-    status: StatusCode,
-    url: String,
-}
-
-impl HttpStatusError {
-    fn new(status: StatusCode, url: &str) -> Self {
-        Self {
-            status,
-            url: url.to_string(),
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            eprintln!("warn: {label} lock poisoned; continuing with recovered state");
+            poisoned.into_inner()
         }
     }
 }
 
-impl std::fmt::Display for HttpStatusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "non-success status {} for {}", self.status, self.url)
-    }
-}
-
-impl std::error::Error for HttpStatusError {}
-
-fn is_http_status(err: &anyhow::Error, status: StatusCode) -> bool {
-    err.downcast_ref::<HttpStatusError>()
-        .map(|e| e.status == status)
-        .unwrap_or(false)
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct StreamHeaders {
-    pub referer: Option<String>,
-    pub origin: Option<String>,
-    pub cookie: Option<String>,
-}
-
-impl StreamHeaders {
-    fn for_page(page_url: &str, origin: Option<String>, cookie: Option<String>) -> Self {
-        Self {
-            referer: Some(page_url.to_string()),
-            origin,
-            cookie,
-        }
-    }
-}
-
-fn collect_env_cookies() -> Option<String> {
-    let mut cookie_parts: Vec<String> = Vec::new();
-    for key in ["COOKIE_HEADER", "KICK_COOKIE", "TIKTOK_COOKIE", "TWITCH_COOKIE"] {
-        if let Ok(val) = std::env::var(key) {
-            if !val.trim().is_empty() {
-                cookie_parts.push(val);
-            }
-        }
-    }
-    if cookie_parts.is_empty() {
-        None
-    } else {
-        Some(cookie_parts.join("; "))
-    }
-}
-
-fn headless_script_for_page(page_url: &str) -> String {
-    if page_url.contains("tiktok.com") {
-        std::env::var("HEADLESS_M3U8_SCRIPT_TIKTOK")
-            .unwrap_or_else(|_| "scripts/capture_m3u8_tiktok.js".to_string())
-    } else {
-        std::env::var("HEADLESS_M3U8_SCRIPT")
-            .unwrap_or_else(|_| "scripts/capture_m3u8.js".to_string())
-    }
-}
-
-/// Minimal client to fetch and parse HLS playlists.
-#[derive(Clone)]
-pub struct HlsClient {
-    client: Client,
-}
-
-impl HlsClient {
-    pub fn new() -> Result<Self> {
-        let mut headers = header::HeaderMap::new();
-        headers.insert(
-            header::USER_AGENT,
-            header::HeaderValue::from_static(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            ),
-        );
-        headers.insert(header::ACCEPT, header::HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"));
-        headers.insert(header::ACCEPT_LANGUAGE, header::HeaderValue::from_static("en-US,en;q=0.9"));
-        let client = Client::builder()
-            .default_headers(headers)
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .context("building reqwest client")?;
-        Ok(Self { client })
-    }
-
-    /// Fetch and parse a master playlist from the provided URL.
-    pub async fn fetch_master(&self, url: &str) -> Result<MasterPlaylist> {
-        let body = self.fetch_bytes(url).await?;
-        self.parse_master_or_media(url, &body)
-    }
-
-    pub async fn fetch_master_with_headers(
-        &self,
-        url: &str,
-        referer: Option<&str>,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<MasterPlaylist> {
-        let body = self
-            .fetch_bytes_with_headers(url, referer, origin, cookie)
-            .await?;
-        self.parse_master_or_media(url, &body)
-    }
-
-    /// Fetch a page via headless Playwright, extract the first m3u8 URL, and parse
-    /// it as a master playlist. Adds Referer/Origin tied to the page URL. Forwards
-    /// COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE / TWITCH_COOKIE if present. If
-    /// M3U8_URL_OVERRIDE is set, use
-    /// that master URL directly instead of headless extraction.
-    pub async fn fetch_master_from_page_with_headers(
-        &self,
-        page_url: &str,
-    ) -> Result<(String, MasterPlaylist, StreamHeaders)> {
-        let env_cookie = collect_env_cookies();
-        let origin = origin_for_page(page_url).unwrap_or_else(|| "https://kick.com".to_string());
-        let base_headers = StreamHeaders::for_page(page_url, Some(origin.clone()), env_cookie.clone());
-
-        let is_tiktok = page_url.contains("tiktok.com");
-        let is_twitch = page_url.contains("twitch.tv");
-        let headless_script = headless_script_for_page(page_url);
-
-        if let Ok(override_url) = std::env::var("M3U8_URL_OVERRIDE") {
-            let master = self
-                .fetch_master_with_headers(
-                    &override_url,
-                    base_headers.referer.as_deref(),
-                    base_headers.origin.as_deref(),
-                    base_headers.cookie.as_deref(),
-                )
-                .await?;
-            return Ok((override_url, master, base_headers));
-        }
-
-        if is_tiktok {
-            if let Some((url, master)) = self
-                .try_fetch_tiktok_master(page_url, env_cookie.as_deref())
-                .await?
-            {
-                return Ok((url, master, base_headers));
-            }
-            eprintln!("TikTok HTTP discovery failed or stream offline; falling back to headless");
-        }
-        if is_twitch {
-            if let Some((url, master)) = self
-                .try_fetch_twitch_master(page_url, env_cookie.as_deref())
-                .await?
-            {
-                return Ok((url, master, base_headers));
-            }
-            eprintln!("Twitch HTTP discovery failed or stream offline; falling back to headless");
-        }
-
-        self.fetch_master_with_headless_with_headers(
-            page_url,
-            env_cookie.as_deref(),
-            &headless_script,
-        )
-        .await
-    }
-
-    pub async fn fetch_master_from_page(&self, page_url: &str) -> Result<(String, MasterPlaylist)> {
-        let (master_url, master, _headers) = self.fetch_master_from_page_with_headers(page_url).await?;
-        Ok((master_url, master))
-    }
-
-    /// Force a headless discovery pass to refresh the master playlist + headers.
-    pub async fn fetch_master_from_page_headless_with_headers(
-        &self,
-        page_url: &str,
-    ) -> Result<(String, MasterPlaylist, StreamHeaders)> {
-        let env_cookie = collect_env_cookies();
-        let headless_script = headless_script_for_page(page_url);
-        self.fetch_master_with_headless_with_headers(
-            page_url,
-            env_cookie.as_deref(),
-            &headless_script,
-        )
-        .await
-    }
-
-    /// Force a headless discovery pass to refresh the master playlist.
-    pub async fn fetch_master_from_page_headless(
-        &self,
-        page_url: &str,
-    ) -> Result<(String, MasterPlaylist)> {
-        let (master_url, master, _headers) =
-            self.fetch_master_from_page_headless_with_headers(page_url).await?;
-        Ok((master_url, master))
-    }
-
-    /// Use a headless browser (Node + Playwright script) to capture an m3u8 URL.
-    async fn fetch_master_with_headless(
-        &self,
-        page_url: &str,
-        cookie_env: Option<&str>,
-        script_path: &str,
-    ) -> Result<(String, MasterPlaylist)> {
-        let (master_url, master, _headers) = self
-            .fetch_master_with_headless_with_headers(page_url, cookie_env, script_path)
-            .await?;
-        Ok((master_url, master))
-    }
-
-    async fn fetch_master_with_headless_with_headers(
-        &self,
-        page_url: &str,
-        cookie_env: Option<&str>,
-        script_path: &str,
-    ) -> Result<(String, MasterPlaylist, StreamHeaders)> {
-        let output = Command::new("node")
-            .arg(script_path)
-            .arg(page_url)
-            .output()
-            .await
-            .with_context(|| format!("running headless script {script_path}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "headless script exited with {}: {}",
-                output.status,
-                stderr.trim()
-            );
-        }
-
-        let mut m3u8_url_line: Option<String> = None;
-        let mut cookie_from_headless: Option<String> = None;
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if m3u8_url_line.is_none() && trimmed.to_lowercase().contains(".m3u8") {
-                m3u8_url_line = Some(trimmed.to_string());
-            }
-            if let Some(rest) = trimmed.strip_prefix("COOKIES:") {
-                if !rest.trim().is_empty() {
-                    cookie_from_headless = Some(rest.trim().to_string());
-                }
-            }
-        }
-
-        let m3u8_url_raw = m3u8_url_line
-            .ok_or_else(|| anyhow::anyhow!("headless script did not emit an m3u8 url; stderr: {}", stderr.trim()))?;
-        let m3u8_url_raw = sanitize_m3u8_url(&m3u8_url_raw);
-        // Use the raw URL from headless to avoid invalidating any signed token.
-        let m3u8_url = m3u8_url_raw;
-        eprintln!("headless extracted m3u8 url: {}", m3u8_url);
-
-        let combined_cookie = match (cookie_env, cookie_from_headless.as_deref()) {
-            (Some(env_c), Some(headless_c)) => Some(format!("{env_c}; {headless_c}")),
-            (Some(env_c), None) => Some(env_c.to_string()),
-            (None, Some(headless_c)) => Some(headless_c.to_string()),
-            (None, None) => None,
-        };
-
-        let origin = origin_for_page(page_url);
-
-        let body = self
-            .fetch_bytes_with_headers(
-                &m3u8_url,
-                Some(page_url),
-                origin.as_deref(),
-                combined_cookie.as_deref(),
-            )
-            .await?;
-
-        let parsed = self.parse_master_or_media(&m3u8_url, &body)?;
-        let headers = StreamHeaders::for_page(page_url, origin, combined_cookie);
-        Ok((m3u8_url, parsed, headers))
-    }
-
-    async fn try_fetch_tiktok_master(
-        &self,
-        page_url: &str,
-        cookie_env: Option<&str>,
-    ) -> Result<Option<(String, MasterPlaylist)>> {
-        let origin = origin_for_page(page_url).unwrap_or_else(|| "https://www.tiktok.com".to_string());
-        let cookie_header = cookie_env
-            .filter(|c| !c.trim().is_empty())
-            .map(|c| c.to_string());
-
-        let html = match self
-            .fetch_text_with_headers(page_url, Some(page_url), Some(&origin), cookie_header.as_deref())
-            .await
-        {
-            Ok(h) => h,
-            Err(err) => {
-                eprintln!("TikTok: failed to fetch page HTML: {err:#}");
-                return Ok(None);
-            }
-        };
-
-        let room_id = match extract_tiktok_room_id(&html) {
-            Some(id) => id,
-            None => {
-                eprintln!("TikTok: no room_id found; stream may be offline");
-                return Ok(None);
-            }
-        };
-
-        let mut live_info: Option<Value> = None;
-        let mut attempts = 0;
-        while attempts < 3 {
-            match self
-                .fetch_tiktok_room_info(&room_id, page_url, Some(&origin), cookie_header.as_deref())
-                .await
-            {
-                Ok(v) => {
-                    live_info = Some(v);
-                    break;
-                }
-                Err(err) => {
-                    attempts += 1;
-                    if attempts >= 3 {
-                        eprintln!("TikTok: room info fetch failed: {err:#}");
-                        return Ok(None);
-                    }
-                    sleep(Duration::from_millis(300)).await;
-                }
-            }
-        }
-
-        let live_info = live_info.unwrap_or(Value::Null);
-        let mut candidates = collect_tiktok_hls_candidates(&live_info);
-
-        if candidates.is_empty() {
-            if let Some(fallback_url) = self
-                .fetch_tiktok_live_detail_url(&room_id, page_url, Some(&origin), cookie_header.as_deref())
-                .await?
-            {
-                candidates.push(("live_detail".to_string(), fallback_url));
-            }
-        }
-
-        if candidates.is_empty() {
-            eprintln!("TikTok: no HLS candidates from room info or detail API");
-            return Ok(None);
-        }
-
-        let selected = pick_best_tiktok_hls(&candidates).unwrap_or_else(|| candidates[0].1.clone());
-        let master = self
-            .fetch_master_with_headers(&selected, Some(page_url), Some(&origin), cookie_header.as_deref())
-            .await?;
-        Ok(Some((selected, master)))
-    }
-
-    async fn try_fetch_twitch_master(
-        &self,
-        page_url: &str,
-        cookie_env: Option<&str>,
-    ) -> Result<Option<(String, MasterPlaylist)>> {
-        let login = match extract_twitch_login(page_url) {
-            Some(name) => name,
-            None => {
-                eprintln!("Twitch: could not determine channel login from URL");
-                return Ok(None);
-            }
-        };
-
-        let origin = origin_for_page(page_url).unwrap_or_else(|| "https://www.twitch.tv".to_string());
-        let cookie_header = cookie_env.filter(|c| !c.trim().is_empty());
-
-        let (sig, token) = match self
-            .fetch_twitch_playback_token(&login, page_url, Some(&origin), cookie_header)
-            .await
-        {
-            Ok(t) => t,
-            Err(err) => {
-                eprintln!("Twitch: playback token fetch failed: {err:#}");
-                return Ok(None);
-            }
-        };
-
-        let hls_url = build_twitch_hls_url(&login, &sig, &token)?;
-        let master = self
-            .fetch_master_with_headers(&hls_url, Some(page_url), Some(&origin), cookie_header)
-            .await?;
-        Ok(Some((hls_url, master)))
-    }
-
-    async fn fetch_twitch_playback_token(
-        &self,
-        login: &str,
-        referer: &str,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<(String, String)> {
-        const DEFAULT_TWITCH_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
-        const TWITCH_PLAYBACK_HASH: &str =
-            "0828119ded2d05bcfcf8e4da97d91aa47a1ec89be12f0161a2367c6a6fc1ce2c";
-
-        let client_id = std::env::var("TWITCH_CLIENT_ID").unwrap_or_else(|_| DEFAULT_TWITCH_CLIENT_ID.to_string());
-        let auth_token = std::env::var("TWITCH_OAUTH_TOKEN")
-            .or_else(|_| std::env::var("TWITCH_AUTH_TOKEN"))
-            .ok()
-            .and_then(|v| twitch_auth_header(&v));
-
-        let payload = serde_json::json!({
-            "operationName": "PlaybackAccessToken",
-            "variables": {
-                "isLive": true,
-                "login": login,
-                "isVod": false,
-                "vodID": "",
-                "playerType": "site"
-            },
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": TWITCH_PLAYBACK_HASH
-                }
-            }
-        });
-
-        let mut req = self
-            .client
-            .post("https://gql.twitch.tv/gql")
-            .header("Client-ID", client_id)
-            .header(header::ACCEPT, "application/json")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("Referer", referer);
-        if let Some(o) = origin {
-            req = req.header("Origin", o);
-        }
-        if let Some(c) = cookie {
-            req = req.header(header::COOKIE, c);
-        }
-        if let Some(auth) = auth_token {
-            req = req.header(header::AUTHORIZATION, auth);
-        }
-
-        let resp = req
-            .json(&payload)
-            .send()
-            .await
-            .context("requesting Twitch playback token")?;
-        let status = resp.status();
-        let body = resp.text().await.context("reading Twitch playback token body")?;
-        if !status.is_success() {
-            eprintln!("Twitch token status {} body: {}", status, truncate_str(&body, 500));
-            anyhow::bail!("Twitch token request returned status {status}");
-        }
-
-        let json: Value = serde_json::from_str(&body).context("parsing Twitch token JSON")?;
-        if let Some((sig, value)) = extract_twitch_playback_token(&json) {
-            return Ok((sig, value));
-        }
-        anyhow::bail!("Twitch token response missing playback access token");
-    }
-
-    async fn fetch_text_with_headers(
-        &self,
-        url: &str,
-        referer: Option<&str>,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<String> {
-        let mut req = self.client.get(url);
-        if let Some(r) = referer {
-            req = req.header("Referer", r);
-        }
-        if let Some(o) = origin {
-            req = req.header("Origin", o);
-        }
-        if let Some(c) = cookie {
-            req = req.header(header::COOKIE, c);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("request failed for {url}"))?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .with_context(|| format!("reading body for {url}"))?;
-        if !status.is_success() {
-            eprintln!("fetch {} -> status {} body preview: {}", url, status, truncate_str(&text, 500));
-            anyhow::bail!("non-success status {} for {}", status, url);
-        }
-        Ok(text)
-    }
-
-    async fn fetch_tiktok_room_info(
-        &self,
-        room_id: &str,
-        referer: &str,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<Value> {
-        let url = "https://webcast.tiktok.com/webcast/room/info";
-        let mut req = self.client.get(url).query(&[
-            ("room_id", room_id),
-            ("aid", "1988"),
-            ("device_platform", "web"),
-            ("app_name", "tiktok_web"),
-            ("language", "en"),
-        ]);
-        req = req.header("Referer", referer);
-        if let Some(o) = origin {
-            req = req.header("Origin", o);
-        }
-        if let Some(c) = cookie {
-            req = req.header(header::COOKIE, c);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| "requesting TikTok room info")?;
-        let status = resp.status();
-        let body = resp.text().await.context("reading TikTok room info body")?;
-        if !status.is_success() {
-            eprintln!("TikTok room info status {} body: {}", status, truncate_str(&body, 500));
-            anyhow::bail!("TikTok room info returned status {status}");
-        }
-        let json: Value = serde_json::from_str(&body).context("parsing TikTok room info JSON")?;
-        let data = json.get("data").cloned().unwrap_or(Value::Null);
-        Ok(data)
-    }
-
-    async fn fetch_tiktok_live_detail_url(
-        &self,
-        room_id: &str,
-        referer: &str,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<Option<String>> {
-        let url = format!("https://www.tiktok.com/api/live/detail/?roomID={room_id}");
-        let mut req = self.client.get(&url);
-        req = req.header("Referer", referer);
-        if let Some(o) = origin {
-            req = req.header("Origin", o);
-        }
-        if let Some(c) = cookie {
-            req = req.header(header::COOKIE, c);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| "requesting TikTok live detail")?;
-        let status = resp.status();
-        let body = resp.text().await.context("reading TikTok live detail body")?;
-        if !status.is_success() {
-            return Ok(None);
-        }
-        let json: Value = serde_json::from_str(&body).context("parsing TikTok live detail JSON")?;
-        Ok(json
-            .get("liveUrl")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()))
-    }
-
-    /// Pick the highest-quality variant from a master playlist and return its joined URL.
-    pub fn highest_variant_url(&self, master_url: &str, master: &MasterPlaylist) -> Result<Url> {
-        let base = Url::parse(master_url).context("invalid master playlist url")?;
-
-        let variant = master
-            .variants
-            .iter()
-            .max_by(|a, b| compare_variant_quality(a, b))
-            .context("master playlist has no variants")?;
-
-        let uri = &variant.uri;
-        let resolved = base.join(uri).context("joining variant uri")?;
-        Ok(resolved)
-    }
-
-    /// Fetch and parse a media playlist (variant) from the provided URL.
-    pub async fn fetch_media(&self, url: &str) -> Result<MediaPlaylist> {
-        let body = self.fetch_bytes(url).await?;
-        let parsed = m3u8_rs::parse_media_playlist_res(&body)
-            .map_err(|e| anyhow::anyhow!("failed to parse media playlist: {e}"))?;
-        Ok(parsed)
-    }
-
-    pub async fn fetch_media_with_headers(
-        &self,
-        url: &str,
-        headers: &StreamHeaders,
-    ) -> Result<MediaPlaylist> {
-        let body = self
-            .fetch_bytes_with_headers(
-                url,
-                headers.referer.as_deref(),
-                headers.origin.as_deref(),
-                headers.cookie.as_deref(),
-            )
-            .await?;
-        let parsed = m3u8_rs::parse_media_playlist_res(&body)
-            .map_err(|e| anyhow::anyhow!("failed to parse media playlist: {e}"))?;
-        Ok(parsed)
-    }
-
-    /// Refresh the best variant URL from a page using headless discovery.
-    pub async fn refresh_media_url_from_page_headless(&self, page_url: &str) -> Result<Url> {
-        let (master_url, master) = self.fetch_master_from_page_headless(page_url).await?;
-        self.highest_variant_url(&master_url, &master)
-    }
-
-    pub async fn refresh_media_url_from_page_headless_with_headers(
-        &self,
-        page_url: &str,
-    ) -> Result<(Url, StreamHeaders)> {
-        let (master_url, master, headers) =
-            self.fetch_master_from_page_headless_with_headers(page_url).await?;
-        let media_url = self.highest_variant_url(&master_url, &master)?;
-        Ok((media_url, headers))
-    }
-
-    /// Fetch the first media segment bytes from a media playlist URL.
-    pub async fn fetch_first_segment(&self, playlist_url: &str) -> Result<Vec<u8>> {
-        let media = self.fetch_media(playlist_url).await?;
-        let first = media
-            .segments
-            .first()
-            .map(|s| &s.uri)
-            .context("media playlist has no segments")?;
-
-        let playlist_url = Url::parse(playlist_url).context("invalid playlist url")?;
-        let segment_url = playlist_url
-            .join(first)
-            .context("joining segment url")?;
-
-        self.fetch_bytes(segment_url.as_str()).await
-    }
-
-    /// Fetch an arbitrary segment (by URI) relative to a media playlist URL.
-    pub async fn fetch_segment_from_playlist(
-        &self,
-        playlist_url: &Url,
-        segment_uri: &str,
-    ) -> Result<Vec<u8>> {
-        let segment_url = playlist_url
-            .join(segment_uri)
-            .context("joining segment url")?;
-        self.fetch_bytes(segment_url.as_str()).await
-    }
-
-    pub async fn fetch_segment_from_playlist_with_headers(
-        &self,
-        playlist_url: &Url,
-        segment_uri: &str,
-        headers: &StreamHeaders,
-    ) -> Result<Vec<u8>> {
-        let segment_url = playlist_url
-            .join(segment_uri)
-            .context("joining segment url")?;
-        self.fetch_bytes_with_headers(
-            segment_url.as_str(),
-            headers.referer.as_deref(),
-            headers.origin.as_deref(),
-            headers.cookie.as_deref(),
-        )
-        .await
-    }
-
-    async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        self.fetch_bytes_with_headers(url, None, None, None).await
-    }
-
-    async fn fetch_bytes_with_headers(
-        &self,
-        url: &str,
-        referer: Option<&str>,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<Vec<u8>> {
-        let mut req = self.client.get(url);
-        if let Some(r) = referer {
-            req = req.header("Referer", r);
-        }
-        if let Some(o) = origin {
-            req = req.header("Origin", o);
-        }
-        if let Some(c) = cookie {
-            req = req.header(header::COOKIE, c);
-        }
-        req = req.header(header::ACCEPT, "application/vnd.apple.mpegurl,application/x-mpegURL,application/octet-stream");
-
-        // Log the effective headers for troubleshooting signed/authorized endpoints.
-        if std::env::var("LOG_M3U8_HEADERS").is_ok() {
-            let mut dbg_headers = Vec::new();
-            if let Some(r) = referer {
-                dbg_headers.push(format!("Referer={r}"));
-            }
-            if let Some(o) = origin {
-                dbg_headers.push(format!("Origin={o}"));
-            }
-            if let Some(c) = cookie {
-                dbg_headers.push(format!("Cookie={}...", c.chars().take(80).collect::<String>()));
-            }
-            eprintln!("m3u8 request headers: {}", dbg_headers.join(" | "));
-        }
-
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("request failed for {url}"))?;
-        let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .with_context(|| format!("reading body for {url}"))?;
-        if !status.is_success() {
-            let preview = String::from_utf8_lossy(&bytes);
-            eprintln!("fetch {} -> status {} body preview: {}", url, status, preview.chars().take(500).collect::<String>());
-            return Err(HttpStatusError::new(status, url).into());
-        }
-        Ok(bytes.to_vec())
-    }
-
-}
-
-impl HlsClient {
-    fn parse_master_or_media(&self, m3u8_url: &str, body: &[u8]) -> Result<MasterPlaylist> {
-        match m3u8_rs::parse_master_playlist_res(body) {
-            Ok(master) if !master.variants.is_empty() => return Ok(master),
-            Ok(_master) => {
-                // Empty variants; try media parse and wrap as single-variant master.
-                if let Ok(_media) = m3u8_rs::parse_media_playlist_res(body) {
-                    let variant = VariantStream {
-                        uri: m3u8_url.to_string(),
-                        ..Default::default()
-                    };
-                    let mut out = MasterPlaylist::default();
-                    out.variants.push(variant);
-                    return Ok(out);
-                }
-                // Fall through to error below if media parse fails.
-            }
-            Err(e) => {
-                // Try media parse before bailing.
-                if let Ok(_media) = m3u8_rs::parse_media_playlist_res(body) {
-                    let variant = VariantStream {
-                        uri: m3u8_url.to_string(),
-                        ..Default::default()
-                    };
-                    let mut out = MasterPlaylist::default();
-                    out.variants.push(variant);
-                    return Ok(out);
-                }
-                return Err(anyhow::anyhow!("failed to parse master playlist: {e}"));
-            }
-        }
-
-        Err(anyhow::anyhow!("failed to parse playlist at {m3u8_url}"))
-    }
-}
-
-fn extract_tiktok_room_id(html: &str) -> Option<String> {
-    for marker in ["id=\"SIGI_STATE\"", "id=\"sigi-persisted-data\"", "id=\"__UNIVERSAL_DATA_FOR_REHYDRATION__\""] {
-        if let Some(block) = extract_json_script_block(html, marker) {
-            if let Ok(json) = serde_json::from_str::<Value>(&block) {
-                if let Some(id) = find_room_id_value(&json) {
-                    return Some(id);
-                }
-                // Some pages nest under __DEFAULT_SCOPE__ for the universal data script.
-                if let Some(default_scope) = json.get("__DEFAULT_SCOPE__") {
-                    if let Some(id) = find_room_id_value(default_scope) {
-                        return Some(id);
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: scan for roomId in the HTML.
-    if let Some(idx) = html.find("roomId\":\"") {
-        let start = idx + "roomId\":\"".len();
-        let rest = &html[start..];
-        let end = rest.find('"').unwrap_or(rest.len());
-        let candidate = &rest[..end];
-        if !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_digit()) {
-            return Some(candidate.to_string());
-        }
-    }
-
-    None
-}
-
-fn extract_json_script_block(html: &str, marker: &str) -> Option<String> {
-    let tag_start = html.find(marker)?;
-    let after_tag = html[tag_start..].find('>')?;
-    let script_start = tag_start + after_tag + 1;
-    let script_end_rel = html[script_start..].find("</script>")?;
-    let script_end = script_start + script_end_rel;
-    Some(html[script_start..script_end].to_string())
-}
-
-fn find_room_id_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Object(map) => {
-            for (k, v) in map {
-                if k.eq_ignore_ascii_case("roomid") || k.eq_ignore_ascii_case("room_id") {
-                    if let Some(s) = v.as_str() {
-                        if !s.is_empty() {
-                            return Some(s.to_string());
-                        }
-                    } else if let Some(n) = v.as_i64() {
-                        return Some(n.to_string());
-                    }
-                }
-                if let Some(found) = find_room_id_value(v) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(arr) => {
-            for v in arr {
-                if let Some(found) = find_room_id_value(v) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn collect_tiktok_hls_candidates(live_info: &Value) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-
-    if let Some(stream_data) = live_info
-        .get("stream_url")
-        .and_then(|v| v.get("live_core_sdk_data"))
-        .and_then(|v| v.get("pull_data"))
-        .and_then(|v| v.get("stream_data"))
-    {
-        if let Some(map) = stream_data.as_object() {
-            for (quality, entry) in map {
-                let parsed = if let Some(s) = entry.as_str() {
-                    serde_json::from_str::<Value>(s).ok()
-                } else {
-                    Some(entry.clone())
-                };
-
-                if let Some(val) = parsed {
-                    if let Some(hls) = extract_hls_from_stream_entry(&val) {
-                        out.push((quality.clone(), hls));
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(map) = live_info
-        .get("stream_url")
-        .and_then(|v| v.get("hls_pull_url_map"))
-        .and_then(|v| v.as_object())
-    {
-        for (quality, url) in map {
-            if let Some(u) = url.as_str() {
-                out.push((quality.clone(), u.to_string()));
-            }
-        }
-    }
-
-    if let Some(url) = live_info
-        .get("stream_url")
-        .and_then(|v| v.get("hls_pull_url"))
-        .and_then(|v| v.as_str())
-    {
-        out.push(("hls_pull".to_string(), url.to_string()));
-    }
-
-    out
-}
-
-fn extract_hls_from_stream_entry(entry: &Value) -> Option<String> {
-    let main = entry.get("main");
-    let candidates = [
-        main.and_then(|v| v.get("https_hls")),
-        main.and_then(|v| v.get("hls")),
-        main.and_then(|v| v.get("hls_pull_url")),
-    ];
-
-    for candidate in candidates.into_iter().flatten() {
-        if let Some(url) = candidate.as_str() {
-            if url.to_ascii_lowercase().contains("m3u8") {
-                return Some(url.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-fn pick_best_tiktok_hls(candidates: &[(String, String)]) -> Option<String> {
-    if candidates.is_empty() {
-        return None;
-    }
-
-    let preferred = [
-        "origion",
-        "origin",
-        "full_hd1",
-        "uhd",
-        "hd1",
-        "hd",
-        "sd2",
-        "sd1",
-        "sd",
-        "ld",
-    ];
-
-    for pref in preferred {
-        if let Some((_, url)) = candidates
-            .iter()
-            .find(|(q, _)| q.to_ascii_lowercase() == pref)
-        {
-            return Some(url.clone());
-        }
-    }
-
-    candidates.first().map(|(_, url)| url.clone())
-}
-
-fn extract_twitch_login(page_url: &str) -> Option<String> {
-    let url = Url::parse(page_url).ok()?;
-    let host = url.host_str()?.to_ascii_lowercase();
-    if !host.ends_with("twitch.tv") {
-        return None;
-    }
-
-    for (k, v) in url.query_pairs() {
-        if k.eq_ignore_ascii_case("channel") || k.eq_ignore_ascii_case("login") {
-            if is_valid_twitch_login(&v) {
-                return Some(v.to_string());
-            }
-        }
-    }
-
-    let mut segments = url.path_segments()?.filter(|s| !s.is_empty());
-    let first = segments.next()?;
-    let first_lc = first.to_ascii_lowercase();
-    if first_lc == "popout" || first_lc == "embed" {
-        if let Some(next) = segments.next() {
-            if is_valid_twitch_login(next) {
-                return Some(next.to_string());
-            }
-        }
-    }
-
-    if is_valid_twitch_login(first) {
-        return Some(first.to_string());
-    }
-
-    None
-}
-
-fn is_valid_twitch_login(login: &str) -> bool {
-    let lower = login.to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-    let reserved = [
-        "videos",
-        "directory",
-        "p",
-        "settings",
-        "downloads",
-        "friends",
-        "inventory",
-        "jobs",
-        "store",
-        "login",
-        "signup",
-        "search",
-        "prime",
-        "bits",
-    ];
-    if reserved.contains(&lower.as_str()) {
-        return false;
-    }
-    login.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn twitch_auth_header(token: &str) -> Option<String> {
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("oauth ") {
-        return Some(trimmed.to_string());
-    }
-    if lower.starts_with("oauth:") {
-        return Some(format!("OAuth {}", trimmed[6..].trim()));
-    }
-    if lower.starts_with("bearer ") {
-        return Some(format!("OAuth {}", trimmed[7..].trim()));
-    }
-    Some(format!("OAuth {}", trimmed))
-}
-
-fn extract_twitch_playback_token(value: &Value) -> Option<(String, String)> {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                if let Some(tok) = extract_twitch_playback_token(item) {
-                    return Some(tok);
-                }
-            }
-            None
-        }
-        Value::Object(_) => {
-            let data = value.get("data")?;
-            let token = data
-                .get("streamPlaybackAccessToken")
-                .or_else(|| data.get("playbackAccessToken"))?;
-            let sig = token.get("signature")?.as_str()?;
-            let value = token.get("value")?.as_str()?;
-            Some((sig.to_string(), value.to_string()))
-        }
-        _ => None,
-    }
-}
-
-fn build_twitch_hls_url(login: &str, sig: &str, token: &str) -> Result<String> {
-    let mut url = Url::parse(&format!("https://usher.ttvnw.net/api/channel/hls/{login}.m3u8"))
-        .context("parsing Twitch usher URL")?;
-    {
-        let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("sig", sig);
-        pairs.append_pair("token", token);
-        pairs.append_pair("allow_source", "true");
-        pairs.append_pair("allow_audio_only", "true");
-        pairs.append_pair("allow_spectre", "true");
-        pairs.append_pair("player", "twitchweb");
-        pairs.append_pair("playlist_include_framerate", "true");
-        pairs.append_pair("fast_bread", "true");
-    }
-    Ok(url.to_string())
-}
-
-/// Compare variants by average bandwidth, then bandwidth, then resolution pixels, then fallback to order.
-fn compare_variant_quality(a: &VariantStream, b: &VariantStream) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    let a_band: Option<u64> = a
-        .average_bandwidth
-        .map(|v| v as u64)
-        .or(Some(a.bandwidth as u64));
-    let b_band: Option<u64> = b
-        .average_bandwidth
-        .map(|v| v as u64)
-        .or(Some(b.bandwidth as u64));
-
-    match (a_band, b_band) {
-        (Some(a_bw), Some(b_bw)) if a_bw != b_bw => return a_bw.cmp(&b_bw),
-        _ => {}
-    }
-
-    let a_pixels = a.resolution.map(|r| r.width as u64 * r.height as u64);
-    let b_pixels = b.resolution.map(|r| r.width as u64 * r.height as u64);
-
-    match (a_pixels, b_pixels) {
-        (Some(a_px), Some(b_px)) if a_px != b_px => return a_px.cmp(&b_px),
-        _ => {}
-    }
-
-    Ordering::Equal
-}
-
-fn parse_resolution(res: &str) -> Option<(u32, u32)> {
-    let parts: Vec<_> = res.split('x').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let w = parts[0].parse().ok()?;
-    let h = parts[1].parse().ok()?;
-    Some((w, h))
-}
-
-fn rect_area(rect: NormalizedRect) -> f32 {
-    let area = rect.w * rect.h;
-    if !area.is_finite() {
-        return 0.0;
-    }
-    area.max(0.0)
-}
-
-fn face_area_from_hints(hints: &clip_layout::ClipLayoutHints) -> Option<f32> {
-    let rect = hints.face_box.or_else(|| {
-        hints
-            .face_track
-            .as_ref()
-            .and_then(|track| track.points.first().map(|p| p.rect))
-    })?;
-    Some(rect_area(rect))
-}
-
-fn face_rect_from_hints(hints: &clip_layout::ClipLayoutHints) -> Option<NormalizedRect> {
-    hints
-        .face_region
-        .or(hints.face_box)
-        .or_else(|| {
-            hints
-                .face_track
-                .as_ref()
-                .and_then(|track| track.points.first().map(|p| p.rect))
-        })
-}
-
-fn face_rect_for_gameplay_guess(hints: &clip_layout::ClipLayoutHints) -> Option<NormalizedRect> {
-    hints.face_box.or_else(|| {
-        hints
-            .face_track
-            .as_ref()
-            .and_then(|track| track.points.first().map(|p| p.rect))
-    })
-}
-
-fn guess_gameplay_low_resource(
-    hints: &clip_layout::ClipLayoutHints,
-    face_only_area_threshold: f32,
-) -> Option<(bool, f32, f32)> {
-    let rect = face_rect_for_gameplay_guess(hints)?;
-    let area = rect_area(rect);
-    if !area.is_finite() {
-        return None;
-    }
-    let center_x = (rect.x + rect.w / 2.0).clamp(0.0, 1.0);
-    let center_y = (rect.y + rect.h / 2.0).clamp(0.0, 1.0);
-    let edge_bias = center_x
-        .min(center_y)
-        .min(1.0 - center_x)
-        .min(1.0 - center_y);
-    const TINY_FACE_AREA: f32 = 0.03;
-    const EDGE_BIAS_THRESHOLD: f32 = 0.22;
-    if area >= face_only_area_threshold {
-        return Some((false, area, edge_bias));
-    }
-    if area <= TINY_FACE_AREA {
-        let gameplay_present = edge_bias <= EDGE_BIAS_THRESHOLD;
-        return Some((gameplay_present, area, edge_bias));
-    }
-    None
-}
-
-fn rect_contains_rect(outer: NormalizedRect, inner: NormalizedRect, margin: f32) -> bool {
-    let margin = margin.max(0.0);
-    let left = outer.x - margin;
-    let top = outer.y - margin;
-    let right = outer.x + outer.w + margin;
-    let bottom = outer.y + outer.h + margin;
-    inner.x >= left
-        && inner.y >= top
-        && (inner.x + inner.w) <= right
-        && (inner.y + inner.h) <= bottom
-}
-
-fn normalize_page_url(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return trimmed.to_string();
-    }
-    if Url::parse(trimmed).is_ok() {
-        return trimmed.to_string();
-    }
-    if trimmed.contains("://") || looks_like_path(trimmed) {
-        return trimmed.to_string();
-    }
-    format!("https://{trimmed}")
-}
-
-fn looks_like_path(value: &str) -> bool {
-    let value = value.trim();
-    if value.is_empty() {
-        return false;
-    }
-    if value.starts_with("./")
-        || value.starts_with("../")
-        || value.starts_with('/')
-        || value.starts_with('\\')
-    {
-        return true;
-    }
-    let bytes = value.as_bytes();
-    bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/')
-}
-
-fn sanitize_m3u8_url(raw: &str) -> String {
-    raw.trim()
-        .trim_matches('\'')
-        .trim_matches('"')
-        .trim_end_matches('\\')
-        .to_string()
-}
-
-fn signed_url_expiry(url: &Url) -> Option<SystemTime> {
-    let mut best: Option<SystemTime> = None;
-    for (key, value) in url.query_pairs() {
-        let key = key.to_ascii_lowercase();
-        let key = key.as_str();
-        let is_exp = matches!(
-            key,
-            "exp"
-                | "expires"
-                | "expire"
-                | "expiry"
-                | "token_exp"
-                | "hdntl_exp"
-                | "hls_exp"
-                | "sig_exp"
-        ) || key.ends_with("_exp");
-        if !is_exp {
-            continue;
-        }
-        let raw = value.trim();
-        if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let mut secs = match raw.parse::<u64>() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if secs > 1_000_000_000_000 {
-            secs /= 1000;
-        }
-        if secs > 10_000_000_000 {
-            secs /= 1000;
-        }
-        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-        best = Some(best.map_or(ts, |prev| prev.min(ts)));
-    }
-    best
-}
-
-fn origin_for_page(page_url: &str) -> Option<String> {
-    if let Ok(u) = Url::parse(page_url) {
-        if let Some(host) = u.host_str() {
-            return Some(format!("{}://{}", u.scheme(), host));
-        }
-    }
-    None
-}
-
-fn truncate_str(s: &str, max: usize) -> String {
+pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
@@ -3381,16 +2051,9 @@ fn next_output_path(save_dir: &str, stub: &str) -> Result<PathBuf> {
 
 async fn run_ffmpeg_30s(input_hls: &Url, out_path: &Path, out_w: u32, out_h: u32) -> Result<()> {
     run_ffmpeg_internal(
-        input_hls.as_str(),
-        out_path,
-        out_w,
-        out_h,
-        Some(30.0),
-        None,
-        false,
-        false,
-        None,
-        false,
+        FfmpegRenderSpec::new(input_hls.as_str(), out_path, out_w, out_h)
+            .with_duration(Some(30.0))
+            .with_regen_pts(false),
     )
     .await
 }
@@ -3400,6 +2063,205 @@ struct ClipTimingHints {
     estimated_total_secs: f32,
     detect_offset_secs: f32,
     before_secs: f32,
+}
+
+#[derive(Debug, Clone)]
+struct FfmpegRenderSpec {
+    input: String,
+    out_path: PathBuf,
+    out_w: u32,
+    out_h: u32,
+    duration_secs: Option<f32>,
+    start_offset_secs: Option<f32>,
+    regen_pts: bool,
+    force_ts_input: bool,
+    progress: Option<ProgressSpec>,
+    live_fast: bool,
+    fast_preset: bool,
+}
+
+impl FfmpegRenderSpec {
+    fn new(input: &str, out_path: &Path, out_w: u32, out_h: u32) -> Self {
+        Self {
+            input: input.to_string(),
+            out_path: out_path.to_path_buf(),
+            out_w,
+            out_h,
+            duration_secs: None,
+            start_offset_secs: None,
+            regen_pts: true,
+            force_ts_input: false,
+            progress: None,
+            live_fast: false,
+            fast_preset: false,
+        }
+    }
+
+    fn with_duration(mut self, duration_secs: Option<f32>) -> Self {
+        self.duration_secs = duration_secs;
+        self
+    }
+
+    fn with_start_offset(mut self, start_offset_secs: Option<f32>) -> Self {
+        self.start_offset_secs = start_offset_secs;
+        self
+    }
+
+    fn with_regen_pts(mut self, regen_pts: bool) -> Self {
+        self.regen_pts = regen_pts;
+        self
+    }
+
+    fn with_force_ts_input(mut self, force_ts_input: bool) -> Self {
+        self.force_ts_input = force_ts_input;
+        self
+    }
+
+    fn with_progress(mut self, progress: Option<ProgressSpec>) -> Self {
+        self.progress = progress;
+        self
+    }
+
+    fn with_live_fast(mut self, live_fast: bool) -> Self {
+        self.live_fast = live_fast;
+        self
+    }
+
+    fn with_fast_preset(mut self, fast_preset: bool) -> Self {
+        self.fast_preset = fast_preset;
+        self
+    }
+}
+
+struct LayoutDecision {
+    layout_is_stacked: bool,
+    face_only: bool,
+    fullscreen_fill: bool,
+    fullscreen_track: Option<clip_layout::FaceTrack>,
+    fullscreen_center_override: Option<NormalizedPoint>,
+}
+
+fn decide_stacked_layout(
+    layout: &ClipLayoutConfig,
+    hints: &ClipLayoutHints,
+    face_focus: Option<NormalizedPoint>,
+) -> LayoutDecision {
+    let mut decision = LayoutDecision {
+        layout_is_stacked: true,
+        face_only: false,
+        fullscreen_fill: false,
+        fullscreen_track: None,
+        fullscreen_center_override: None,
+    };
+    let face_only_area_threshold = 0.40;
+    let face_center = |rect: crate::clip_layout::NormalizedRect| NormalizedPoint {
+        x: (rect.x + rect.w / 2.0).clamp(0.0, 1.0),
+        y: (rect.y + rect.h / 2.0).clamp(0.0, 1.0),
+    };
+    let fallback_enabled = clip_layout::face_fallback_enabled();
+    let face_found = if fallback_enabled {
+        layout.face_crop.is_some() || hints.face_box.is_some() || hints.face_track.is_some()
+    } else {
+        hints.face_track.is_some()
+    };
+    let mut gameplay_found = gameplay_enabled() && hints.game_center.is_some();
+    let mut gameplay_guess: Option<bool> = None;
+    if !gameplay_found {
+        if let Some((guess, area, edge)) =
+            guess_gameplay_low_resource(hints, face_only_area_threshold)
+        {
+            gameplay_guess = Some(guess);
+            if guess {
+                gameplay_found = true;
+                if low_resource_enabled() {
+                    eprintln!(
+                        "clip layout: low-resource guess -> gameplay present (face area {:.3}, edge {:.3})",
+                        area, edge
+                    );
+                } else {
+                    eprintln!(
+                        "clip layout: gameplay not detected; face suggests gameplay (area {:.3}, edge {:.3})",
+                        area, edge
+                    );
+                }
+            } else if low_resource_enabled() {
+                eprintln!(
+                    "clip layout: low-resource guess -> no gameplay (face area {:.3}, edge {:.3})",
+                    area, edge
+                );
+            }
+        }
+    }
+
+    let face_rect = if fallback_enabled || hints.face_track.is_some() {
+        face_rect_from_hints(hints)
+    } else {
+        None
+    };
+    let face_inside_game = gameplay_found
+        && hints
+            .game_region
+            .and_then(|game| face_rect.map(|face| rect_contains_rect(game, face, 0.01)))
+            .unwrap_or(false);
+    if face_inside_game {
+        decision.layout_is_stacked = false;
+        decision.fullscreen_fill = true;
+        eprintln!(
+            "clip layout: face region inside gameplay region; using single-frame layout"
+        );
+        return decision;
+    }
+
+    if face_found && !gameplay_found {
+        if gameplay_guess == Some(false) {
+            eprintln!("clip layout: gameplay guess suggests no gameplay; using single-frame");
+        }
+        decision.layout_is_stacked = false;
+        if layout.face_crop.is_some() {
+            decision.face_only = true;
+            eprintln!("clip layout: no gameplay detected; using face-only layout");
+        } else {
+            decision.fullscreen_fill = true;
+            decision.fullscreen_track = hints.face_track.clone();
+            if decision.fullscreen_track.is_none() && fallback_enabled {
+                if let Some(face_box) = hints.face_box {
+                    let rect = if let Some(focus) = face_focus {
+                        clip_layout::recenter_rect_x(face_box, focus.x)
+                    } else {
+                        face_box
+                    };
+                    decision.fullscreen_track = Some(clip_layout::synthesize_face_track(rect));
+                }
+            }
+            decision.fullscreen_center_override = if fallback_enabled {
+                face_focus
+                    .or_else(|| hints.face_box.map(face_center))
+                    .or_else(|| {
+                        hints
+                            .face_track
+                            .as_ref()
+                            .and_then(|track| track.points.first().map(|p| face_center(p.rect)))
+                    })
+            } else {
+                face_focus.or_else(|| {
+                    hints
+                        .face_track
+                        .as_ref()
+                        .and_then(|track| track.points.first().map(|p| face_center(p.rect)))
+                })
+            };
+            eprintln!("clip layout: no gameplay detected; using single-frame face layout");
+        }
+        return decision;
+    }
+
+    if !face_found {
+        decision.layout_is_stacked = false;
+        decision.fullscreen_fill = true;
+        eprintln!("clip layout: no streamer cam detected; using full-frame gameplay fill");
+    }
+
+    decision
 }
 
 async fn run_ffmpeg_from_file(
@@ -3468,19 +2330,20 @@ async fn run_ffmpeg_from_file(
     }
     let start_offset = if start_secs > 0.0 { Some(start_secs) } else { None };
     let live_fast = timing.is_some() && live_fast_enabled();
+    let force_ts_input = is_ts_input(input_path);
     run_ffmpeg_internal(
-        input_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("non-utf8 input path"))?,
-        out_path,
-        out_w,
-        out_h,
-        Some(duration_secs),
-        start_offset,
-        true,
-        true,
-        None,
-        live_fast,
+        FfmpegRenderSpec::new(
+            input_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-utf8 input path"))?,
+            out_path,
+            out_w,
+            out_h,
+        )
+        .with_duration(Some(duration_secs))
+        .with_start_offset(start_offset)
+        .with_force_ts_input(force_ts_input)
+        .with_live_fast(live_fast),
     )
     .await
 }
@@ -3563,6 +2426,42 @@ fn build_ffmpeg_fill_filters(
     (vf_cpu, vf_gpu_sw, vf_gpu_hw)
 }
 
+fn append_filter_graph(base: &FilterGraph, extra_chain: &str) -> FilterGraph {
+    if extra_chain.trim().is_empty() {
+        return base.clone();
+    }
+    match base {
+        FilterGraph::Vf(chain) => FilterGraph::Vf(format!("{chain},{extra_chain}")),
+        FilterGraph::Complex { graph, output } => {
+            let next = format!("{output}_cap");
+            let graph = format!("{graph};[{output}]{extra_chain}[{next}]");
+            FilterGraph::Complex {
+                graph,
+                output: next,
+            }
+        }
+    }
+}
+
+fn prepend_hwdownload_filter(base: &FilterGraph) -> FilterGraph {
+    match base {
+        FilterGraph::Vf(chain) => {
+            FilterGraph::Vf(format!("hwdownload,format=yuv420p,{chain}"))
+        }
+        FilterGraph::Complex { graph, output } => {
+            if !graph.contains("[0:v]") {
+                return base.clone();
+            }
+            let replaced = graph.replacen("[0:v]", "[hw_src]", 1);
+            let graph = format!("[0:v]hwdownload,format=yuv420p[hw_src];{replaced}");
+            FilterGraph::Complex {
+                graph,
+                output: output.clone(),
+            }
+        }
+    }
+}
+
 fn tail_trunc(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -3613,12 +2512,12 @@ fn render_progress_line(current: f32, total: Option<f32>) -> String {
     if let Some(total) = total.filter(|v| v.is_finite() && *v > 0.0) {
         let pct = (current / total * 100.0).clamp(0.0, 100.0);
         return format!(
-            "ts progress: {pct:5.1}% ({}/{})",
+            "ffmpeg progress: {pct:5.1}% ({}/{})",
             format_progress_time(current),
             format_progress_time(total)
         );
     }
-    format!("ts progress: {}", format_progress_time(current))
+    format!("ffmpeg progress: {}", format_progress_time(current))
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -3626,144 +2525,6 @@ fn parse_bool(value: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
-    }
-}
-
-const LOW_RESOURCE_OVERRIDES: &[(&str, &str)] = &[
-    ("CLIP_LIVE_FAST", "1"),
-    ("CLIP_POSE", "0"),
-    ("CLIP_FACE_TRACK", "0"),
-    ("CLIP_DETECT", "0"),
-    ("CLIP_GAMEPLAY", "0"),
-    ("CLIP_REGION_DETECT", "0"),
-    ("CLIP_LLM_ENABLE", "0"),
-    ("CLIP_EMOTION_ENABLE", "0"),
-    ("CLIP_EMOTION_AUDIO", "0"),
-    ("CLIP_EMOTION_FACE", "0"),
-    ("CLIP_FACE_BUDGET_SECS", "6"),
-    ("CLIP_DETECT_BUDGET_SECS", "6"),
-    ("CLIP_DETECT_SAMPLES", "1"),
-    ("CLIP_DETECT_STEP", "2.5"),
-    ("CLIP_LIVE_LAYOUT_TTL_SECS", "300"),
-    ("WHISPER_GPU", "0"),
-    ("WHISPER_CLIP_GPU", "0"),
-    ("WHISPER_RT_TARGET", "0.5"),
-    ("WHISPER_MODEL_CANDIDATES", "ggml-tiny.en.bin"),
-    ("WHISPER_WORKER_STATUS_MS", "1000"),
-];
-
-fn low_resource_enabled() -> bool {
-    std::env::var("CLIP_LOW_RESOURCES")
-        .ok()
-        .and_then(|v| parse_bool(&v))
-        .unwrap_or(false)
-}
-
-struct LowResourceState {
-    enabled: bool,
-    baseline: HashMap<String, Option<String>>,
-}
-
-impl LowResourceState {
-    fn new() -> Self {
-        Self {
-            enabled: false,
-            baseline: HashMap::new(),
-        }
-    }
-
-    fn refresh(&mut self) {
-        let enabled = low_resource_enabled();
-        match (self.enabled, enabled) {
-            (false, true) => self.apply(),
-            (true, false) => self.restore(),
-            (true, true) => self.enforce(),
-            (false, false) => {}
-        }
-    }
-
-    fn apply(&mut self) {
-        for (key, value) in LOW_RESOURCE_OVERRIDES {
-            if !self.baseline.contains_key(*key) {
-                self.baseline.insert((*key).to_string(), std::env::var(*key).ok());
-            }
-            std::env::set_var(key, value);
-        }
-        self.enabled = true;
-        eprintln!("low resource mode enabled");
-    }
-
-    fn enforce(&self) {
-        for (key, value) in LOW_RESOURCE_OVERRIDES {
-            if std::env::var(key).ok().as_deref() != Some(*value) {
-                std::env::set_var(key, value);
-            }
-        }
-    }
-
-    fn restore(&mut self) {
-        let keys: Vec<String> = self.baseline.keys().cloned().collect();
-        for key in keys {
-            match self.baseline.get(&key).cloned().unwrap_or(None) {
-                Some(value) => std::env::set_var(&key, value),
-                None => std::env::remove_var(&key),
-            }
-        }
-        self.baseline.clear();
-        self.enabled = false;
-        eprintln!("low resource mode disabled");
-    }
-}
-
-fn low_resource_state() -> &'static Mutex<LowResourceState> {
-    static STATE: OnceLock<Mutex<LowResourceState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(LowResourceState::new()))
-}
-
-fn refresh_low_resource_state() {
-    if let Ok(mut state) = low_resource_state().lock() {
-        state.refresh();
-    }
-}
-
-fn ensure_live_detect_budgets() {
-    let mut face_secs = std::env::var("CLIP_FACE_BUDGET_SECS")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0);
-    let mut total_secs = std::env::var("CLIP_DETECT_BUDGET_SECS")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0);
-
-    let mut set_face = false;
-    let mut set_total = false;
-
-    if face_secs.is_none() {
-        face_secs = Some(20.0);
-        set_face = true;
-    }
-    if total_secs.is_none() {
-        let base = face_secs.unwrap_or(20.0);
-        total_secs = Some(base * 2.0);
-        set_total = true;
-    }
-
-    if set_face {
-        std::env::set_var("CLIP_FACE_BUDGET_SECS", format!("{:.0}", face_secs.unwrap()));
-    }
-    if set_total {
-        std::env::set_var("CLIP_DETECT_BUDGET_SECS", format!("{:.0}", total_secs.unwrap()));
-    }
-
-    if set_face || set_total {
-        let face = face_secs.unwrap_or(20.0);
-        let total = total_secs.unwrap_or(face * 2.0);
-        let gameplay = (total - face).max(0.0);
-        eprintln!(
-            "clip detect: live budgets face={:.0}s gameplay={:.0}s (total {:.0}s)",
-            face, gameplay, total
-        );
     }
 }
 
@@ -4029,54 +2790,10 @@ fn audio_norm_enabled() -> bool {
         .unwrap_or(true)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaptionPosition {
-    Margin,
-    Chest,
-}
-
-#[derive(Clone, Debug)]
-struct CaptionConfig {
-    position: CaptionPosition,
-    font: Option<String>,
-    font_size: f32,
-    color: String,
-    outline_color: String,
-    outline: u32,
-    min_word_secs: f32,
-    max_words: usize,
-    chest_ratio: f32,
-    margin_offset_px: f32,
-    debug: bool,
-}
-
-#[derive(Clone, Debug)]
-struct CaptionWord {
-    text: String,
-    start: f32,
-    end: f32,
-}
-
 #[derive(Clone, Debug)]
 struct ClipMetadata {
     title: String,
     description: String,
-}
-
-#[derive(Clone, Debug)]
-struct SubtitleSpec {
-    path: PathBuf,
-}
-
-#[derive(Debug)]
-struct TempSubtitle {
-    path: PathBuf,
-}
-
-impl Drop for TempSubtitle {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -4091,20 +2808,6 @@ struct LlmConfig {
     gpu_layers: Option<i32>,
     rename_files: bool,
     debug: bool,
-}
-
-fn captions_enabled() -> bool {
-    std::env::var("CLIP_CAPTIONS")
-        .ok()
-        .and_then(|v| parse_bool(&v))
-        .unwrap_or(false)
-}
-
-fn closed_captions_enabled() -> bool {
-    std::env::var("CLIP_CLOSED_CAPTIONS")
-        .ok()
-        .and_then(|v| parse_bool(&v))
-        .unwrap_or(false)
 }
 
 static LLM_BACKOFF_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
@@ -4135,119 +2838,6 @@ fn llm_enabled() -> bool {
         .ok()
         .and_then(|v| parse_bool(&v))
         .unwrap_or(false)
-}
-
-fn parse_caption_position(value: &str) -> Option<CaptionPosition> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "margin" | "seam" | "gap" | "between" => Some(CaptionPosition::Margin),
-        "chest" | "torso" => Some(CaptionPosition::Chest),
-        _ => None,
-    }
-}
-
-fn resolve_caption_pixels(out_h: u32, value: Option<f32>, default_ratio: f32) -> f32 {
-    let raw = value.unwrap_or(default_ratio);
-    if raw.is_finite() && raw > 0.0 {
-        if raw <= 2.0 {
-            (out_h as f32 * raw).max(1.0)
-        } else {
-            raw
-        }
-    } else {
-        out_h as f32 * default_ratio
-    }
-}
-
-fn default_caption_font() -> Option<String> {
-    #[cfg(windows)]
-    {
-        let candidates = [
-            r"C:\Windows\Fonts\arial.ttf",
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\seguisb.ttf",
-            r"C:\Windows\Fonts\calibri.ttf",
-        ];
-        for path in candidates {
-            if Path::new(path).exists() {
-                return Some(path.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn read_caption_config(out_h: u32) -> Option<CaptionConfig> {
-    if !captions_enabled() {
-        return None;
-    }
-    let position = std::env::var("CLIP_CAPTIONS_POSITION")
-        .ok()
-        .and_then(|v| parse_caption_position(&v))
-        .unwrap_or(CaptionPosition::Margin);
-    let mut font = std::env::var("CLIP_CAPTIONS_FONT")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    if font.is_none() {
-        font = default_caption_font();
-    }
-    let font_size = std::env::var("CLIP_CAPTIONS_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok());
-    let font_size = resolve_caption_pixels(out_h, font_size, 0.045).clamp(12.0, out_h as f32);
-    let color = std::env::var("CLIP_CAPTIONS_COLOR")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "white".to_string());
-    let outline_color = std::env::var("CLIP_CAPTIONS_OUTLINE_COLOR")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "black".to_string());
-    let outline = std::env::var("CLIP_CAPTIONS_OUTLINE")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(3.0)
-        .max(0.0)
-        .round() as u32;
-    let min_word_secs = std::env::var("CLIP_CAPTIONS_MIN_WORD_SECS")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(0.12)
-        .clamp(0.04, 1.0);
-    let max_words = std::env::var("CLIP_CAPTIONS_MAX_WORDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(300);
-    let chest_ratio = std::env::var("CLIP_CAPTIONS_CHEST_RATIO")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(0.65)
-        .clamp(0.2, 0.9);
-    let margin_offset = std::env::var("CLIP_CAPTIONS_MARGIN_OFFSET")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok());
-    let margin_offset_px = resolve_caption_pixels(out_h, margin_offset, 0.0);
-    let debug = std::env::var("CLIP_CAPTIONS_DEBUG")
-        .ok()
-        .and_then(|v| parse_bool(&v))
-        .unwrap_or(false);
-
-    Some(CaptionConfig {
-        position,
-        font,
-        font_size,
-        color,
-        outline_color,
-        outline,
-        min_word_secs,
-        max_words,
-        chest_ratio,
-        margin_offset_px,
-        debug,
-    })
 }
 
 fn read_llm_config() -> Option<LlmConfig> {
@@ -4319,102 +2909,6 @@ fn read_llm_config() -> Option<LlmConfig> {
         rename_files,
         debug,
     })
-}
-
-fn build_caption_words(
-    mut words: Vec<WordTiming>,
-    cfg: &CaptionConfig,
-    duration_secs: Option<f32>,
-) -> Vec<CaptionWord> {
-    words.sort_by(|a, b| a.t0.partial_cmp(&b.t0).unwrap_or(std::cmp::Ordering::Equal));
-    let mut out = Vec::new();
-    let min_word = cfg.min_word_secs.max(0.04);
-    for (idx, word) in words.iter().enumerate() {
-        if out.len() >= cfg.max_words {
-            break;
-        }
-        if word.norm.is_empty() {
-            continue;
-        }
-        let text = word.text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        let start = word.t0.max(0.0);
-        let mut end = word.t1.max(start + min_word);
-        if let Some(next) = words.get(idx + 1) {
-            if next.t0.is_finite() && next.t0 > start {
-                let cap = (next.t0 - 0.01).max(start + min_word);
-                end = end.min(cap);
-            }
-        }
-        if let Some(limit) = duration_secs {
-            if start >= limit {
-                continue;
-            }
-            end = end.min(limit);
-        }
-        if end <= start {
-            continue;
-        }
-        out.push(CaptionWord {
-            text: text.to_string(),
-            start,
-            end,
-        });
-    }
-    out
-}
-
-fn trim_transcript(text: &str, max_chars: usize) -> String {
-    let trimmed = text.trim();
-    if trimmed.len() <= max_chars {
-        return trimmed.to_string();
-    }
-    truncate_str(trimmed, max_chars)
-}
-
-fn normalize_title_whitespace(title: &str) -> String {
-    title
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string()
-}
-
-fn sanitize_title_for_filename(title: &str) -> String {
-    let mut out = String::new();
-    let mut last_sep = false;
-    for ch in title.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_sep = false;
-        } else if ch == '-' {
-            out.push('-');
-            last_sep = false;
-        } else if !last_sep {
-            out.push('_');
-            last_sep = true;
-        }
-    }
-    let trimmed = out.trim_matches('_');
-    if trimmed.is_empty() {
-        String::new()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn fallback_title_from_transcript(text: &str, max_chars: usize) -> String {
-    let mut title = normalize_title_whitespace(text);
-    if title.is_empty() {
-        return title;
-    }
-    if title.len() > max_chars {
-        title = truncate_str(&title, max_chars);
-    }
-    title
 }
 
 async fn generate_clip_metadata(
@@ -4532,261 +3026,6 @@ fn parse_llm_json(content: &str, cfg: &LlmConfig) -> Option<ClipMetadata> {
     Some(ClipMetadata { title, description })
 }
 
-fn escape_drawtext_value(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            ':' => out.push_str("\\:"),
-            ',' => out.push_str("\\,"),
-            '%' => out.push_str("\\%"),
-            '\n' | '\r' => out.push(' '),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn drawtext_font_arg(font: &str) -> String {
-    let value = escape_drawtext_value(font);
-    if Path::new(font).exists() || font.contains('/') || font.contains('\\') {
-        format!("fontfile='{}'", value)
-    } else {
-        format!("font='{}'", value)
-    }
-}
-
-fn caption_y_for_layout(
-    cfg: &CaptionConfig,
-    layout_is_stacked: bool,
-    stacked_dims: Option<StackedLayoutDims>,
-    out_h: u32,
-) -> f32 {
-    let frame_h = if layout_is_stacked {
-        stacked_dims.map(|d| d.face_h).unwrap_or(out_h) as f32
-    } else {
-        out_h as f32
-    };
-    let mut y = match cfg.position {
-        CaptionPosition::Margin if layout_is_stacked => {
-            frame_h - cfg.font_size * 0.6 + cfg.margin_offset_px
-        }
-        _ => frame_h * cfg.chest_ratio - cfg.font_size * 0.5,
-    };
-    let max_y = (out_h as f32 - cfg.font_size).max(0.0);
-    if !y.is_finite() {
-        y = 0.0;
-    }
-    y.clamp(0.0, max_y)
-}
-
-fn build_caption_drawtext_chain(words: &[CaptionWord], cfg: &CaptionConfig, y: f32) -> String {
-    if words.is_empty() {
-        return String::new();
-    }
-    let mut filters = Vec::with_capacity(words.len());
-    let font_arg = cfg.font.as_ref().map(|f| drawtext_font_arg(f));
-    let fontsize = cfg.font_size.round().max(8.0) as u32;
-    for word in words {
-        let text = escape_drawtext_value(&word.text);
-        let mut parts = Vec::new();
-        parts.push(format!("drawtext=text='{}'", text));
-        if let Some(arg) = &font_arg {
-            parts.push(arg.clone());
-        }
-        parts.push(format!("fontcolor={}", cfg.color));
-        parts.push(format!("fontsize={}", fontsize));
-        if cfg.outline > 0 {
-            parts.push(format!("borderw={}", cfg.outline));
-            parts.push(format!("bordercolor={}", cfg.outline_color));
-        }
-        parts.push("x=(w-text_w)/2".to_string());
-        parts.push(format!("y={:.1}", y));
-        parts.push(format!(
-            "enable='between(t,{:.3},{:.3})'",
-            word.start, word.end
-        ));
-        filters.push(parts.join(":"));
-    }
-    filters.join(",")
-}
-
-fn append_filter_graph(base: &FilterGraph, extra_chain: &str) -> FilterGraph {
-    if extra_chain.trim().is_empty() {
-        return base.clone();
-    }
-    match base {
-        FilterGraph::Vf(chain) => FilterGraph::Vf(format!("{chain},{extra_chain}")),
-        FilterGraph::Complex { graph, output } => {
-            let next = format!("{output}_cap");
-            let graph = format!("{graph};[{output}]{extra_chain}[{next}]");
-            FilterGraph::Complex {
-                graph,
-                output: next,
-            }
-        }
-    }
-}
-
-fn prepend_hwdownload_filter(base: &FilterGraph) -> FilterGraph {
-    match base {
-        FilterGraph::Vf(chain) => {
-            FilterGraph::Vf(format!("hwdownload,format=yuv420p,{chain}"))
-        }
-        FilterGraph::Complex { graph, output } => {
-            if !graph.contains("[0:v]") {
-                return base.clone();
-            }
-            let replaced = graph.replacen("[0:v]", "[hw_src]", 1);
-            let graph = format!("[0:v]hwdownload,format=yuv420p[hw_src];{replaced}");
-            FilterGraph::Complex {
-                graph,
-                output: output.clone(),
-            }
-        }
-    }
-}
-
-fn format_srt_time(secs: f32) -> String {
-    let secs = secs.max(0.0);
-    let total_ms = (secs * 1000.0).round() as u64;
-    let ms = total_ms % 1000;
-    let total_secs = total_ms / 1000;
-    let s = total_secs % 60;
-    let total_mins = total_secs / 60;
-    let m = total_mins % 60;
-    let h = total_mins / 60;
-    format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
-}
-
-fn wrap_caption_text(text: &str, max_len: usize) -> String {
-    let text = text.trim();
-    if text.len() <= max_len {
-        return text.to_string();
-    }
-    let split_at = text
-        .char_indices()
-        .take_while(|(_, ch)| !ch.is_control())
-        .filter_map(|(idx, ch)| if ch == ' ' { Some(idx) } else { None })
-        .filter(|idx| *idx <= max_len)
-        .last();
-    if let Some(idx) = split_at {
-        let left = text[..idx].trim();
-        let right = text[idx + 1..].trim();
-        if !left.is_empty() && !right.is_empty() {
-            return format!("{left}\n{right}");
-        }
-    }
-    text.to_string()
-}
-
-fn build_srt_from_payload(
-    payload: &TranscriptPayload,
-    duration_secs: Option<f32>,
-) -> Option<String> {
-    let duration = duration_secs
-        .filter(|v| v.is_finite() && *v > 0.0)?;
-    let mut words = payload.words.clone();
-    if words.is_empty() {
-        let text = normalize_title_whitespace(&payload.text);
-        if text.is_empty() {
-            return None;
-        }
-        let line = wrap_caption_text(&text, 42);
-        return Some(format!(
-            "1\n{} --> {}\n{}\n",
-            format_srt_time(0.0),
-            format_srt_time(duration),
-            line
-        ));
-    }
-
-    words.sort_by(|a, b| {
-        a.t0.partial_cmp(&b.t0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let max_gap = 0.8;
-    let max_span = 4.0;
-    let max_words = 8usize;
-    let min_word = 0.12;
-
-    let mut cues: Vec<(f32, f32, String)> = Vec::new();
-    let mut current: Vec<String> = Vec::new();
-    let mut cue_start = 0.0;
-    let mut last_end = 0.0;
-
-    for word in words {
-        let text = word.text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        let start = word.t0.max(0.0);
-        let mut end = word.t1.max(start + min_word);
-        if end > duration {
-            end = duration;
-        }
-        if end <= start {
-            continue;
-        }
-        let gap = if current.is_empty() { 0.0 } else { start - last_end };
-        let span = if current.is_empty() { 0.0 } else { end - cue_start };
-        let should_break =
-            !current.is_empty() && (gap > max_gap || current.len() >= max_words || span > max_span);
-        if should_break {
-            let line = current.join(" ").trim().to_string();
-            if !line.is_empty() {
-                let cue_end = last_end.max(cue_start + min_word);
-                cues.push((cue_start, cue_end.min(duration), line));
-            }
-            current.clear();
-        }
-        if current.is_empty() {
-            cue_start = start;
-        }
-        current.push(text.to_string());
-        last_end = end;
-    }
-
-    if !current.is_empty() {
-        let line = current.join(" ").trim().to_string();
-        if !line.is_empty() {
-            let cue_end = last_end.max(cue_start + min_word);
-            cues.push((cue_start, cue_end.min(duration), line));
-        }
-    }
-
-    if cues.is_empty() {
-        return None;
-    }
-
-    let mut out = String::new();
-    for (idx, (start, end, text)) in cues.iter().enumerate() {
-        let line = wrap_caption_text(text, 42);
-        out.push_str(&format!(
-            "{}\n{} --> {}\n{}\n\n",
-            idx + 1,
-            format_srt_time(*start),
-            format_srt_time(*end),
-            line
-        ));
-    }
-    Some(out)
-}
-
-fn write_temp_srt(contents: &str) -> Result<PathBuf> {
-    let stamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_millis();
-    let pid = std::process::id();
-    let filename = format!("autoclip_cc_{pid}_{stamp}.srt");
-    let path = std::env::temp_dir().join(filename);
-    fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
-}
-
 fn rename_output_with_title(out_path: &Path, title: &str) -> Result<Option<PathBuf>> {
     let slug = sanitize_title_for_filename(title);
     if slug.is_empty() {
@@ -4813,6 +3052,9 @@ fn rename_output_with_title(out_path: &Path, title: &str) -> Result<Option<PathB
 }
 
 fn ffmpeg_encode_timeout() -> Option<Duration> {
+    if ffmpeg_no_limits_enabled() {
+        return None;
+    }
     std::env::var("FFMPEG_ENCODE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
@@ -4841,19 +3083,6 @@ fn ffmpeg_hwaccel_device_index() -> Option<u32> {
         .and_then(|v| parse_device_index(&v))
 }
 
-fn subtitle_codec_for_output(out_path: &Path) -> &'static str {
-    let ext = out_path
-        .extension()
-        .and_then(|v| v.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "mp4" | "m4v" => "mov_text",
-        "mkv" => "srt",
-        _ => "mov_text",
-    }
-}
-
 async fn run_ffmpeg_encode(
     input: &str,
     out_path: &Path,
@@ -4861,6 +3090,7 @@ async fn run_ffmpeg_encode(
     encoder: &str,
     use_hw_encode: bool,
     use_nvenc: bool,
+    fast_preset: bool,
     allow_hwaccel: bool,
     use_hw_frames: bool,
     regen_pts: bool,
@@ -4933,12 +3163,14 @@ async fn run_ffmpeg_encode(
     }
 
     if use_nvenc {
-        cmd.arg("-preset").arg("p4");
+        let preset = if fast_preset { "p1" } else { "p4" };
+        cmd.arg("-preset").arg(preset);
         cmd.arg("-tune").arg("hq");
         cmd.arg("-b:v").arg("0");
         cmd.arg("-cq").arg("23");
     } else {
-        cmd.arg("-preset").arg("veryfast");
+        let preset = if fast_preset { "ultrafast" } else { "veryfast" };
+        cmd.arg("-preset").arg(preset);
         cmd.arg("-crf").arg("23");
     }
 
@@ -4988,13 +3220,33 @@ async fn run_ffmpeg_encode(
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing ffmpeg stderr"))?;
 
+    const MAX_FFMPEG_STDERR_BYTES: usize = 1_000_000;
+    const MAX_FFMPEG_STDOUT_BYTES: usize = 256_000;
+
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
-            .await
-            .context("reading ffmpeg stderr")?;
+        let mut tmp = [0u8; 4096];
+        let mut truncated = false;
+        loop {
+            let n = reader.read(&mut tmp).await.context("reading ffmpeg stderr")?;
+            if n == 0 {
+                break;
+            }
+            if buf.len() < MAX_FFMPEG_STDERR_BYTES {
+                let remaining = MAX_FFMPEG_STDERR_BYTES - buf.len();
+                let take = remaining.min(n);
+                buf.extend_from_slice(&tmp[..take]);
+                if take < n {
+                    truncated = true;
+                }
+            } else {
+                truncated = true;
+            }
+        }
+        if truncated {
+            buf.extend_from_slice(b"\n[ffmpeg stderr truncated]\n");
+        }
         Ok::<Vec<u8>, anyhow::Error>(buf)
     });
 
@@ -5008,18 +3260,44 @@ async fn run_ffmpeg_encode(
     let mut last_print = Instant::now();
     let mut last_pct = -1.0f32;
     let mut last_reported_time: Option<f32> = None;
+    let mut stall_timed_out = false;
     let mut printed = false;
     let timeout = ffmpeg_encode_timeout();
     let mut timed_out = false;
+    let stall_timeout = if progress.is_some() {
+        ffmpeg_progress_stall_timeout()
+    } else {
+        None
+    };
 
     let read_stdout = async {
-        while let Some(line) = stdout_lines
-            .next_line()
-            .await
-            .context("reading ffmpeg progress")?
-        {
-            stdout_buf.extend_from_slice(line.as_bytes());
-            stdout_buf.push(b'\n');
+        loop {
+            let next_line = if let Some(limit) = stall_timeout {
+                match tokio::time::timeout(limit, stdout_lines.next_line()).await {
+                    Ok(res) => res.context("reading ffmpeg progress")?,
+                    Err(_) => {
+                        stall_timed_out = true;
+                        break;
+                    }
+                }
+            } else {
+                stdout_lines
+                    .next_line()
+                    .await
+                    .context("reading ffmpeg progress")?
+            };
+            let Some(line) = next_line else { break };
+            if stdout_buf.len() < MAX_FFMPEG_STDOUT_BYTES {
+                let remaining = MAX_FFMPEG_STDOUT_BYTES - stdout_buf.len();
+                let line_bytes = line.as_bytes();
+                let take = remaining.min(line_bytes.len());
+                stdout_buf.extend_from_slice(&line_bytes[..take]);
+                if take < line_bytes.len() {
+                    stdout_buf.extend_from_slice(b"\n[ffmpeg stdout truncated]\n");
+                } else {
+                    stdout_buf.push(b'\n');
+                }
+            }
 
             if progress.is_some() {
                 if let Some(value) = line.strip_prefix("out_time=") {
@@ -5081,6 +3359,18 @@ async fn run_ffmpeg_encode(
         read_stdout.await?;
     }
 
+    if stall_timed_out {
+        if let Some(limit) = stall_timeout {
+            eprintln!(
+                "ffmpeg: progress stalled for {:.1}s; terminating",
+                limit.as_secs_f32()
+            );
+        } else {
+            eprintln!("ffmpeg: progress stalled; terminating");
+        }
+        let _ = child.kill().await;
+    }
+
     if timed_out {
         if let Some(limit) = timeout {
             eprintln!(
@@ -5105,6 +3395,17 @@ async fn run_ffmpeg_encode(
         };
         stderr_buf.extend_from_slice(msg.as_bytes());
     }
+    if stall_timed_out {
+        let msg = if let Some(limit) = stall_timeout {
+            format!(
+                "\nffmpeg progress stalled for {:.1}s; terminating\n",
+                limit.as_secs_f32()
+            )
+        } else {
+            "\nffmpeg progress stalled; terminating\n".to_string()
+        };
+        stderr_buf.extend_from_slice(msg.as_bytes());
+    }
     if printed {
         eprintln!();
     }
@@ -5115,19 +3416,30 @@ async fn run_ffmpeg_encode(
     })
 }
 
-async fn run_ffmpeg_internal(
-    input: &str,
-    out_path: &Path,
-    out_w: u32,
-    out_h: u32,
-    duration_secs: Option<f32>,
-    start_offset_secs: Option<f32>,
-    regen_pts: bool,
-    force_ts_input: bool,
-    progress: Option<ProgressSpec>,
-    live_fast: bool,
-) -> Result<()> {
+async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
     let _span = profile_span("ffmpeg: encode");
+    let input = spec.input.as_str();
+    let out_path = &spec.out_path;
+    let out_w = spec.out_w;
+    let out_h = spec.out_h;
+    let duration_secs = spec.duration_secs;
+    let start_offset_secs = spec.start_offset_secs;
+    let regen_pts = spec.regen_pts;
+    let force_ts_input = spec.force_ts_input;
+    let mut progress = spec.progress;
+    let live_fast = spec.live_fast;
+    let fast_preset = spec.fast_preset;
+    if progress.is_none() && ffmpeg_progress_enabled() {
+        progress = Some(ProgressSpec {
+            total_secs: duration_secs,
+        });
+    }
+    if let Some(mut current) = progress {
+        if current.total_secs.is_none() {
+            current.total_secs = duration_secs;
+        }
+        progress = Some(current);
+    }
     let (mut video_encoder, mut is_nvenc, mut is_hw, _encoder_forced) = ffmpeg_video_encoder();
     if is_hw || is_nvenc {
         let min_free = ffmpeg_min_free_vram_mb();
@@ -5163,30 +3475,36 @@ async fn run_ffmpeg_internal(
     let mut fullscreen_track = None;
     let mut fullscreen_center_override = None;
     let face_focus = layout_hints.face_focus;
-    let face_only_area_threshold = 0.40;
-    let face_center = |rect: crate::clip_layout::NormalizedRect| NormalizedPoint {
-        x: (rect.x + rect.w / 2.0).clamp(0.0, 1.0),
-        y: (rect.y + rect.h / 2.0).clamp(0.0, 1.0),
-    };
     if layout_is_stacked {
         let mut detect_cfg = read_clip_detect_config();
-        let need_face = layout.face_crop.is_none() && layout_hints.face_box.is_none();
         let user_game_center = layout_hints.game_center;
         let user_game_region = layout_hints.game_region;
+        let face_track_override = std::env::var("CLIP_FACE_TRACK")
+            .ok()
+            .and_then(|v| parse_bool(&v));
         if live_fast && user_game_center.is_none() {
             layout_hints.game_center = Some(NormalizedPoint { x: 0.5, y: 0.5 });
         }
-        let need_gameplay = user_game_center.is_none() && !live_fast;
         if live_fast {
             detect_cfg.sample_count = detect_cfg.sample_count.min(2);
-            detect_cfg.scan_full_clip = false;
-            detect_cfg.track_face = false;
-            detect_cfg.face_track_step_secs = None;
+            if face_track_override != Some(true) {
+                detect_cfg.scan_full_clip = false;
+                detect_cfg.track_face = false;
+                detect_cfg.face_track_step_secs = None;
+                eprintln!(
+                    "live render: face tracking disabled (set CLIP_FACE_TRACK=1 to enable)"
+                );
+            }
             detect_cfg.face_budget_override =
                 Some(min_duration(detect_cfg.face_budget_override, Duration::from_secs(6)));
             detect_cfg.analysis_budget =
                 Some(min_duration(detect_cfg.analysis_budget, Duration::from_secs(8)));
         }
+        let mut need_face = layout.face_crop.is_none() && layout_hints.face_box.is_none();
+        if detect_cfg.track_face && layout_hints.face_track.is_none() {
+            need_face = true;
+        }
+        let need_gameplay = user_game_center.is_none() && !live_fast;
         if detect_cfg.enabled && (need_face || need_gameplay) {
             match detect_layout_hints(input, &detect_cfg).await {
                 Ok(detected) => {
@@ -5227,91 +3545,12 @@ async fn run_ffmpeg_internal(
                 }
             }
         }
-        let face_found = layout.face_crop.is_some()
-            || layout_hints.face_box.is_some()
-            || layout_hints.face_track.is_some();
-        let mut gameplay_found = gameplay_enabled() && layout_hints.game_center.is_some();
-        let mut low_resource_guess: Option<bool> = None;
-        let face_area = face_area_from_hints(&layout_hints).unwrap_or(0.0);
-        let face_large = face_area >= face_only_area_threshold;
-        if low_resource_enabled() && !gameplay_found {
-            if let Some((guess, area, edge)) =
-                guess_gameplay_low_resource(&layout_hints, face_only_area_threshold)
-            {
-                gameplay_found = guess;
-                low_resource_guess = Some(guess);
-                if guess {
-                    eprintln!(
-                        "clip layout: low-resource guess -> gameplay present (face area {:.3}, edge {:.3})",
-                        area, edge
-                    );
-                } else {
-                    eprintln!(
-                        "clip layout: low-resource guess -> no gameplay (face area {:.3}, edge {:.3})",
-                        area, edge
-                    );
-                }
-            }
-        }
-        if face_found && !gameplay_found && !face_large {
-            if low_resource_enabled() && low_resource_guess == Some(false) {
-                eprintln!(
-                    "clip layout: low-resource guess suggests no gameplay; skipping stacked fallback"
-                );
-            } else {
-                gameplay_found = true;
-                eprintln!(
-                    "clip layout: gameplay not detected; face area {:.3} below {:.2}; assuming gameplay present for stacked layout",
-                    face_area,
-                    face_only_area_threshold
-                );
-            }
-        }
-        let face_rect = face_rect_from_hints(&layout_hints);
-        let face_inside_game = gameplay_found
-            && layout_hints
-                .game_region
-                .and_then(|game| face_rect.map(|face| rect_contains_rect(game, face, 0.01)))
-                .unwrap_or(false);
-        if face_inside_game {
-            layout_is_stacked = false;
-            fullscreen_fill = true;
-            eprintln!(
-                "clip layout: face region inside gameplay region; using single-frame layout"
-            );
-        } else if face_found && !gameplay_found {
-            layout_is_stacked = false;
-            if layout.face_crop.is_some() {
-                face_only = true;
-                eprintln!("clip layout: no gameplay detected; using face-only layout");
-            } else {
-                fullscreen_fill = true;
-                fullscreen_track = layout_hints.face_track.clone();
-                if fullscreen_track.is_none() {
-                    if let Some(face_box) = layout_hints.face_box {
-                        let rect = if let Some(focus) = face_focus {
-                            clip_layout::recenter_rect_x(face_box, focus.x)
-                        } else {
-                            face_box
-                        };
-                        fullscreen_track = Some(clip_layout::synthesize_face_track(rect));
-                    }
-                }
-                fullscreen_center_override = face_focus
-                    .or_else(|| layout_hints.face_box.map(face_center))
-                    .or_else(|| {
-                        layout_hints
-                            .face_track
-                            .as_ref()
-                            .and_then(|track| track.points.first().map(|p| face_center(p.rect)))
-                    });
-                eprintln!("clip layout: no gameplay detected; using single-frame face layout");
-            }
-        } else if !face_found {
-            layout_is_stacked = false;
-            fullscreen_fill = true;
-            eprintln!("clip layout: no streamer cam detected; using full-frame gameplay fill");
-        }
+        let decision = decide_stacked_layout(&layout, &layout_hints, face_focus);
+        layout_is_stacked = decision.layout_is_stacked;
+        face_only = decision.face_only;
+        fullscreen_fill = decision.fullscreen_fill;
+        fullscreen_track = decision.fullscreen_track;
+        fullscreen_center_override = decision.fullscreen_center_override;
     }
     let stacked_dims = if layout_is_stacked {
         Some(resolve_stacked_layout_dims(out_w, out_h, &layout, &layout_hints))
@@ -5381,7 +3620,7 @@ async fn run_ffmpeg_internal(
                 match write_temp_srt(&srt) {
                     Ok(path) => {
                         subtitle_spec = Some(SubtitleSpec { path: path.clone() });
-                        _subtitle_temp = Some(TempSubtitle { path });
+                        _subtitle_temp = Some(TempSubtitle::new(path));
                     }
                     Err(err) => {
                         eprintln!("closed captions: failed to write srt: {err:#}");
@@ -5539,6 +3778,7 @@ async fn run_ffmpeg_internal(
         &video_encoder,
         is_hw,
         is_nvenc,
+        fast_preset,
         allow_hwaccel,
         use_hw_frames,
         regen_pts,
@@ -5577,6 +3817,7 @@ async fn run_ffmpeg_internal(
                     &video_encoder,
                     true,
                     true,
+                    fast_preset,
                     false,
                     false,
                     regen_pts,
@@ -5598,6 +3839,7 @@ async fn run_ffmpeg_internal(
                     "libx264",
                     false,
                     false,
+                    fast_preset,
                     allow_hwaccel,
                     false,
                     regen_pts,
@@ -5663,6 +3905,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FACE_CROP", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_CONTEXT", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_ZOOM", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_CENTER", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_FACE_BOX", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_REGION", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_ANCHOR", mode: EnvValueMode::Required },
@@ -5679,6 +3922,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FACE_PICK_RAW", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_FACE_SCORE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_TRACK_STEP", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_FACE_REFRAME_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_TILE_MIN_SCORE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_TILE_MAX_DEPTH", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_FACE_FRAME_HEAD_TOP", mode: EnvValueMode::Required },
@@ -5723,7 +3967,13 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FACE_ID_DEBUG", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_FACE_DEBUG", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_FACE_TRACK", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FACE_LOCK_CENTER", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FACE_FALLBACK", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FFMPEG_PROGRESS", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FFMPEG_NO_LIMITS", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_FFMPEG_PROGRESS_STALL_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_AUDIO_NORM", mode: EnvValueMode::Optional },
+    EnvSpec { env: "GPU_VRAM_RESERVE_MB", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_CAPTIONS", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_CAPTIONS_POSITION", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_CAPTIONS_FONT", mode: EnvValueMode::Required },
@@ -5757,6 +4007,9 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_DETECT_STEP", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_DETECT_FULL", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_DETECT_BUDGET_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_REPROCESS_CHUNK_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_REPROCESS_SUBCHUNK_SECS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_REPROCESS_FAST", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_TS_REALTIME", mode: EnvValueMode::Flag },
     EnvSpec { env: "CLIP_GAMEPLAY", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_REGION_DETECT", mode: EnvValueMode::Optional },
@@ -5827,7 +4080,11 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "WHISPER_GPU", mode: EnvValueMode::Optional },
     EnvSpec { env: "WHISPER_CLIP_GPU", mode: EnvValueMode::Optional },
     EnvSpec { env: "WHISPER_MIN_FREE_VRAM_MB", mode: EnvValueMode::Required },
-    EnvSpec { env: "WHISPER_CUBLAS", mode: EnvValueMode::Optional },
+    EnvSpec { env: "WHISPER_CLIP_MIN_FREE_VRAM_MB", mode: EnvValueMode::Required },
+    EnvSpec { env: "WHISPER_CLIP_VRAM_FACTOR", mode: EnvValueMode::Required },
+    EnvSpec { env: "WHISPER_CLIP_VRAM_OVERHEAD_MB", mode: EnvValueMode::Required },
+    EnvSpec { env: "WHISPER_GPU_DEVICE", mode: EnvValueMode::Optional },
+    EnvSpec { env: "WHISPER_CLIP_GPU_DEVICE", mode: EnvValueMode::Optional },
     EnvSpec { env: "WHISPER_LOG_LEVEL", mode: EnvValueMode::Required },
     EnvSpec { env: "WHISPER_ISOLATE", mode: EnvValueMode::Optional },
     EnvSpec { env: "WHISPER_WORKER_MODE", mode: EnvValueMode::Optional },
@@ -6024,80 +4281,6 @@ fn apply_env_overrides(overrides: &[(String, String)]) {
     }
 }
 
-fn split_wake_phrases(raw: &str) -> Vec<String> {
-    raw.split(|c| matches!(c, ',' | '|' | ';' | '\n' | '\r'))
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn split_stream_list(raw: &str) -> Vec<String> {
-    raw.split(|c| matches!(c, ',' | '|' | ';' | '\n' | '\r'))
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn normalize_stream_url(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(normalize_page_url(trimmed))
-}
-
-fn parse_streams_file(contents: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
-            continue;
-        }
-        let Some(url) = normalize_stream_url(trimmed) else { continue };
-        if seen.insert(url.clone()) {
-            out.push(url);
-        }
-    }
-    out
-}
-
-fn default_streams_file_path() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("streams.txt")
-}
-
-fn read_streams_file(path: &Path) -> Result<Vec<String>> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("reading streams file {}", path.display()))?;
-    Ok(parse_streams_file(&contents))
-}
-
-fn sync_streams_file(path: &Path, streams: &[String]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating streams dir {}", parent.display()))?;
-    }
-    let mut lines = Vec::new();
-    lines.push("# AutoClip streams list (hot-reload).".to_string());
-    lines.push("# One stream URL per line.".to_string());
-    lines.push(String::new());
-    lines.extend(streams.iter().cloned());
-    let next = lines.join("\n");
-    let write = match fs::read_to_string(path) {
-        Ok(current) => current != next,
-        Err(_) => true,
-    };
-    if write {
-        fs::write(path, next)
-            .with_context(|| format!("writing streams file {}", path.display()))?;
-    }
-    Ok(())
-}
-
 fn read_streams_poll_secs() -> Duration {
     std::env::var("CLIP_STREAMS_POLL_SECS")
         .ok()
@@ -6135,6 +4318,229 @@ fn read_wake_no_words_secs() -> Option<Duration> {
         None => 300.0,
     };
     Some(Duration::from_secs_f32(secs))
+}
+
+fn read_reprocess_chunk_secs() -> Option<f32> {
+    let raw = std::env::var("CLIP_REPROCESS_CHUNK_SECS").ok();
+    let parsed = raw.as_deref().and_then(|v| v.trim().parse::<f32>().ok());
+    let secs = match parsed {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(_) => return None,
+        None => 60.0,
+    };
+    Some(secs.clamp(5.0, 3600.0))
+}
+
+fn read_reprocess_subchunk_secs() -> Option<f32> {
+    let raw = std::env::var("CLIP_REPROCESS_SUBCHUNK_SECS").ok();
+    let parsed = raw.as_deref().and_then(|v| v.trim().parse::<f32>().ok());
+    let secs = match parsed {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(_) => return None,
+        None => return None,
+    };
+    Some(secs.clamp(1.0, 3600.0))
+}
+
+fn reprocess_fast_enabled() -> bool {
+    std::env::var("CLIP_REPROCESS_FAST")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+fn ffmpeg_progress_enabled() -> bool {
+    std::env::var("CLIP_FFMPEG_PROGRESS")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+fn ffmpeg_progress_stall_timeout() -> Option<Duration> {
+    if ffmpeg_no_limits_enabled() {
+        return None;
+    }
+    std::env::var("CLIP_FFMPEG_PROGRESS_STALL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(Duration::from_secs_f32)
+}
+
+fn ffmpeg_no_limits_enabled() -> bool {
+    std::env::var("CLIP_FFMPEG_NO_LIMITS")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReprocessResumeState {
+    input_path: String,
+    input_size: u64,
+    input_mtime_ms: u64,
+    chunk_secs: f32,
+    subchunk_secs: Option<f32>,
+    total_secs: Option<f32>,
+    next_start_secs: f32,
+    next_index: u32,
+    segment_index: Option<u32>,
+    segment_start_secs: Option<f32>,
+    segment_duration_secs: Option<f32>,
+    segment_output_path: Option<String>,
+    next_part_index: Option<u32>,
+    updated_ms: u64,
+}
+
+fn input_fingerprint(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    let size = meta.len();
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some((size, mtime_ms))
+}
+
+fn reprocess_resume_path(save_root: &str, input_path: &Path, chunk_secs: f32) -> PathBuf {
+    let base = non_video_dir(save_root);
+    let (safe, hash) = reprocess_resume_tag(input_path, chunk_secs);
+    base.join(format!("reprocess_{safe}_{hash:016x}.json"))
+}
+
+fn reprocess_work_dir(save_root: &str, input_path: &Path, chunk_secs: f32) -> PathBuf {
+    let base = non_video_dir(save_root);
+    let (safe, hash) = reprocess_resume_tag(input_path, chunk_secs);
+    base.join(format!("reprocess_{safe}_{hash:016x}"))
+}
+
+fn reprocess_resume_tag(input_path: &Path, chunk_secs: f32) -> (String, u64) {
+    let stem = input_path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("input");
+    let mut safe = String::new();
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            safe.push(ch);
+        } else if ch.is_ascii_whitespace() {
+            safe.push('_');
+        }
+        if safe.len() >= 32 {
+            break;
+        }
+    }
+    if safe.is_empty() {
+        safe.push_str("input");
+    }
+    let mut hasher = DefaultHasher::new();
+    input_path.to_string_lossy().hash(&mut hasher);
+    chunk_secs.to_bits().hash(&mut hasher);
+    if let Some((size, mtime_ms)) = input_fingerprint(input_path) {
+        size.hash(&mut hasher);
+        mtime_ms.hash(&mut hasher);
+    }
+    let hash = hasher.finish();
+    (safe, hash)
+}
+
+fn reprocess_segment_dir(
+    save_root: &str,
+    input_path: &Path,
+    chunk_secs: f32,
+    segment_index: u32,
+    output_path: &Path,
+) -> PathBuf {
+    let base = reprocess_work_dir(save_root, input_path, chunk_secs);
+    let mut stem = output_path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("segment")
+        .to_string();
+    stem.retain(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if stem.is_empty() {
+        stem.push_str("segment");
+    }
+    base.join(format!("seg_{segment_index:04}_{stem}"))
+}
+
+fn collect_part_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|v| v.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("mp4"))
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
+async fn concat_media_parts(parts: &[PathBuf], output_path: &Path) -> Result<()> {
+    if parts.is_empty() {
+        anyhow::bail!("no media parts to concatenate");
+    }
+    let list_path = output_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("concat_parts.txt");
+    let mut list_body = String::new();
+    for part in parts {
+        let line = part.to_string_lossy().replace('\'', "'\\''");
+        list_body.push_str("file '");
+        list_body.push_str(&line);
+        list_body.push_str("'\n");
+    }
+    fs::write(&list_path, list_body)?;
+
+    let temp_out = temp_output_path(output_path);
+    cleanup_temp_output(&temp_out);
+    let status = Command::new(ffmpeg_bin())
+        .args([
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            list_path.to_string_lossy().as_ref(),
+            "-fflags",
+            "+genpts",
+            "-c",
+            "copy",
+            temp_out.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .await
+        .context("running ffmpeg concat")?;
+    let _ = fs::remove_file(&list_path);
+    if !status.success() {
+        anyhow::bail!("ffmpeg concat failed with status {status}");
+    }
+    finalize_output_path(&temp_out, output_path)?;
+    Ok(())
+}
+
+fn read_reprocess_resume_state(path: &Path) -> Option<ReprocessResumeState> {
+    let payload = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&payload).ok()
+}
+
+fn write_reprocess_resume_state(path: &Path, state: &ReprocessResumeState) -> Result<()> {
+    let payload = serde_json::to_vec(state).context("serializing reprocess resume state")?;
+    write_atomic_file(path, &payload)
+}
+
+fn clear_reprocess_resume_state(path: &Path) {
+    let _ = fs::remove_file(path);
 }
 
 fn read_m3u8_refresh_secs() -> Option<Duration> {
@@ -6193,13 +4599,11 @@ async fn refresh_media_source(
         .refresh_media_url_from_page_headless_with_headers(page_url)
         .await?;
     {
-        let mut guard = media_url.lock().expect("media url lock poisoned while refreshing");
+        let mut guard = lock_or_recover(&media_url, "media url refresh");
         *guard = new_url.clone();
     }
     {
-        let mut guard = media_headers
-            .lock()
-            .expect("media headers lock poisoned while refreshing");
+        let mut guard = lock_or_recover(&media_headers, "media headers refresh");
         *guard = headers;
     }
     seen.clear();
@@ -6282,158 +4686,6 @@ fn spawn_ctrl_c_handler(stop: Arc<AtomicBool>, worker: Option<Arc<Mutex<Option<C
             }
         }
     });
-}
-
-fn sanitize_stream_id(raw: &str) -> String {
-    let mut out = String::new();
-    let mut last_underscore = false;
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_underscore = false;
-        } else if ch == '-' {
-            out.push('-');
-            last_underscore = false;
-        } else {
-            if !last_underscore {
-                out.push('_');
-                last_underscore = true;
-            }
-        }
-    }
-    let trimmed = out.trim_matches('_');
-    if trimmed.is_empty() {
-        "stream".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn stream_id_from_url(url: &str) -> String {
-    let normalized = normalize_page_url(url);
-    if let Ok(parsed) = Url::parse(&normalized) {
-        let host = parsed.host_str().unwrap_or("stream");
-        let path = parsed.path().trim_matches('/');
-        let base = if path.is_empty() {
-            host.to_string()
-        } else {
-            format!("{host}_{path}")
-        };
-        return sanitize_stream_id(&base);
-    }
-    sanitize_stream_id(&normalized)
-}
-
-fn face_id_enabled() -> bool {
-    std::env::var("CLIP_FACE_ID")
-        .ok()
-        .and_then(|v| parse_bool(&v))
-        .unwrap_or(false)
-}
-
-fn face_id_file_for_stream(page_url: &str) -> PathBuf {
-    if let Ok(path) = std::env::var("CLIP_FACE_ID_FILE") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-    let stream_id = stream_id_from_url(page_url);
-    Path::new("face_id").join(format!("{stream_id}.json"))
-}
-
-fn extract_meta_image(html: &str, key: &str) -> Option<String> {
-    let needle = format!(r#"{key}""#);
-    let pos = html.find(&needle)?;
-    let tail = &html[pos..];
-    let content_pos = tail.find("content=")?;
-    let mut rest = &tail[content_pos + "content=".len()..];
-    rest = rest.trim_start();
-    let quote = rest.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    rest = &rest[1..];
-    let end = rest.find(quote)?;
-    let value = rest[..end].trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-async fn fetch_profile_image_url(page_url: &str) -> Result<Option<String>> {
-    let client = Client::new();
-    let resp = client.get(page_url).send().await?;
-    if !resp.status().is_success() {
-        return Ok(None);
-    }
-    let html = resp.text().await?;
-    if let Some(url) = extract_meta_image(&html, r#"property="og:image"#) {
-        return Ok(Some(url));
-    }
-    if let Some(url) = extract_meta_image(&html, r#"name="twitter:image"#) {
-        return Ok(Some(url));
-    }
-    Ok(None)
-}
-
-async fn enroll_face_id_from_stream_frame(
-    page_url: &str,
-    file_path: &Path,
-) -> Result<bool> {
-    let hls = HlsClient::new()?;
-    let (master_url, master) = hls.fetch_master_from_page(page_url).await?;
-    let media_url = hls.highest_variant_url(&master_url, &master)?;
-    clip_detect::enroll_face_id_from_media_url(media_url.as_str(), file_path).await
-}
-
-async fn maybe_auto_enroll_face_id(page_url: &str) {
-    if !face_id_enabled() {
-        return;
-    }
-    let file_path = face_id_file_for_stream(page_url);
-    if file_path.exists() {
-        return;
-    }
-    let _ = std::env::set_var(
-        "CLIP_FACE_ID_FILE",
-        file_path.to_string_lossy().as_ref(),
-    );
-    let image_url = match fetch_profile_image_url(page_url).await {
-        Ok(Some(url)) => url,
-        Ok(None) => {
-            eprintln!("face id: no profile image found on {}", page_url);
-            return;
-        }
-        Err(err) => {
-            eprintln!("face id: failed to fetch profile image: {err:#}");
-            return;
-        }
-    };
-    match clip_detect::enroll_face_id_from_image_url(&image_url, &file_path).await {
-        Ok(true) => {
-            eprintln!("face id: enrolled from profile image -> {}", file_path.display());
-        }
-        Ok(false) => {
-            eprintln!("face id: profile image did not yield a face; trying stream frame");
-            match enroll_face_id_from_stream_frame(page_url, &file_path).await {
-                Ok(true) => {
-                    eprintln!("face id: enrolled from stream frame -> {}", file_path.display());
-                }
-                Ok(false) => {
-                    eprintln!("face id: stream frame did not yield a face");
-                }
-                Err(err) => {
-                    eprintln!("face id: stream frame enrollment failed: {err:#}");
-                }
-            }
-        }
-        Err(err) => {
-            eprintln!("face id: enrollment failed: {err:#}");
-        }
-    }
 }
 
 fn build_stream_save_path(base: &str, stream_id: &str) -> String {
@@ -6586,6 +4838,7 @@ const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("CLIP_FACE_FRAME_EYE_TOP_RATIO", "0.45"),
     ("CLIP_FACE_FRAME_EYE_CHIN_RATIO", "0.55"),
     ("CLIP_FACE_FRAME_SHOULDER_SCALE", "3.2"),
+    ("CLIP_FACE_CENTER", "0"),
     ("CLIP_FACE_MESH", "1"),
     ("CLIP_FACE_MESH_MODEL", "models/face_mesh/face_mesh.onnx"),
     ("CLIP_FACE_MESH_MODEL_MIN_MB", "1"),
@@ -6653,6 +4906,11 @@ const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("CLIP_LLM_GPU_LAYERS", "0"),
     ("CLIP_LLM_FILE_RENAME", "1"),
     ("CLIP_LLM_DEBUG", "0"),
+    ("CLIP_FFMPEG_PROGRESS", "1"),
+    ("CLIP_FFMPEG_PROGRESS_STALL_SECS", "120"),
+    ("CLIP_REPROCESS_CHUNK_SECS", "60"),
+    ("CLIP_REPROCESS_SUBCHUNK_SECS", "0"),
+    ("CLIP_REPROCESS_FAST", "0"),
     ("CLIP_LIVE_FAST", "1"),
     ("CLIP_LIVE_LAYOUT_TTL_SECS", "120"),
     ("CLIP_LOW_RESOURCES", "0"),
@@ -6678,7 +4936,13 @@ const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("CLIP_EMOTION_DEBUG", "0"),
     ("FFMPEG_MIN_FREE_VRAM_MB", "512"),
     ("FFMPEG_ENCODE_TIMEOUT_SECS", "300"),
+    ("GPU_VRAM_RESERVE_MB", "512"),
     ("WHISPER_MIN_FREE_VRAM_MB", "2048"),
+    ("WHISPER_CLIP_MIN_FREE_VRAM_MB", "4096"),
+    ("WHISPER_CLIP_VRAM_FACTOR", "1.35"),
+    ("WHISPER_CLIP_VRAM_OVERHEAD_MB", "512"),
+    ("WHISPER_GPU_DEVICE", ""),
+    ("WHISPER_CLIP_GPU_DEVICE", ""),
     ("WHISPER_CLIP_GPU", "0"),
     ("WHISPER_ISOLATE", "0"),
     ("WHISPER_WORKER_MODE", "stream"),
@@ -7252,10 +5516,7 @@ async fn main() -> Result<()> {
     seed_ort_dylib_from_live_config(&live_config_path);
     refresh_low_resource_state();
 
-    // Ensure CUDA backend is preferred when available; avoid falling back to CPU due to missing env.
-    if std::env::var("WHISPER_CUBLAS").is_err() {
-        std::env::set_var("WHISPER_CUBLAS", "1");
-    }
+    // Ensure GPU backend is preferred when available; avoid falling back to CPU due to missing env.
     if std::env::var("WHISPER_GPU").is_err() {
         std::env::set_var("WHISPER_GPU", "1");
     }
@@ -7660,11 +5921,27 @@ async fn run_ts_wake_demo(
 async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
     let path = Path::new(ts_path);
     if !path.exists() {
-        anyhow::bail!("TS file not found: {}", path.display());
+        anyhow::bail!("media file not found: {}", path.display());
+    }
+
+    if let Some(mut live) = LiveConfigState::from_env() {
+        live.maybe_refresh();
+    }
+    refresh_low_resource_state();
+
+    let reprocess_fast = reprocess_fast_enabled();
+    if reprocess_fast {
+        std::env::set_var("CLIP_CAPTIONS", "0");
+        std::env::set_var("CLIP_CLOSED_CAPTIONS", "0");
+        std::env::set_var("CLIP_LLM_ENABLE", "0");
+        std::env::set_var("CLIP_AUDIO_NORM", "0");
+        std::env::set_var("CLIP_EMOTION_ENABLE", "0");
+        std::env::set_var("CLIP_EMOTION_AUDIO", "0");
+        std::env::set_var("CLIP_EMOTION_FACE", "0");
+        eprintln!("reprocess: fast mode enabled (captions/LLM/audio norm disabled)");
     }
 
     let cfg = Config::example();
-    let output_path = next_output_path(&cfg.save_path, &cfg.file_name_stub)?;
     let (out_w, out_h) = parse_resolution(&cfg.resolution).unwrap_or((1080, 1920));
     let progress_total_secs = probe_media_duration_secs(path).await;
     if std::env::var("CLIP_DETECT_STEP").is_err() {
@@ -7679,24 +5956,338 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
     if std::env::var("CLIP_FACE_TRACK").is_err() {
         std::env::set_var("CLIP_FACE_TRACK", "1");
     }
+    let chunk_secs = read_reprocess_chunk_secs();
+    let force_ts_input = is_ts_input(path);
+    let input = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-utf8 input path"))?;
+
+    if let (Some(total_secs), Some(chunk_secs)) = (progress_total_secs, chunk_secs) {
+        if total_secs > chunk_secs {
+            let resume_path = reprocess_resume_path(&cfg.save_path, path, chunk_secs);
+            let subchunk_secs = read_reprocess_subchunk_secs();
+            let mut start = 0.0f32;
+            let mut idx = 1u32;
+            let mut resume_used = false;
+            let mut resume_segment: Option<(u32, f32, f32, PathBuf, u32)> = None;
+            if let Some(state) = read_reprocess_resume_state(&resume_path) {
+                let (size, mtime_ms) = input_fingerprint(path).unwrap_or((0, 0));
+                let chunk_match =
+                    (state.chunk_secs - chunk_secs).abs() <= 0.001 || state.chunk_secs == 0.0;
+                let total_match = match (state.total_secs, Some(total_secs)) {
+                    (Some(a), Some(b)) => (a - b).abs() <= 0.5,
+                    (None, _) => true,
+                    _ => false,
+                };
+                let subchunk_match = match (state.subchunk_secs, subchunk_secs) {
+                    (Some(a), Some(b)) => (a - b).abs() <= 0.01,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if state.input_path == input
+                    && chunk_match
+                    && total_match
+                    && subchunk_match
+                    && state.input_size == size
+                    && state.input_mtime_ms == mtime_ms
+                    && state.next_start_secs >= 0.0
+                {
+                    start = state.next_start_secs;
+                    idx = state.next_index.max(1);
+                    resume_used = true;
+                    if let (Some(seg_idx), Some(seg_start), Some(seg_dur), Some(out), Some(part)) = (
+                        state.segment_index,
+                        state.segment_start_secs,
+                        state.segment_duration_secs,
+                        state.segment_output_path.as_ref(),
+                        state.next_part_index,
+                    ) {
+                        if seg_idx == idx
+                            && start >= seg_start
+                            && start < seg_start + seg_dur - 0.01
+                        {
+                            resume_segment =
+                                Some((seg_idx, seg_start, seg_dur, PathBuf::from(out), part));
+                        }
+                    }
+                }
+            }
+            let segments = (total_secs / chunk_secs).ceil().max(1.0) as u32;
+            if resume_used {
+                eprintln!(
+                    "reprocess: resuming at segment {}/{} start {:.1}s (chunk {:.1}s)",
+                    idx, segments, start, chunk_secs
+                );
+                if start >= total_secs - 0.01 {
+                    clear_reprocess_resume_state(&resume_path);
+                    eprintln!("reprocess: resume indicates completion; nothing to do");
+                    return Ok(());
+                }
+            }
+            while start < total_secs {
+                let remaining = (total_secs - start).max(0.0);
+                if remaining <= 0.01 {
+                    break;
+                }
+                let (segment_start, duration, output_path, mut part_index) =
+                    if let Some((_seg_idx, seg_start, seg_dur, out, part)) =
+                        resume_segment.take()
+                    {
+                        (
+                            seg_start,
+                            seg_dur,
+                            out,
+                            part.max(0).min(10_000),
+                        )
+                    } else {
+                        let output = next_output_path(&cfg.save_path, &cfg.file_name_stub)?;
+                        (start, remaining.min(chunk_secs), output, 0)
+                    };
+                let segment_end = segment_start + duration;
+                let mut part_start = start.max(segment_start);
+                let use_subchunk = subchunk_secs
+                    .filter(|v| *v > 0.0 && *v + 0.01 < duration)
+                    .unwrap_or(0.0);
+                let (size, mtime_ms) = input_fingerprint(path).unwrap_or((0, 0));
+                if use_subchunk > 0.0 {
+                    let seg_dir = reprocess_segment_dir(
+                        &cfg.save_path,
+                        path,
+                        chunk_secs,
+                        idx,
+                        &output_path,
+                    );
+                    if part_index == 0 && seg_dir.exists() {
+                        let _ = fs::remove_dir_all(&seg_dir);
+                    }
+                    fs::create_dir_all(&seg_dir)?;
+                    if part_index == 0 && (part_start - segment_start).abs() > 0.01 {
+                        part_index =
+                            ((part_start - segment_start) / use_subchunk).floor().max(0.0) as u32;
+                    }
+                    while part_start < segment_end - 0.01 {
+                        let part_duration = (segment_end - part_start).min(use_subchunk);
+                        let part_path = seg_dir.join(format!("part_{part_index:03}.mp4"));
+                        let resume_state = ReprocessResumeState {
+                            input_path: input.to_string(),
+                            input_size: size,
+                            input_mtime_ms: mtime_ms,
+                            chunk_secs,
+                            subchunk_secs: Some(use_subchunk),
+                            total_secs: Some(total_secs),
+                            next_start_secs: part_start,
+                            next_index: idx,
+                            segment_index: Some(idx),
+                            segment_start_secs: Some(segment_start),
+                            segment_duration_secs: Some(duration),
+                            segment_output_path: Some(output_path.to_string_lossy().to_string()),
+                            next_part_index: Some(part_index),
+                            updated_ms: now_unix_ms(),
+                        };
+                        let _ = write_reprocess_resume_state(&resume_path, &resume_state);
+                        eprintln!(
+                            "reprocess: segment {}/{} part {} start {:.1}s duration {:.1}s -> {}",
+                            idx,
+                            segments,
+                            part_index + 1,
+                            part_start,
+                            part_duration,
+                            part_path.display()
+                        );
+                        let mut attempts = 0u32;
+                        let max_retries = 1u32;
+                        loop {
+                            let result = run_ffmpeg_internal(
+                                FfmpegRenderSpec::new(input, &part_path, out_w, out_h)
+                                    .with_duration(Some(part_duration))
+                                    .with_start_offset(Some(part_start))
+                                    .with_force_ts_input(force_ts_input)
+                                    .with_progress(Some(ProgressSpec {
+                                        total_secs: Some(part_duration),
+                                    }))
+                                    .with_live_fast(false)
+                                    .with_fast_preset(reprocess_fast),
+                            )
+                            .await;
+                            match result {
+                                Ok(()) => break,
+                                Err(err) => {
+                                    let msg = err.to_string();
+                                    if ffmpeg_error_indicates_stall(&msg) {
+                                        if attempts < max_retries {
+                                            attempts += 1;
+                                            eprintln!(
+                                                "reprocess: ffmpeg stalled; retrying segment {}/{} part {} (retry {}/{})",
+                                                idx,
+                                                segments,
+                                                part_index + 1,
+                                                attempts,
+                                                max_retries
+                                            );
+                                            continue;
+                                        }
+                                        eprintln!(
+                                            "reprocess: ffmpeg stalled; leaving resume at segment {}/{} start {:.1}s (rerun to continue)",
+                                            idx,
+                                            segments,
+                                            part_start
+                                        );
+                                        return Ok(());
+                                    }
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        part_index += 1;
+                        part_start += part_duration;
+                        let resume_state = ReprocessResumeState {
+                            input_path: input.to_string(),
+                            input_size: size,
+                            input_mtime_ms: mtime_ms,
+                            chunk_secs,
+                            subchunk_secs: Some(use_subchunk),
+                            total_secs: Some(total_secs),
+                            next_start_secs: part_start,
+                            next_index: idx,
+                            segment_index: Some(idx),
+                            segment_start_secs: Some(segment_start),
+                            segment_duration_secs: Some(duration),
+                            segment_output_path: Some(output_path.to_string_lossy().to_string()),
+                            next_part_index: Some(part_index),
+                            updated_ms: now_unix_ms(),
+                        };
+                        let _ = write_reprocess_resume_state(&resume_path, &resume_state);
+                    }
+                    let parts = collect_part_files(&seg_dir)?;
+                    concat_media_parts(&parts, &output_path).await?;
+                    let _ = fs::remove_dir_all(&seg_dir);
+                } else {
+                    let resume_state = ReprocessResumeState {
+                        input_path: input.to_string(),
+                        input_size: size,
+                        input_mtime_ms: mtime_ms,
+                        chunk_secs,
+                        subchunk_secs,
+                        total_secs: Some(total_secs),
+                        next_start_secs: segment_start,
+                        next_index: idx,
+                        segment_index: None,
+                        segment_start_secs: None,
+                        segment_duration_secs: None,
+                        segment_output_path: None,
+                        next_part_index: None,
+                        updated_ms: now_unix_ms(),
+                    };
+                    if let Err(err) = write_reprocess_resume_state(&resume_path, &resume_state) {
+                        eprintln!(
+                            "reprocess: failed to persist resume state {}: {err:#}",
+                            resume_path.display()
+                        );
+                    }
+                    eprintln!(
+                        "reprocess: segment {}/{} start {:.1}s duration {:.1}s -> {}",
+                        idx,
+                        segments,
+                        segment_start,
+                        duration,
+                        output_path.display()
+                    );
+                    let mut attempts = 0u32;
+                    let max_retries = 1u32;
+                    loop {
+                        let result = run_ffmpeg_internal(
+                            FfmpegRenderSpec::new(input, &output_path, out_w, out_h)
+                                .with_duration(Some(duration))
+                                .with_start_offset(Some(segment_start))
+                                .with_force_ts_input(force_ts_input)
+                                .with_progress(Some(ProgressSpec {
+                                    total_secs: Some(duration),
+                                }))
+                                .with_live_fast(false)
+                                .with_fast_preset(reprocess_fast),
+                        )
+                        .await;
+                        match result {
+                            Ok(()) => break,
+                            Err(err) => {
+                                let msg = err.to_string();
+                                if ffmpeg_error_indicates_stall(&msg) {
+                                    if attempts < max_retries {
+                                        attempts += 1;
+                                        eprintln!(
+                                            "reprocess: ffmpeg stalled; retrying segment {}/{} (retry {}/{})",
+                                            idx,
+                                            segments,
+                                            attempts,
+                                            max_retries
+                                        );
+                                        continue;
+                                    }
+                                    eprintln!(
+                                        "reprocess: ffmpeg stalled; leaving resume at segment {}/{} start {:.1}s (rerun to continue)",
+                                        idx,
+                                        segments,
+                                        segment_start
+                                    );
+                                    return Ok(());
+                                }
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+                let next_start = segment_start + duration;
+                let resume_state = ReprocessResumeState {
+                    input_path: input.to_string(),
+                    input_size: size,
+                    input_mtime_ms: mtime_ms,
+                    chunk_secs,
+                    subchunk_secs,
+                    total_secs: Some(total_secs),
+                    next_start_secs: next_start,
+                    next_index: idx + 1,
+                    segment_index: None,
+                    segment_start_secs: None,
+                    segment_duration_secs: None,
+                    segment_output_path: None,
+                    next_part_index: None,
+                    updated_ms: now_unix_ms(),
+                };
+                let _ = write_reprocess_resume_state(&resume_path, &resume_state);
+                println!("reprocessed segment {idx} -> {}", output_path.display());
+                start = next_start;
+                idx += 1;
+            }
+            clear_reprocess_resume_state(&resume_path);
+            return Ok(());
+        }
+    }
+
+    let output_path = next_output_path(&cfg.save_path, &cfg.file_name_stub)?;
     run_ffmpeg_internal(
-        path.to_str()
-            .ok_or_else(|| anyhow::anyhow!("non-utf8 input path"))?,
-        &output_path,
-        out_w,
-        out_h,
-        progress_total_secs,
-        None,
-        true,
-        true,
-        Some(ProgressSpec {
-            total_secs: progress_total_secs,
-        }),
-        false,
+        FfmpegRenderSpec::new(input, &output_path, out_w, out_h)
+            .with_duration(progress_total_secs)
+            .with_force_ts_input(force_ts_input)
+            .with_progress(Some(ProgressSpec {
+                total_secs: progress_total_secs,
+            }))
+            .with_live_fast(false)
+            .with_fast_preset(reprocess_fast),
     )
     .await?;
-    println!("reprocessed TS clip -> {}", output_path.display());
+    println!("reprocessed media clip -> {}", output_path.display());
     Ok(())
+}
+
+fn is_ts_input(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "ts" | "m2ts"))
+        .unwrap_or(false)
+}
+
+fn ffmpeg_error_indicates_stall(message: &str) -> bool {
+    message.contains("ffmpeg progress stalled") || message.contains("ffmpeg encode timed out")
 }
 
 fn run_check_gameplay_model(model_dir: Option<&str>) -> Result<()> {
@@ -8054,6 +6645,9 @@ fn print_help(bin: &str) {
     println!("  CLIP_FACE_PICK_RAW       Pick faces using raw detector score (default true)");
     println!("  CLIP_FACE_SCORE          Face detection confidence threshold (default 0.6)");
     println!("  CLIP_FACE_TRACK_STEP     Seconds between face tracking samples (default 2.0)");
+    println!("  CLIP_FACE_REFRAME_SECS   Minimum seconds between tracked reframes (default 6.0)");
+    println!("  CLIP_FACE_LOCK_CENTER    Lock crop center to detected face positions (default false)");
+    println!("  CLIP_FACE_FALLBACK       Allow face-box fallback when tracking missing (default false)");
     println!("  CLIP_AUDIO_NORM          Normalize clip audio loudness (default true)");
     println!("  CLIP_CAPTIONS            Enable word-by-word open captions (default false)");
     println!("  CLIP_CAPTIONS_POSITION   Caption placement: margin (default) or chest");
@@ -8080,12 +6674,18 @@ fn print_help(bin: &str) {
     println!("  CLIP_LLM_GPU_LAYERS      LLM GPU layers (0 = CPU, empty = model default)");
     println!("  CLIP_LLM_FILE_RENAME     Rename clip files using LLM title (default true)");
     println!("  CLIP_LLM_DEBUG           Log LLM parse details (default false)");
+    println!("  CLIP_FFMPEG_PROGRESS     Print ffmpeg progress/percent during encoding (default false)");
+    println!("  CLIP_FFMPEG_PROGRESS_STALL_SECS Fail if ffmpeg makes no progress for N seconds (default 120)");
+    println!("  CLIP_REPROCESS_CHUNK_SECS Chunk duration for reprocess-ts media (default 60, 0 disables)");
+    println!("  CLIP_REPROCESS_SUBCHUNK_SECS Sub-chunk duration for reprocess resume (default unset)");
+    println!("  CLIP_REPROCESS_FAST      Speed-focused reprocess (skip captions/LLM/audio norm, faster encode)");
     println!("  CLIP_FACE_BUDGET_SECS    Override face detection time budget in seconds");
     println!("  CLIP_FACE_TILE_MIN_SCORE Tile search min score (default 0.60; set <= 0 to disable)");
     println!("  CLIP_FACE_TILE_MAX_DEPTH Max bisection depth for tile search (default 3)");
     println!("  CLIP_FACE_FRAME_HEAD_TOP      Head top offset vs face box (default -0.28)");
     println!("  CLIP_FACE_FRAME_HEAD_TOP_MIN  Min head top offset (default -0.8)");
     println!("  CLIP_FACE_FRAME_HEAD_TOP_MAX  Max head top offset (default 0.2)");
+    println!("  CLIP_FACE_CENTER           Center face in frame using kalman-smoothed tracking (default false)");
     println!("  CLIP_FACE_FRAME_EYE_TOP_RATIO Eye->top ratio for head estimate (default 0.45)");
     println!("  CLIP_FACE_FRAME_EYE_CHIN_RATIO Eye->chin ratio for head estimate (default 0.55)");
     println!("  CLIP_FACE_FRAME_SHOULDER_SCALE Shoulder width scale vs face (default 3.2)");
@@ -8176,12 +6776,19 @@ fn print_help(bin: &str) {
     println!("  WHISPER_GPU              Enable GPU for live wake (default true)");
     println!("  WHISPER_CLIP_GPU         Enable GPU for clip transcription (default false)");
     println!("  WHISPER_MIN_FREE_VRAM_MB Min free VRAM before using whisper GPU (default 2048)");
+    println!("  WHISPER_CLIP_MIN_FREE_VRAM_MB Min free VRAM before using whisper GPU for clips (default 4096)");
+    println!("  WHISPER_CLIP_VRAM_FACTOR Scale factor for estimating clip GPU VRAM use (default 1.35)");
+    println!("  WHISPER_CLIP_VRAM_OVERHEAD_MB Extra VRAM cushion for clip GPU use (default 512)");
+    println!("  WHISPER_GPU_DEVICE       Force NVIDIA device id for live wake (default auto)");
+    println!("  WHISPER_CLIP_GPU_DEVICE  Force NVIDIA device id for clip transcription (default auto)");
     println!("  WHISPER_ISOLATE          Run live wake in a helper process (default false)");
     println!("  WHISPER_WORKER_STATUS_MS Poll interval for wake worker status (default 500ms)");
     println!("  FFMPEG_ENCODER / FFMPEG_HWACCEL / FFMPEG_HWACCEL_DEVICE   Encoder/accel knobs");
     println!("  FFMPEG_HWACCEL_FALLBACK  Fallback hwaccel (e.g. d3d11va, cuda, none; default none)");
     println!("  FFMPEG_MIN_FREE_VRAM_MB  Min free VRAM before using GPU encode (default 512)");
     println!("  FFMPEG_ENCODE_TIMEOUT_SECS   Hard cap for ffmpeg encode wall time (seconds)");
+    println!("  CLIP_FFMPEG_NO_LIMITS   Disable ffmpeg stall + encode timeouts");
+    println!("  GPU_VRAM_RESERVE_MB      Always keep this much VRAM free (default 512)");
     println!("  LOG_M3U8_HEADERS         Log request headers when fetching playlists");
     println!("  TWITCH_CLIENT_ID         Twitch Client-ID for playback token (default web client)");
     println!("  TWITCH_OAUTH_TOKEN / TWITCH_AUTH_TOKEN   Twitch OAuth token for gated streams (optional)");
@@ -8196,35 +6803,16 @@ fn print_help(bin: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::captions::{
+        CaptionConfig, CaptionPosition, CaptionWord, build_caption_drawtext_chain,
+        build_srt_from_payload, default_caption_font, format_srt_time, wrap_caption_text,
+    };
+    use crate::clip_layout::FaceAnchor;
+    use crate::clip_layout::NormalizedRect;
+    use crate::stream_audio_wake::WordTiming;
+    use crate::test_util::EnvGuard;
+    use crate::url_utils::sanitize_m3u8_url;
     use std::process::Command as SysCommand;
-
-    struct EnvGuard {
-        saved: Vec<(String, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn new() -> Self {
-            Self { saved: Vec::new() }
-        }
-
-        fn set(&mut self, key: &str, value: &str) {
-            if !self.saved.iter().any(|(k, _)| k == key) {
-                self.saved.push((key.to_string(), std::env::var(key).ok()));
-            }
-            std::env::set_var(key, value);
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, val) in self.saved.drain(..) {
-                match val {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
 
     fn tool_available(tool: &str) -> bool {
         SysCommand::new(tool)
@@ -8283,11 +6871,60 @@ mod tests {
         Ok(stdout.lines().any(|line| line.trim() == "subtitle"))
     }
 
-    #[tokio::test]
+    fn parse_signalstats_yavg(output: &str) -> Option<f64> {
+        let mut best: Option<f64> = None;
+        for line in output.lines() {
+            let Some(idx) = line.find("lavfi.signalstats.YAVG=") else {
+                continue;
+            };
+            let tail = &line[idx + "lavfi.signalstats.YAVG=".len()..];
+            let val_str = tail
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .next()
+                .unwrap_or("");
+            if let Ok(val) = val_str.parse::<f64>() {
+                best = Some(best.map_or(val, |prev| prev.max(val)));
+            }
+        }
+        best
+    }
+
+    fn sample_frame_yavg(path: &Path, time_secs: f32) -> Result<f64> {
+        let output = SysCommand::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-v",
+                "info",
+                "-ss",
+                &format!("{time_secs:.3}"),
+                "-i",
+                path.to_string_lossy().as_ref(),
+                "-frames:v",
+                "1",
+                "-vf",
+                "signalstats,metadata=print",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("ffmpeg signalstats failed: {}", stderr.trim());
+        }
+        let mut merged = String::new();
+        merged.push_str(&String::from_utf8_lossy(&output.stdout));
+        merged.push_str(&String::from_utf8_lossy(&output.stderr));
+        parse_signalstats_yavg(&merged)
+            .ok_or_else(|| anyhow::anyhow!("failed to parse signalstats YAVG"))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn run_stub_succeeds() {
         // Ensure no network-dependent env vars force the main path.
-        std::env::remove_var("CLIP_PAGE_URL");
-        std::env::remove_var("M3U8_URL_OVERRIDE");
+        let mut env = EnvGuard::new();
+        env.remove("CLIP_PAGE_URL");
+        env.remove("M3U8_URL_OVERRIDE");
         let app = AutoClip::new(Config::example());
         assert!(app.run().await.is_ok());
     }
@@ -8295,12 +6932,28 @@ mod tests {
     #[test]
     fn parse_streams_file_ignores_comments_and_dedupes() {
         let input = "# streams\nkick.com/queenbushcamp\n\n// comment\nkick.com/queenbushcamp\nhttps://twitch.tv/someuser\n";
-        let streams = parse_streams_file(input);
+        let streams = stream_utils::parse_streams_file(input);
         assert_eq!(
             streams,
             vec![
                 "https://kick.com/queenbushcamp".to_string(),
                 "https://twitch.tv/someuser".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn split_wake_phrases_handles_delimiters() {
+        let input = " hello, world | ok; test\nnext\rline ";
+        assert_eq!(
+            split_wake_phrases(input),
+            vec![
+                "hello".to_string(),
+                "world".to_string(),
+                "ok".to_string(),
+                "test".to_string(),
+                "next".to_string(),
+                "line".to_string()
             ]
         );
     }
@@ -8318,11 +6971,72 @@ mod tests {
     }
 
     #[test]
+    fn normalize_page_url_adds_scheme_for_domains() {
+        assert_eq!(
+            normalize_page_url("kick.com/queenbushcamp"),
+            "https://kick.com/queenbushcamp"
+        );
+        assert_eq!(
+            normalize_page_url("https://kick.com/queenbushcamp"),
+            "https://kick.com/queenbushcamp"
+        );
+        assert_eq!(
+            normalize_page_url("C:\\videos\\clip.ts"),
+            "C:\\videos\\clip.ts"
+        );
+        assert_eq!(normalize_page_url("/var/tmp/clip.ts"), "/var/tmp/clip.ts");
+    }
+
+    #[test]
+    fn sanitize_m3u8_url_strips_quotes_and_trailing_slash() {
+        assert_eq!(
+            sanitize_m3u8_url("\"https://example.com/stream.m3u8\""),
+            "https://example.com/stream.m3u8"
+        );
+        assert_eq!(
+            sanitize_m3u8_url(" 'https://example.com/stream.m3u8'\\ "),
+            "https://example.com/stream.m3u8"
+        );
+    }
+
+    #[test]
+    fn signed_url_expiry_picks_earliest_expiry() {
+        let url = Url::parse(
+            "https://example.com/stream.m3u8?exp=1700000000&token_exp=1800000000",
+        )
+        .expect("url parse");
+        let expiry = signed_url_expiry(&url).expect("expiry");
+        assert_eq!(
+            expiry,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+    }
+
+    #[test]
+    fn lock_or_recover_returns_guard_after_poison() {
+        let mutex = Mutex::new(42u32);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("poison");
+        });
+        let guard = lock_or_recover(&mutex, "test");
+        assert_eq!(*guard, 42);
+    }
+
+    #[test]
     fn extract_output_index_parses_variants() {
         assert_eq!(extract_output_index("clip_001", "clip"), Some(1));
         assert_eq!(extract_output_index("clip_010__title", "clip"), Some(10));
         assert_eq!(extract_output_index("clip__oops", "clip"), None);
         assert_eq!(extract_output_index("other_001", "clip"), None);
+    }
+
+    #[test]
+    fn is_ts_input_matches_only_ts_variants() {
+        assert!(is_ts_input(Path::new("clip.ts")));
+        assert!(is_ts_input(Path::new("clip.m2ts")));
+        assert!(!is_ts_input(Path::new("clip.mp4")));
+        assert!(!is_ts_input(Path::new("clip.mkv")));
     }
 
     #[test]
@@ -8351,12 +7065,12 @@ mod tests {
     fn extract_meta_image_reads_content() {
         let html = r#"<html><head><meta property="og:image" content="https://example.com/a.jpg"></head></html>"#;
         assert_eq!(
-            extract_meta_image(html, r#"property="og:image"#),
+            url_utils::extract_meta_image(html, r#"property="og:image"#),
             Some("https://example.com/a.jpg".to_string())
         );
         let html = r#"<meta name="twitter:image" content="https://example.com/b.png"/>"#;
         assert_eq!(
-            extract_meta_image(html, r#"name="twitter:image"#),
+            url_utils::extract_meta_image(html, r#"name="twitter:image"#),
             Some("https://example.com/b.png".to_string())
         );
     }
@@ -8364,21 +7078,16 @@ mod tests {
     #[test]
     fn face_id_file_for_stream_prefers_env_override() {
         let key = "CLIP_FACE_ID_FILE";
-        let prev = std::env::var(key).ok();
-        std::env::set_var(key, "face_id/custom.json");
-        let path = face_id_file_for_stream("https://kick.com/QueenBushCamp");
+        let mut env = EnvGuard::new();
+        env.set(key, "face_id/custom.json");
+        let path = face_id::face_id_file_for_stream("https://kick.com/QueenBushCamp");
         assert_eq!(path, PathBuf::from("face_id/custom.json"));
-        if let Some(value) = prev {
-            std::env::set_var(key, value);
-        } else {
-            std::env::remove_var(key);
-        }
     }
 
     #[test]
     fn face_area_from_hints_uses_box_or_track() {
         let mut hints = clip_layout::ClipLayoutHints::default();
-        assert!(face_area_from_hints(&hints).is_none());
+        assert!(layout_utils::face_area_from_hints(&hints).is_none());
 
         hints.face_box = Some(NormalizedRect {
             x: 0.0,
@@ -8386,7 +7095,7 @@ mod tests {
             w: 0.2,
             h: 0.5,
         });
-        let area = face_area_from_hints(&hints).unwrap();
+        let area = layout_utils::face_area_from_hints(&hints).unwrap();
         assert!((area - 0.1).abs() < 1e-6);
 
         hints.face_box = None;
@@ -8401,7 +7110,7 @@ mod tests {
                 },
             }],
         });
-        let area = face_area_from_hints(&hints).unwrap();
+        let area = layout_utils::face_area_from_hints(&hints).unwrap();
         assert!((area - 0.1).abs() < 1e-6);
     }
 
@@ -8478,6 +7187,135 @@ mod tests {
     }
 
     #[test]
+    fn choose_segment_duration_uses_playlist_when_pts_is_suspicious() {
+        let playlist = Duration::from_secs_f32(6.0);
+        let too_short = Duration::from_secs_f32(0.8);
+        let too_long = Duration::from_secs_f32(30.0);
+        assert_eq!(
+            choose_segment_duration(Some(too_short), playlist),
+            playlist
+        );
+        assert_eq!(choose_segment_duration(Some(too_long), playlist), playlist);
+        let ok = Duration::from_secs_f32(6.5);
+        assert_eq!(choose_segment_duration(Some(ok), playlist), ok);
+    }
+
+    #[test]
+    fn buffer_retains_full_60s_even_with_bad_pts() {
+        let clip_window = Duration::from_secs(60);
+        let mut buffer = RollingBuffer::new(clip_window);
+        let playlist = Duration::from_secs_f32(6.0);
+        let bad_pts = Duration::from_secs_f32(0.6);
+        for _ in 0..10 {
+            let seg = choose_segment_duration(Some(bad_pts), playlist);
+            buffer.push(vec![0u8; 16], seg);
+        }
+        assert_eq!(buffer.total_duration(), clip_window);
+    }
+
+    #[test]
+    fn stacked_layout_requires_face_and_game() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_GAMEPLAY", "1");
+        env.set("CLIP_LOW_RESOURCES", "0");
+        env.set("CLIP_FACE_FALLBACK", "1");
+
+        let layout = ClipLayoutConfig {
+            mode: ClipLayoutMode::Stacked,
+            face_ratio: 0.4,
+            face_crop: None,
+            face_anchor: FaceAnchor::TopLeft,
+            face_context_scale: 1.5,
+            face_zoom: 1.0,
+        };
+        let mut both = ClipLayoutHints::default();
+        both.face_box = Some(NormalizedRect {
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.2,
+        });
+        both.game_center = Some(NormalizedPoint { x: 0.5, y: 0.5 });
+        let decision = decide_stacked_layout(&layout, &both, None);
+        assert!(decision.layout_is_stacked);
+        assert!(!decision.face_only);
+        assert!(!decision.fullscreen_fill);
+
+        let mut face_only = both.clone();
+        face_only.face_box = Some(NormalizedRect {
+            x: 0.35,
+            y: 0.35,
+            w: 0.3,
+            h: 0.3,
+        });
+        face_only.game_center = None;
+        let decision = decide_stacked_layout(&layout, &face_only, None);
+        assert!(!decision.layout_is_stacked);
+        assert!(decision.fullscreen_fill);
+        assert!(!decision.face_only);
+
+        let mut game_only = ClipLayoutHints::default();
+        game_only.game_center = Some(NormalizedPoint { x: 0.5, y: 0.5 });
+        let decision = decide_stacked_layout(&layout, &game_only, None);
+        assert!(!decision.layout_is_stacked);
+        assert!(decision.fullscreen_fill);
+        assert!(!decision.face_only);
+    }
+
+    #[test]
+    fn stacked_layout_uses_low_resource_gameplay_guess() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_GAMEPLAY", "0");
+        env.set("CLIP_LOW_RESOURCES", "1");
+        env.set("CLIP_FACE_FALLBACK", "1");
+
+        let layout = ClipLayoutConfig {
+            mode: ClipLayoutMode::Stacked,
+            face_ratio: 0.4,
+            face_crop: None,
+            face_anchor: FaceAnchor::TopLeft,
+            face_context_scale: 1.5,
+            face_zoom: 1.0,
+        };
+
+        let mut edge_face = ClipLayoutHints::default();
+        edge_face.face_box = Some(NormalizedRect {
+            x: 0.02,
+            y: 0.05,
+            w: 0.12,
+            h: 0.12,
+        });
+        let decision = decide_stacked_layout(&layout, &edge_face, None);
+        assert!(decision.layout_is_stacked);
+
+        let mut centered_face = ClipLayoutHints::default();
+        centered_face.face_box = Some(NormalizedRect {
+            x: 0.35,
+            y: 0.35,
+            w: 0.2,
+            h: 0.2,
+        });
+        let decision = decide_stacked_layout(&layout, &centered_face, None);
+        assert!(!decision.layout_is_stacked);
+        assert!(decision.fullscreen_fill);
+    }
+
+    #[test]
+    fn low_resource_overrides_apply_and_restore() {
+        low_resource::reset_low_resource_state_for_tests();
+        let mut env = EnvGuard::new();
+        env.set("CLIP_LOW_RESOURCES", "1");
+        env.set("CLIP_FACE_TRACK", "1");
+
+        refresh_low_resource_state();
+        assert_eq!(std::env::var("CLIP_FACE_TRACK").ok().as_deref(), Some("0"));
+
+        env.set("CLIP_LOW_RESOURCES", "0");
+        refresh_low_resource_state();
+        assert_eq!(std::env::var("CLIP_FACE_TRACK").ok().as_deref(), Some("1"));
+    }
+
+    #[test]
     fn non_video_files_use_subdir() -> Result<()> {
         let stamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -8493,7 +7331,7 @@ mod tests {
 
         let status_path = whisper_worker_status_path(&dir_str);
         let media_path = whisper_worker_media_url_path(&dir_str);
-        let expected_dir = dir.join(NON_VIDEO_SUBDIR);
+        let expected_dir = dir.join(storage_utils::NON_VIDEO_SUBDIR);
         assert_eq!(
             status_path,
             expected_dir.join(".whisper_wake_status.json")
@@ -8515,29 +7353,25 @@ mod tests {
 
     #[test]
     fn low_resource_face_box_still_uses_kalman_for_fullscreen_track() {
-        let original_low = std::env::var("CLIP_LOW_RESOURCES").ok();
-        let mut env = EnvGuard::new();
-        env.set("CLIP_LOW_RESOURCES", "1");
-        refresh_low_resource_state();
-        env.set("CLIP_FACE_BOX", "0.1,0.1,0.8,0.8");
+        {
+            let mut env = EnvGuard::new();
+            env.set("CLIP_LOW_RESOURCES", "1");
+            refresh_low_resource_state();
+            env.set("CLIP_FACE_BOX", "0.1,0.1,0.8,0.8");
 
-        let hints = read_clip_layout_hints();
-        let face_box = hints.face_box.expect("expected face box");
-        let track = clip_layout::synthesize_face_track(face_box);
-        let FilterGraph::Vf(chain) =
-            build_tracked_full_frame_fill_filter_graph(1080, 1920, &track)
-                .expect("expected tracked full-frame graph")
-        else {
-            panic!("expected Vf filter graph");
-        };
-        assert!(
-            chain.contains("between(t"),
-            "expected kalman-driven tracked crop expression"
-        );
-
-        match original_low {
-            Some(value) => std::env::set_var("CLIP_LOW_RESOURCES", value),
-            None => std::env::remove_var("CLIP_LOW_RESOURCES"),
+            let hints = read_clip_layout_hints();
+            let face_box = hints.face_box.expect("expected face box");
+            let track = clip_layout::synthesize_face_track(face_box);
+            let FilterGraph::Vf(chain) =
+                build_tracked_full_frame_fill_filter_graph(1080, 1920, &track)
+                    .expect("expected tracked full-frame graph")
+            else {
+                panic!("expected Vf filter graph");
+            };
+            assert!(
+                chain.contains("between(t"),
+                "expected kalman-driven tracked crop expression"
+            );
         }
         refresh_low_resource_state();
     }
@@ -8572,7 +7406,7 @@ mod tests {
         assert_eq!(guess.map(|(value, _, _)| value), Some(true));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn captions_embed_subtitles_in_low_resource_mode() -> Result<()> {
         if !tool_available("ffmpeg") || !tool_available("ffprobe") {
             eprintln!("skipping: ffmpeg/ffprobe not available");
@@ -8604,22 +7438,76 @@ mod tests {
         }
 
         run_ffmpeg_internal(
-            input.to_string_lossy().as_ref(),
-            &output,
-            320,
-            180,
-            Some(1.0),
-            None,
-            true,
-            false,
-            None,
-            false,
+            FfmpegRenderSpec::new(input.to_string_lossy().as_ref(), &output, 320, 180)
+                .with_duration(Some(1.0))
+                .with_regen_pts(true),
         )
         .await?;
 
         assert!(
             output_has_subtitles(&output)?,
             "expected subtitle stream in output"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_captions_are_visibly_rendered() -> Result<()> {
+        if !tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg not available");
+            return Ok(());
+        }
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("autoclip_open_caps_{stamp}"));
+        fs::create_dir_all(&dir)?;
+        let input = dir.join("input.mp4");
+        let baseline = dir.join("baseline.mp4");
+        let output = dir.join("captions.mp4");
+        generate_test_video(&input)?;
+
+        let mut env = EnvGuard::new();
+        env.set("CLIP_LAYOUT", "full");
+        env.set("CLIP_DETECT", "0");
+        env.set("CLIP_FACE_TRACK", "0");
+        env.set("CLIP_LIVE_FAST", "0");
+        env.set("FFMPEG_ENCODER", "libx264");
+        env.set("FFMPEG_HWACCEL", "none");
+        env.set("CLIP_CAPTIONS_COLOR", "white");
+        env.set("CLIP_CAPTIONS_OUTLINE", "0");
+        env.set("CLIP_CAPTIONS_POSITION", "chest");
+        env.set("CLIP_CAPTIONS_CHEST_RATIO", "0.5");
+        env.set("CLIP_CAPTIONS_SIZE", "0.25");
+        env.set("CLIP_TEST_TRANSCRIPT", "hello world");
+        if let Some(font) = default_caption_font() {
+            env.set("CLIP_CAPTIONS_FONT", &font);
+        }
+
+        env.set("CLIP_CAPTIONS", "0");
+        env.set("CLIP_CLOSED_CAPTIONS", "0");
+        run_ffmpeg_internal(
+            FfmpegRenderSpec::new(input.to_string_lossy().as_ref(), &baseline, 320, 180)
+                .with_duration(Some(1.0))
+                .with_regen_pts(true),
+        )
+        .await?;
+
+        env.set("CLIP_CAPTIONS", "1");
+        run_ffmpeg_internal(
+            FfmpegRenderSpec::new(input.to_string_lossy().as_ref(), &output, 320, 180)
+                .with_duration(Some(1.0))
+                .with_regen_pts(true),
+        )
+        .await?;
+
+        let base_y = sample_frame_yavg(&baseline, 0.25)?;
+        let cap_y = sample_frame_yavg(&output, 0.25)?;
+        assert!(
+            cap_y > base_y + 1.0,
+            "expected captions to raise average luma (baseline {base_y:.2}, captions {cap_y:.2})"
         );
         let _ = fs::remove_dir_all(&dir);
         Ok(())
@@ -8635,10 +7523,21 @@ mod tests {
         };
 
         let client = HlsClient::new()?;
-        let master = client.fetch_master(&master_url).await?;
+        let master = client
+            .fetch_master_with_headers(&master_url, None, None, None)
+            .await?;
         let media_url = client.highest_variant_url(&master_url, &master)?;
 
-        let segment_bytes = client.fetch_first_segment(media_url.as_str()).await?;
+        let media = client.fetch_media(media_url.as_str()).await?;
+        let first = media
+            .segments
+            .first()
+            .map(|s| &s.uri)
+            .context("media playlist has no segments")?;
+        let playlist_url = Url::parse(media_url.as_str()).context("invalid playlist url")?;
+        let segment_bytes = client
+            .fetch_segment_from_playlist(&playlist_url, first)
+            .await?;
         assert!(!segment_bytes.is_empty(), "segment should contain data");
         Ok(())
     }
@@ -8656,7 +7555,16 @@ mod tests {
         let (master_url, master) = client.fetch_master_from_page(&page_url).await?;
         let media_url = client.highest_variant_url(&master_url, &master)?;
 
-        let segment_bytes = client.fetch_first_segment(media_url.as_str()).await?;
+        let media = client.fetch_media(media_url.as_str()).await?;
+        let first = media
+            .segments
+            .first()
+            .map(|s| &s.uri)
+            .context("media playlist has no segments")?;
+        let playlist_url = Url::parse(media_url.as_str()).context("invalid playlist url")?;
+        let segment_bytes = client
+            .fetch_segment_from_playlist(&playlist_url, first)
+            .await?;
         assert!(!segment_bytes.is_empty(), "segment should contain data");
         Ok(())
     }
@@ -8691,15 +7599,44 @@ mod tests {
     }
 
     #[test]
+    fn normalize_title_whitespace_collapses() {
+        let input = "  hello   world \n\t good   bye  ";
+        assert_eq!(normalize_title_whitespace(input), "hello world good bye");
+    }
+
+    #[test]
+    fn sanitize_title_for_filename_basic() {
+        assert_eq!(sanitize_title_for_filename("Hello, World!"), "hello_world");
+        assert_eq!(sanitize_title_for_filename("Hello-World"), "hello-world");
+        assert_eq!(sanitize_title_for_filename("!!!"), "");
+    }
+
+    #[test]
+    fn trim_transcript_trims_and_truncates() {
+        assert_eq!(trim_transcript("  ok  ", 10), "ok");
+        assert_eq!(trim_transcript(" 0123456789A ", 10), "0123456...");
+    }
+
+    #[test]
+    fn fallback_title_from_transcript_respects_limits() {
+        assert_eq!(fallback_title_from_transcript("   ", 10), "");
+        assert_eq!(fallback_title_from_transcript("hello world", 20), "hello world");
+        assert_eq!(fallback_title_from_transcript("hello world", 8), "hello...");
+    }
+
+    #[test]
     fn extract_twitch_login_from_url() {
         assert_eq!(
-            extract_twitch_login("https://www.twitch.tv/rynn?twitch5=0"),
+            crate::hls_client::extract_twitch_login("https://www.twitch.tv/rynn?twitch5=0"),
             Some("rynn".to_string())
         );
         assert_eq!(
-            extract_twitch_login("https://player.twitch.tv/?channel=rynn"),
+            crate::hls_client::extract_twitch_login("https://player.twitch.tv/?channel=rynn"),
             Some("rynn".to_string())
         );
-        assert_eq!(extract_twitch_login("https://www.twitch.tv/directory"), None);
+        assert_eq!(
+            crate::hls_client::extract_twitch_login("https://www.twitch.tv/directory"),
+            None
+        );
     }
 }

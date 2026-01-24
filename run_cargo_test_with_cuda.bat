@@ -2,7 +2,7 @@
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 set CMAKE_GENERATOR=Ninja
 set CMAKE_MAKE_PROGRAM=C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe
-set WHISPER_CUBLAS=1
+set GGML_CUDA=1
 set GGML_LOG_LEVEL=1
 set BASE_DIR=%CD%\target\debug\build
 set WHISPER_OUT=

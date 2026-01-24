@@ -1,3 +1,8 @@
+//! Gameplay detection using CLIP (text + vision) embeddings.
+//!
+//! This module loads a CLIP model, embeds a set of positive/negative labels,
+//! and scores frame regions to estimate whether gameplay is present.
+
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -19,6 +24,7 @@ const SEQ_LEN: usize = 77;
 const CLIP_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 const CLIP_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
 
+/// Configuration for gameplay detection and CLIP scoring.
 #[derive(Clone, Debug)]
 pub struct ClipGameplayConfig {
     pub enabled: bool,
@@ -34,6 +40,7 @@ pub struct ClipGameplayConfig {
     pub negative_labels: Vec<String>,
 }
 
+/// A scored observation for a candidate gameplay region.
 #[derive(Clone, Copy, Debug)]
 pub struct ClipRegionObservation {
     pub rect: NormalizedRect,
@@ -41,6 +48,7 @@ pub struct ClipRegionObservation {
     pub score: f32,
 }
 
+/// Pre-embedded label vectors for gameplay scoring.
 #[derive(Clone, Debug)]
 pub struct ClipLabelSet {
     pub positive: Vec<Vec<f32>>,
@@ -49,6 +57,7 @@ pub struct ClipLabelSet {
     pub top_k: usize,
 }
 
+/// Read gameplay configuration from the environment with sane defaults.
 pub fn read_clip_gameplay_config(
     default_w: u32,
     default_h: u32,
@@ -157,6 +166,7 @@ fn default_onnx_path(onnx_dir: &PathBuf, candidates: &[&str]) -> PathBuf {
     onnx_dir.join(candidates[0])
 }
 
+/// CLIP-powered gameplay detector that scores candidate regions.
 pub struct ClipGameplayDetector {
     text_model: TypedRunnableModel<TypedModel>,
     vision_model: TypedRunnableModel<TypedModel>,
@@ -170,6 +180,7 @@ pub struct ClipGameplayDetector {
 }
 
 impl ClipGameplayDetector {
+    /// Build a gameplay detector from config, returning `None` when disabled.
     pub fn new(config: &ClipGameplayConfig) -> Result<Option<Self>> {
         if !config.enabled {
             return Ok(None);
@@ -255,6 +266,7 @@ impl ClipGameplayDetector {
         Ok(Some(detector))
     }
 
+    /// Return the embedded label set currently held by this detector.
     pub fn label_set(&self) -> ClipLabelSet {
         ClipLabelSet {
             positive: self.positive.clone(),
@@ -264,6 +276,7 @@ impl ClipGameplayDetector {
         }
     }
 
+    /// Encode custom label sets into CLIP embeddings.
     pub fn encode_label_set(
         &self,
         positive_labels: &[String],
@@ -281,6 +294,9 @@ impl ClipGameplayDetector {
         })
     }
 
+    /// Detect the most likely gameplay region in an RGB frame.
+    ///
+    /// `rgb` should be packed RGB bytes. Returns a scored observation or `None`.
     pub fn detect_region(
         &self,
         rgb: &[u8],
@@ -592,6 +608,7 @@ fn parse_size(value: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// Parse a comma/pipe-delimited label list into trimmed entries.
 pub fn parse_label_list(value: String) -> Vec<String> {
     value
         .split(|c| c == '|' || c == ',')
@@ -653,6 +670,7 @@ fn gameplay_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Log gameplay debug output when `CLIP_GAMEPLAY_DEBUG` is enabled.
 pub fn log_gameplay_debug(message: &str) {
     if gameplay_debug_enabled() {
         eprintln!("{message}");

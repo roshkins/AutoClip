@@ -1,14 +1,22 @@
+//! Lightweight console ticker for long-running operations.
+//!
+//! This utility prints a periodic "still working" line until dropped.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Periodically prints a status line while work is in progress.
 pub struct LoadingTicker {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl LoadingTicker {
+    /// Start a ticker with a label and interval.
+    ///
+    /// The ticker stops automatically when the returned guard is dropped.
     pub fn start(label: &'static str, interval: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();

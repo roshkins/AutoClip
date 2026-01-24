@@ -1,3 +1,7 @@
+//! Minimal scoped profiling helpers.
+//!
+//! When enabled via `CLIP_PROFILE`, spans log their elapsed time on drop.
+
 use std::time::Instant;
 
 fn parse_bool(value: &str) -> bool {
@@ -7,6 +11,7 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
+/// Return whether profiling spans are enabled.
 pub fn profile_enabled() -> bool {
     std::env::var("CLIP_PROFILE")
         .ok()
@@ -14,6 +19,7 @@ pub fn profile_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Scoped timer that logs elapsed time on drop when profiling is enabled.
 pub struct ProfileSpan {
     label: &'static str,
     start: Instant,
@@ -21,6 +27,7 @@ pub struct ProfileSpan {
 }
 
 impl ProfileSpan {
+    /// Start a new profiling span with a label.
     pub fn new(label: &'static str) -> Self {
         let enabled = profile_enabled();
         let start = Instant::now();
@@ -44,6 +51,7 @@ impl Drop for ProfileSpan {
     }
 }
 
+/// Convenience helper to create a new profiling span.
 pub fn profile_span(label: &'static str) -> ProfileSpan {
     ProfileSpan::new(label)
 }

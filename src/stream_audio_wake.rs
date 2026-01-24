@@ -1,3 +1,8 @@
+//! Whisper-based wake-word detection and transcription.
+//!
+//! This module handles both stream audio and microphone wake detection using
+//! whisper.cpp/whisper-rs, plus optional emotion-based triggers.
+
 use std::env;
 use std::fs;
 use std::ffi::CStr;
@@ -163,6 +168,7 @@ fn audio_stats(samples: &[f32]) -> (f32, f32) {
     (rms, peak)
 }
 
+/// Word-level timing returned by Whisper.
 #[derive(Clone, Debug)]
 pub struct WordTiming {
     pub text: String,
@@ -171,6 +177,7 @@ pub struct WordTiming {
     pub t1: f32,
 }
 
+/// Transcript payload with word timings.
 #[derive(Clone, Debug)]
 pub struct TranscriptPayload {
     pub text: String,
@@ -202,21 +209,42 @@ struct WhisperHandle {
 
 impl WhisperHandle {
     fn new(model_path: &Path) -> Result<Self> {
-        Self::new_with_gpu(model_path, whisper_prefers_gpu())
+        let device = whisper_gpu_device_override().map(|v| v as i32);
+        Self::new_with_gpu_device(model_path, whisper_prefers_gpu(), device)
     }
 
-    fn new_with_gpu(model_path: &Path, prefer_gpu: bool) -> Result<Self> {
+    fn new_with_gpu_device(
+        model_path: &Path,
+        prefer_gpu: bool,
+        gpu_device: Option<i32>,
+    ) -> Result<Self> {
         install_whisper_log_filter();
         let model_path = model_path.to_path_buf();
         let mut prefer_gpu = prefer_gpu;
+        if !prefer_gpu {
+            if let Some(reason) = whisper_gpu_disabled_reason_from_env() {
+                eprintln!("whisper: GPU disabled via {reason}; using CPU");
+            }
+        }
         if prefer_gpu && !whisper_gpu_allowed("whisper") {
+            let min_free = whisper_min_free_vram_mb();
+            let free = gpu::query_nvidia_free_vram_mb(None);
+            if let Some(free) = free {
+                eprintln!(
+                    "whisper: GPU disabled by VRAM guard (free {free} MB < min {min_free} MB)"
+                );
+            } else {
+                eprintln!(
+                    "whisper: GPU disabled by VRAM guard (min {min_free} MB; free unknown)"
+                );
+            }
             prefer_gpu = false;
         }
-        let (ctx, use_gpu) = create_whisper_context(&model_path, prefer_gpu)
+        let (ctx, use_gpu) = create_whisper_context(&model_path, prefer_gpu, gpu_device)
             .or_else(|err| {
                 if prefer_gpu {
                     eprintln!("whisper GPU init failed: {err:#}; falling back to CPU");
-                    create_whisper_context(&model_path, false)
+                    create_whisper_context(&model_path, false, None)
                 } else {
                     Err(err)
                 }
@@ -235,16 +263,15 @@ impl WhisperHandle {
 
     fn ensure_cpu_state(&mut self) -> Result<&mut whisper_rs::WhisperState> {
         if self.cpu_state.is_none() {
-            let (ctx, _) = create_whisper_context(&self.model_path, false)?;
+            let (ctx, _) = create_whisper_context(&self.model_path, false, None)?;
             eprintln!("whisper: creating CPU state for fallback");
             let state = ctx.create_state().context("creating whisper CPU state")?;
             self.cpu_ctx = Some(ctx);
             self.cpu_state = Some(state);
         }
-        Ok(self
-            .cpu_state
+        self.cpu_state
             .as_mut()
-            .expect("cpu state set when needed"))
+            .ok_or_else(|| anyhow::anyhow!("whisper CPU state missing after initialization"))
     }
 
     fn transcribe_with_mode(
@@ -331,7 +358,104 @@ fn whisper_prefers_gpu() -> bool {
     }
 }
 
-fn whisper_clip_prefers_gpu() -> bool {
+fn whisper_gpu_disabled_reason_from_env() -> Option<String> {
+    let env_val = env::var("WHISPER_GPU").unwrap_or_else(|_| "(unset)".to_string());
+    let disabled = env_val
+        .trim()
+        .is_empty()
+        || parse_bool_env(&env_val) == Some(false);
+    if !disabled {
+        return None;
+    }
+    let low_resource = env::var("CLIP_LOW_RESOURCES")
+        .ok()
+        .and_then(|v| parse_bool_env(&v))
+        .unwrap_or(false);
+    if low_resource {
+        return Some(format!(
+            "WHISPER_GPU={env_val} (CLIP_LOW_RESOURCES=1 forces CPU)"
+        ));
+    }
+    Some(format!("WHISPER_GPU={env_val}"))
+}
+
+fn whisper_min_free_vram_mb() -> u64 {
+    env::var("WHISPER_MIN_FREE_VRAM_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2048)
+}
+
+fn whisper_clip_min_free_vram_mb() -> u64 {
+    env::var("WHISPER_CLIP_MIN_FREE_VRAM_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(whisper_min_free_vram_mb)
+}
+
+fn whisper_clip_vram_factor() -> f64 {
+    env::var("WHISPER_CLIP_VRAM_FACTOR")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.35)
+}
+
+fn whisper_clip_vram_overhead_mb() -> u64 {
+    env::var("WHISPER_CLIP_VRAM_OVERHEAD_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(512)
+}
+
+fn whisper_clip_gpu_device_override() -> Option<u32> {
+    env::var("WHISPER_CLIP_GPU_DEVICE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+}
+
+fn whisper_gpu_device_override() -> Option<u32> {
+    env::var("WHISPER_GPU_DEVICE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+}
+
+fn whisper_gpu_allowed(label: &str) -> bool {
+    let min_free = whisper_min_free_vram_mb();
+    gpu::gpu_vram_allows(min_free, None, label)
+}
+
+fn whisper_clip_vram_requirement_mb(model_path: &Path) -> Option<u64> {
+    let meta = fs::metadata(model_path).ok()?;
+    let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
+    if !size_mb.is_finite() || size_mb <= 0.0 {
+        return None;
+    }
+    let required = size_mb * whisper_clip_vram_factor() + whisper_clip_vram_overhead_mb() as f64;
+    if !required.is_finite() || required <= 0.0 {
+        return None;
+    }
+    Some(required.ceil() as u64)
+}
+
+fn whisper_clip_pick_gpu_device(model_path: &Path) -> Option<u32> {
+    let min_free = whisper_clip_min_free_vram_mb();
+    let required = whisper_clip_vram_requirement_mb(model_path).unwrap_or(min_free);
+    let required = required.max(min_free);
+    if let Some(device) = whisper_clip_gpu_device_override() {
+        if gpu::gpu_vram_allows(required, Some(device), "whisper clip") {
+            return Some(device);
+        }
+        eprintln!(
+            "whisper clip: GPU device {device} has insufficient VRAM (need ~{required} MB); using CPU"
+        );
+        return None;
+    }
+    gpu::pick_best_nvidia_device(required, "whisper clip")
+}
+
+fn whisper_clip_gpu_device_for_model(model_path: &Path) -> Option<i32> {
     let prefer = match env::var("WHISPER_CLIP_GPU") {
         Ok(v) => {
             let trimmed = v.trim();
@@ -342,29 +466,23 @@ fn whisper_clip_prefers_gpu() -> bool {
         Err(_) => false,
     };
     if !prefer {
-        return false;
+        return None;
     }
-    whisper_gpu_allowed("whisper clip")
-}
-
-fn whisper_min_free_vram_mb() -> u64 {
-    env::var("WHISPER_MIN_FREE_VRAM_MB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2048)
-}
-
-fn whisper_gpu_allowed(label: &str) -> bool {
-    let min_free = whisper_min_free_vram_mb();
-    gpu::gpu_vram_allows(min_free, None, label)
+    whisper_clip_pick_gpu_device(model_path).map(|v| v as i32)
 }
 
 fn create_whisper_context(
     model_path: &Path,
     use_gpu: bool,
+    gpu_device: Option<i32>,
 ) -> Result<(&'static WhisperContext, bool)> {
     let mut wparams = WhisperContextParameters::default();
     wparams.use_gpu = use_gpu;
+    if use_gpu {
+        if let Some(device) = gpu_device {
+            wparams.gpu_device = device;
+        }
+    }
 
     eprintln!("whisper: initializing context (use_gpu={use_gpu})");
     let ctx = WhisperContext::new_with_params(
@@ -709,10 +827,11 @@ fn benchmark_model_rt(path: &Path) -> Option<f32> {
     let audio: Vec<f32> = vec![0.0; samples];
 
     let prefer_gpu = whisper_prefers_gpu();
-    let (ctx, _use_gpu) = create_whisper_context(path, prefer_gpu)
+    let device = whisper_gpu_device_override().map(|v| v as i32);
+    let (ctx, _use_gpu) = create_whisper_context(path, prefer_gpu, device)
         .or_else(|_| {
             if prefer_gpu {
-                create_whisper_context(path, false)
+                create_whisper_context(path, false, None)
             } else {
                 Err(anyhow::anyhow!("whisper init failed"))
             }
@@ -739,7 +858,11 @@ fn benchmark_model_rt(path: &Path) -> Option<f32> {
     Some(rt)
 }
 
-/// Listen to stream audio (HLS) via ffmpeg, run Whisper locally, and fire when the wake phrase is detected.
+/// Listen to stream audio (HLS) via ffmpeg, run Whisper locally, and fire when a wake phrase is detected.
+///
+/// This spawns a background thread that repeatedly reads audio from the HLS
+/// URL and updates `detect_ns`/`audio_ns`/`last_word_ns` counters for health
+/// monitoring.
 pub fn start_stream_wake_from_hls(
     media_url: Arc<Mutex<Url>>,
     model_path: &Path,
@@ -785,6 +908,9 @@ pub fn start_stream_wake_from_hls(
     Ok(())
 }
 
+/// Run the wake-word worker loop when the stream URL is written to disk.
+///
+/// This is the long-running worker used by the isolated whisper process.
 pub fn run_wake_worker_stream(
     media_url_path: &Path,
     model_path: &Path,
@@ -827,7 +953,9 @@ pub fn run_wake_worker_stream(
     )
 }
 
-/// Detect the wake phrase inside a local media file (TS/MP4/etc) and return its timestamp (seconds).
+/// Detect a wake phrase inside a local media file (TS/MP4/etc).
+///
+/// Returns the timestamp (seconds) where the wake phrase is first detected.
 pub fn detect_wake_in_file(
     input_path: &Path,
     model_path: &Path,
@@ -847,7 +975,10 @@ pub fn detect_wake_in_file(
     result
 }
 
-/// Listen to microphone audio via ffmpeg, run Whisper locally, and fire when the wake phrase is detected.
+/// Listen to microphone audio via ffmpeg, run Whisper locally, and fire when a wake phrase is detected.
+///
+/// This spawns a background thread and updates the shared timing counters used
+/// for health monitoring.
 pub fn start_mic_wake_with_ffmpeg(
     mic_device: Option<&str>,
     model_path: &Path,
@@ -885,6 +1016,7 @@ pub fn start_mic_wake_with_ffmpeg(
     Ok(())
 }
 
+/// Run the wake-word worker loop for microphone audio in a foreground task.
 pub fn run_wake_worker_mic(
     mic_device: Option<&str>,
     model_path: &Path,
@@ -1004,6 +1136,10 @@ fn transcribe_audio(
     }))
 }
 
+/// Transcribe a segment of audio input and return word timings.
+///
+/// `start_offset_secs`/`duration_secs` allow slicing, and `force_ts_input`
+/// controls ffmpeg probing when the input extension is ambiguous.
 #[allow(dead_code)]
 pub fn transcribe_words_from_input(
     input: &str,
@@ -1017,6 +1153,9 @@ pub fn transcribe_words_from_input(
     )
 }
 
+/// Transcribe clip audio into a payload containing text and word timings.
+///
+/// Requires a finite `duration_secs` so timestamps are bounded.
 pub fn transcribe_clip_audio(
     input: &str,
     start_offset_secs: Option<f32>,
@@ -1065,7 +1204,12 @@ pub fn transcribe_clip_audio(
     }
 
     let model_path = select_best_model_path();
-    let mut whisper = WhisperHandle::new_with_gpu(&model_path, whisper_clip_prefers_gpu())?;
+    let clip_device = whisper_clip_gpu_device_for_model(&model_path);
+    let mut whisper = WhisperHandle::new_with_gpu_device(
+        &model_path,
+        clip_device.is_some(),
+        clip_device,
+    )?;
     log_whisper_backend();
 
     let (mut ffmpeg, mut pcm_reader) =
@@ -1589,15 +1733,18 @@ fn match_wake_text<'a>(
 }
 
 fn log_whisper_backend() {
-    let cublas = env::var("WHISPER_CUBLAS").unwrap_or_else(|_| "(unset)".to_string());
     let ggml_log = env::var("GGML_LOG_LEVEL").unwrap_or_else(|_| "(unset)".to_string());
     let whisper_gpu_env = env::var("WHISPER_GPU").unwrap_or_else(|_| "(unset)".to_string());
+    let whisper_clip_gpu_env =
+        env::var("WHISPER_CLIP_GPU").unwrap_or_else(|_| "(unset)".to_string());
     let nvidia_present = detect_nvidia_gpus_present();
     eprintln!(
-        "whisper backend: use_gpu=true (requested); WHISPER_CUBLAS={cublas}; WHISPER_GPU={whisper_gpu_env}; GGML_LOG_LEVEL={ggml_log}; nvidia_detected={nvidia_present}"
+        "whisper backend: use_gpu=true (requested); WHISPER_GPU={whisper_gpu_env}; WHISPER_CLIP_GPU={whisper_clip_gpu_env}; GGML_LOG_LEVEL={ggml_log}; nvidia_detected={nvidia_present}"
     );
-    if cublas == "(unset)" {
-        eprintln!("whisper backend warning: WHISPER_CUBLAS not set; if the binary wasn't built with CUDA, inference will fall back to CPU");
+    if !nvidia_present {
+        eprintln!(
+            "whisper backend warning: no NVIDIA GPU detected; GPU requests may fall back to CPU"
+        );
     }
 }
 
@@ -1616,6 +1763,7 @@ fn detect_nvidia_gpus_present() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::EnvGuard;
 
     #[test]
     fn normalize_basic() {
@@ -1644,16 +1792,11 @@ mod tests {
     #[test]
     fn transcribe_clip_audio_uses_test_transcript() -> Result<()> {
         let key = "CLIP_TEST_TRANSCRIPT";
-        let prev = env::var(key).ok();
-        env::set_var(key, "hello world");
+        let mut env = EnvGuard::new();
+        env.set(key, "hello world");
         let payload = transcribe_clip_audio("missing.mp4", None, Some(1.0), false)?;
         assert_eq!(payload.text, "hello world");
         assert!(!payload.words.is_empty());
-        if let Some(value) = prev {
-            env::set_var(key, value);
-        } else {
-            env::remove_var(key);
-        }
         Ok(())
     }
 }
