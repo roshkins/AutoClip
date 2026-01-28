@@ -909,6 +909,22 @@ fn split_analysis_budget(
     (Some(face_budget), gameplay_budget)
 }
 
+fn gameplay_budget_with_fallback(
+    analysis_budget: Option<Duration>,
+    gameplay_budget: Option<Duration>,
+) -> Option<Duration> {
+    let has_budget = analysis_budget
+        .filter(|budget| budget.as_secs_f32() > 0.05)
+        .is_some();
+    if has_budget {
+        gameplay_budget.or(Some(Duration::from_secs_f32(
+            DEFAULT_GAMEPLAY_BUDGET_MIN_SECS,
+        )))
+    } else {
+        gameplay_budget
+    }
+}
+
 /// Run a sweep over face-score thresholds to evaluate model behavior.
 pub async fn run_face_threshold_sweep(
     positives: &[String],
@@ -1469,6 +1485,8 @@ pub async fn detect_layout_hints(
     }
     if gameplay_detection && gameplay_total_samples > 0 {
         let _span = profile_span("clip detect: gameplay sampling");
+        let gameplay_budget =
+            gameplay_budget_with_fallback(config.analysis_budget, gameplay_budget);
         if has_budget && gameplay_budget.is_none() {
             eprintln!("clip detect: gameplay time budget 0.0s; skipping gameplay samples");
         } else {
@@ -1481,10 +1499,11 @@ pub async fn detect_layout_hints(
             let use_reticle = clip_detector.is_none();
             let labels = gameplay_labels.as_ref();
             let cfg = gameplay_config.as_ref();
+            let min_gameplay_samples = 3usize;
             for (idx, seek) in gameplay_sample_times.iter().copied().enumerate() {
                 if let Some(budget) = gameplay_budget {
                     let elapsed = gameplay_start.elapsed();
-                    if elapsed >= budget {
+                    if elapsed >= budget && gameplay_samples_attempted >= min_gameplay_samples {
                         eprintln!(
                             "clip detect: gameplay time budget {:.1}s hit after {}/{} sample(s); stopping early",
                             budget.as_secs_f32(),
@@ -3352,9 +3371,10 @@ fn filter_face_id_candidates(
     frame: &FaceFrame,
     candidates: Vec<FaceCandidate>,
 ) -> Vec<FaceCandidate> {
+    let all_candidates = candidates;
     let mut kept = Vec::new();
     let mut best_sim: Option<f32> = None;
-    for candidate in candidates {
+    for candidate in all_candidates.iter().copied() {
         let sim = match matcher.matches_candidate(frame, candidate.model_rect) {
             Some(v) => v,
             None => continue,
@@ -3376,7 +3396,12 @@ fn filter_face_id_candidates(
             eprintln!("face id: no candidates to score");
         }
     }
-    kept
+    if kept.is_empty() {
+        eprintln!("face id: no candidates matched; falling back to raw faces");
+        all_candidates
+    } else {
+        kept
+    }
 }
 
 fn face_dump_dir() -> Option<PathBuf> {
@@ -6993,6 +7018,22 @@ mod tests {
             summed <= total.as_secs_f32() + 0.01,
             "face + gameplay should fit in total budget"
         );
+    }
+
+    #[test]
+    fn gameplay_budget_fallback_applies_when_total_budget_present() {
+        let total = Duration::from_secs_f32(15.0);
+        let fallback = gameplay_budget_with_fallback(Some(total), None);
+        assert_eq!(
+            fallback,
+            Some(Duration::from_secs_f32(DEFAULT_GAMEPLAY_BUDGET_MIN_SECS))
+        );
+    }
+
+    #[test]
+    fn gameplay_budget_fallback_respects_missing_budget() {
+        let fallback = gameplay_budget_with_fallback(None, None);
+        assert_eq!(fallback, None);
     }
 
     #[test]

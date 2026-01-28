@@ -4964,6 +4964,9 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "M3U8_PAGE_URL", mode: EnvValueMode::Required },
     EnvSpec { env: "COOKIE_HEADER", mode: EnvValueMode::Required },
     EnvSpec { env: "KICK_COOKIE", mode: EnvValueMode::Required },
+    EnvSpec { env: "KICK_CLIENT_ID", mode: EnvValueMode::Optional },
+    EnvSpec { env: "KICK_CLIENT_SECRET", mode: EnvValueMode::Optional },
+    EnvSpec { env: "KICK_OAUTH_SCOPE", mode: EnvValueMode::Optional },
     EnvSpec { env: "TIKTOK_COOKIE", mode: EnvValueMode::Required },
     EnvSpec { env: "TWITCH_COOKIE", mode: EnvValueMode::Required },
     EnvSpec { env: "HEADLESS_M3U8_SCRIPT", mode: EnvValueMode::Required },
@@ -6575,6 +6578,25 @@ async fn main() -> Result<()> {
             };
             return run_reprocess_ts(path).await;
         }
+        if cmd.eq_ignore_ascii_case("kick-profile") {
+            let Some(page_url) = positionals.get(1) else {
+                eprintln!("usage: autoclip kick-profile <kick_channel_url>");
+                return Ok(());
+            };
+            let page_url = normalize_page_url(page_url);
+            match face_id::fetch_profile_image_url(&page_url).await {
+                Ok(Some(url)) => {
+                    println!("kick profile image: {url}");
+                }
+                Ok(None) => {
+                    println!("kick profile image: not found");
+                }
+                Err(err) => {
+                    println!("kick profile image: error: {err:#}");
+                }
+            }
+            return Ok(());
+        }
         if cmd.eq_ignore_ascii_case("kick-vod") || cmd.eq_ignore_ascii_case("kick-latest-vod") {
             let Some(page_url) = positionals.get(1) else {
                 eprintln!("usage: autoclip kick-vod <kick_channel_url>");
@@ -6670,7 +6692,7 @@ async fn main() -> Result<()> {
     }
 
     if page_url_arg.is_none() && std::env::var("CLIP_PAGE_URL").is_err() {
-        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-ts <ts_path> | autoclip reprocess-ts <ts_path> | autoclip kick-vod <kick_channel_url> | autoclip check-gameplay-model [model_dir] | autoclip demo-wakeword-mic <page_url> [--phrase WORDS] [--no-log-raw-wake] | autoclip face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
+    eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-ts <ts_path> | autoclip reprocess-ts <ts_path> | autoclip kick-profile <kick_channel_url> | autoclip kick-vod <kick_channel_url> | autoclip check-gameplay-model [model_dir] | autoclip demo-wakeword-mic <page_url> [--phrase WORDS] [--no-log-raw-wake] | autoclip face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
         return Ok(());
     }
 
@@ -7798,6 +7820,7 @@ fn print_help(bin: &str) {
     println!("  {bin} demo-hls-buffer <page_url>");
     println!("  {bin} demo-ts <path_to_ts> [--phrase WORDS] [--no-log-raw-wake]");
     println!("  {bin} reprocess-ts <path_to_ts>");
+    println!("  {bin} kick-profile <kick_channel_url>");
     println!("  {bin} kick-vod <kick_channel_url>");
     println!("  {bin} check-gameplay-model [model_dir]");
     println!("  {bin} demo-detect <media_path>");
@@ -7957,6 +7980,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_STREAM_OFFLINE_SECS Exit if no new segments for N seconds (default 120)");
     println!("  CLIP_WAKE_WORDS          Wake phrase list (comma/pipe separated) for clip trigger");
     println!("  CLIP_PROFILE             Enable timing logs for hotspots (default false)");
+    println!("  CLIP_PROFILE_LOG         Write profiling spans to log file when set");
     println!("  CLIP_EMOTION_ENABLE      Enable emotion triggers from audio/face (default false)");
     println!("  CLIP_EMOTION_WORDS       Emotion keyword list (comma/pipe separated)");
     println!("  CLIP_EMOTION_THRESHOLD   Emotion score threshold (default 1.5)");
@@ -7976,6 +8000,8 @@ fn print_help(bin: &str) {
     println!("  CLIP_TS_REALTIME         When set, read local TS files at realtime speed");
     println!("  M3U8_URL_OVERRIDE        Skip discovery; use this master URL directly");
     println!("  COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE / TWITCH_COOKIE   Cookies to send on discovery");
+    println!("  KICK_CLIENT_ID / KICK_CLIENT_SECRET   Kick API app credentials (optional, for profile image)");
+    println!("  KICK_OAUTH_SCOPE       Optional Kick OAuth scope override (space-separated)");
     println!("  HEADLESS_M3U8_SCRIPT / HEADLESS_M3U8_SCRIPT_TIKTOK   Override Playwright scripts");
     println!("  WAKE_REFRACTORY_SECS     Cooldown between wake detections (default 12)");
     println!("  WAKE_BUFFER_HEADROOM_SECS   Extra buffer headroom for wake timing (default 20)");
@@ -8588,6 +8614,32 @@ mod tests {
         };
         let srt = build_srt_from_payload(&payload, Some(1.0)).unwrap();
         assert!(srt.contains("Hello world"));
+    }
+
+    #[test]
+    fn captions_merge_words_with_same_start_time() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_CAPTIONS_BUCKET_SECS", "");
+        let payload = TranscriptPayload {
+            text: "Hello world".to_string(),
+            words: vec![
+                WordTiming {
+                    text: "Hello".to_string(),
+                    norm: "hello".to_string(),
+                    t0: 0.2,
+                    t1: 0.4,
+                },
+                WordTiming {
+                    text: "world".to_string(),
+                    norm: "world".to_string(),
+                    t0: 0.2,
+                    t1: 0.5,
+                },
+            ],
+        };
+        let srt = build_srt_from_payload(&payload, Some(1.0)).unwrap();
+        assert!(srt.contains("Hello world"));
+        assert_eq!(srt.matches("Hello").count(), 1);
     }
 
     #[test]

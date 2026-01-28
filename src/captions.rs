@@ -315,6 +315,7 @@ pub(crate) fn build_caption_words(
     words.sort_by(|a, b| a.t0.partial_cmp(&b.t0).unwrap_or(std::cmp::Ordering::Equal));
     let mut out = Vec::new();
     let min_word = cfg.min_word_secs.max(0.04);
+    const SAME_START_EPS: f32 = 0.001;
     for (idx, word) in words.iter().enumerate() {
         if out.len() >= cfg.max_words {
             break;
@@ -433,6 +434,175 @@ pub(crate) fn wrap_caption_text(text: &str, max_len: usize) -> String {
     text.to_string()
 }
 
+fn wrap_caption_text_by_width(
+    text: &str,
+    max_width_px: f32,
+    font_name: &str,
+    font_size: f32,
+) -> String {
+    if text.trim().is_empty() || max_width_px <= 0.0 {
+        return text.trim().to_string();
+    }
+    let Some(_) = measure_text_width_px(text, font_name, font_size) else {
+        return wrap_caption_text(text, 42);
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{} {}", current, word)
+        };
+        if fits_width(&candidate, max_width_px, font_name, font_size) {
+            current = candidate;
+            continue;
+        }
+        if current.is_empty() {
+            let parts = split_word_by_width(word, max_width_px, font_name, font_size);
+            let parts_len = parts.len();
+            for (idx, part) in parts.into_iter().enumerate() {
+                if idx + 1 == parts_len {
+                    current = part;
+                } else {
+                    lines.push(part);
+                }
+            }
+        } else {
+            lines.push(current);
+            current = word.to_string();
+            if !fits_width(&current, max_width_px, font_name, font_size) {
+                let parts = split_word_by_width(&current, max_width_px, font_name, font_size);
+                let parts_len = parts.len();
+                current.clear();
+                for (idx, part) in parts.into_iter().enumerate() {
+                    if idx + 1 == parts_len {
+                        current = part;
+                    } else {
+                        lines.push(part);
+                    }
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines.join("\n")
+}
+
+fn fits_width(text: &str, max_width_px: f32, font_name: &str, font_size: f32) -> bool {
+    match measure_text_width_px(text, font_name, font_size) {
+        Some(width) => width <= max_width_px,
+        None => true,
+    }
+}
+
+fn split_word_by_width(
+    word: &str,
+    max_width_px: f32,
+    font_name: &str,
+    font_size: f32,
+) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in word.chars() {
+        let candidate = format!("{}{}", current, ch);
+        if fits_width(&candidate, max_width_px, font_name, font_size) || current.is_empty() {
+            current = candidate;
+        } else {
+            parts.push(current);
+            current = ch.to_string();
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+fn max_line_width_px(text: &str, font_name: &str, font_size: f32) -> Option<f32> {
+    let mut max_width = 0.0;
+    for line in text.split('\n') {
+        let width = measure_text_width_px(line, font_name, font_size)?;
+        if width > max_width {
+            max_width = width;
+        }
+    }
+    Some(max_width)
+}
+
+#[cfg(windows)]
+fn measure_text_width_px(text: &str, font_name: &str, font_size: f32) -> Option<f32> {
+    use windows_sys::Win32::Foundation::SIZE;
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateFontW, DeleteDC, DeleteObject, GetTextExtentPoint32W,
+        SelectObject, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DEFAULT_QUALITY,
+        FF_DONTCARE, FW_NORMAL, OUT_DEFAULT_PRECIS,
+    };
+    if text.is_empty() {
+        return Some(0.0);
+    }
+    let hdc = unsafe { CreateCompatibleDC(0) };
+    if hdc == 0 {
+        return None;
+    }
+    let height = -(font_size.round().max(1.0) as i32);
+    let font_w = to_wide(font_name);
+    let hfont = unsafe {
+        CreateFontW(
+            height,
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            DEFAULT_QUALITY as u32,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32,
+            font_w.as_ptr(),
+        )
+    };
+    if hfont == 0 {
+        unsafe {
+            DeleteDC(hdc);
+        }
+        return None;
+    }
+    let old = unsafe { SelectObject(hdc, hfont as isize) };
+    let text_w = to_wide(text);
+    let mut size = SIZE { cx: 0, cy: 0 };
+    let ok = unsafe {
+        GetTextExtentPoint32W(hdc, text_w.as_ptr(), (text_w.len() - 1) as i32, &mut size)
+    };
+    unsafe {
+        SelectObject(hdc, old);
+        DeleteObject(hfont as isize);
+        DeleteDC(hdc);
+    }
+    if ok == 0 {
+        None
+    } else {
+        Some(size.cx as f32)
+    }
+}
+
+#[cfg(not(windows))]
+fn measure_text_width_px(_text: &str, _font_name: &str, _font_size: f32) -> Option<f32> {
+    None
+}
+
+#[cfg(windows)]
+fn to_wide(text: &str) -> Vec<u16> {
+    let mut out: Vec<u16> = text.encode_utf16().collect();
+    out.push(0);
+    out
+}
+
 fn is_special_whisper_token(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -489,8 +659,9 @@ fn build_caption_cues(
     let mut cues: Vec<(f32, f32, String)> = Vec::new();
     let mut added = 0usize;
     let mut current_bucket: Option<u64> = None;
+    const SAME_START_EPS: f32 = 0.001;
 
-    for word in words {
+    for (idx, word) in words.iter().enumerate() {
         if added >= max_words {
             break;
         }
@@ -534,6 +705,12 @@ fn build_caption_cues(
 
         let start = word.t0.max(0.0);
         let mut end = word.t1.max(start + min_word);
+        if let Some(next) = words.get(idx + 1) {
+            if next.t0.is_finite() && next.t0 > start {
+                let cap = (next.t0 - 0.01).max(start + min_word);
+                end = end.min(cap);
+            }
+        }
         if end > duration {
             end = duration;
         }
@@ -546,6 +723,17 @@ fn build_caption_cues(
                 last.2.push_str(&cleaned);
             }
             continue;
+        }
+        if let Some(last) = cues.last_mut() {
+            if (last.0 - start).abs() <= SAME_START_EPS {
+                if !last.2.is_empty() {
+                    last.2.push(' ');
+                }
+                last.2.push_str(&cleaned);
+                last.1 = last.1.max(end);
+                added = added.saturating_add(1);
+                continue;
+            }
         }
         cues.push((start, end, cleaned));
         added = added.saturating_add(1);
@@ -670,17 +858,22 @@ pub(crate) fn build_ass_from_payload_with_limits(
     out.push_str("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
 
     let fixed_size = if scale_lock {
-        let max_units = cues
+        let max_width = cues
             .iter()
             .map(|(_, _, text)| {
-                let line = wrap_caption_text(text, 42);
-                line.split('\n')
-                    .map(|segment| segment.chars().map(char_width_units).sum::<f32>())
-                    .fold(0.0, f32::max)
+                let line = wrap_caption_text_by_width(text, max_w, &font_name, base_size);
+                if let Some(width) = max_line_width_px(&line, &font_name, base_size) {
+                    width
+                } else {
+                    line.split('\n')
+                        .map(|segment| segment.chars().map(char_width_units).sum::<f32>())
+                        .fold(0.0, f32::max)
+                        * glyph_ratio
+                }
             })
             .fold(0.0, f32::max);
-        if max_units > 0.0 {
-            let scaled = max_w / (max_units * glyph_ratio);
+        if max_width > 0.0 {
+            let scaled = max_w / max_width * base_size;
             scaled.clamp(base_size * min_scale, base_size * max_scale)
         } else {
             base_size
@@ -690,21 +883,26 @@ pub(crate) fn build_ass_from_payload_with_limits(
     };
 
     for (start, end, text) in cues {
-        let line = wrap_caption_text(&text, 42);
+        let line = wrap_caption_text_by_width(&text, max_w, &font_name, base_size);
         let mut escaped = escape_ass_text(&line);
         escaped = escaped.replace('\n', "\\N");
         let size = if scale_lock {
             fixed_size
         } else {
-            let max_units = line
-                .split('\n')
-                .map(|segment| segment.chars().map(char_width_units).sum::<f32>())
-                .fold(0.0, f32::max);
-            if max_units > 0.0 {
-                let scaled = max_w / (max_units * glyph_ratio);
+            if let Some(width) = max_line_width_px(&line, &font_name, base_size) {
+                let scaled = max_w / width * base_size;
                 scaled.clamp(base_size * min_scale, base_size * max_scale)
             } else {
-                base_size
+                let max_units = line
+                    .split('\n')
+                    .map(|segment| segment.chars().map(char_width_units).sum::<f32>())
+                    .fold(0.0, f32::max);
+                if max_units > 0.0 {
+                    let scaled = max_w / (max_units * glyph_ratio);
+                    scaled.clamp(base_size * min_scale, base_size * max_scale)
+                } else {
+                    base_size
+                }
             }
         };
         let x_center = out_w as f32 / 2.0;
@@ -716,6 +914,19 @@ pub(crate) fn build_ass_from_payload_with_limits(
             override_tag,
             escaped
         ));
+        if cfg.debug {
+            let width = max_line_width_px(&line, &font_name, size)
+                .unwrap_or_else(|| line.chars().map(char_width_units).sum::<f32>() * size * glyph_ratio);
+            eprintln!(
+                "captions: ass cue {:.2}-{:.2} size {:.1}px width {:.1}/{:.1} text '{}'",
+                start,
+                end,
+                size,
+                width,
+                max_w,
+                line.replace('\n', " | ")
+            );
+        }
     }
 
     Some(out)
@@ -806,21 +1017,37 @@ pub(crate) fn build_drawtext_caption_filter_with_limit(
         .unwrap_or(2.5);
     let max_w = (out_w as f32 * width_ratio - (cfg.outline as f32 * 2.0)).max(8.0);
     let base_size = cfg.font_size.round().max(8.0);
+    let font_name = cfg
+        .font
+        .as_ref()
+        .and_then(|font| {
+            let font_path = Path::new(font);
+            if font_path.exists() {
+                font_name_from_path(font_path)
+            } else {
+                Some(font.clone())
+            }
+        })
+        .unwrap_or_else(|| "Arial".to_string());
     let y = y.round().clamp(0.0, out_h as f32);
     let fixed_size = if scale_lock {
-        let max_units = cues
+        let max_width = cues
             .iter()
             .map(|(_, _, text)| {
-                let line = wrap_caption_text(text, 42);
-                line.split('\n')
-                    .map(|segment| segment.chars().map(char_width_units).sum::<f32>())
-                    .fold(0.0, f32::max)
+                let line = wrap_caption_text_by_width(text, max_w, &font_name, base_size);
+                if let Some(width) = max_line_width_px(&line, &font_name, base_size) {
+                    width
+                } else {
+                    line.split('\n')
+                        .map(|segment| segment.chars().map(char_width_units).sum::<f32>())
+                        .fold(0.0, f32::max)
+                        * glyph_ratio
+                }
             })
             .fold(0.0, f32::max);
-        if max_units > 0.0 {
-            let scaled = max_w / (max_units * glyph_ratio);
-            let size = scaled.clamp(base_size * min_scale, base_size * max_scale);
-            size
+        if max_width > 0.0 {
+            let scaled = max_w / max_width * base_size;
+            scaled.clamp(base_size * min_scale, base_size * max_scale)
         } else {
             base_size
         }
@@ -831,7 +1058,7 @@ pub(crate) fn build_drawtext_caption_filter_with_limit(
     let cue_count = cues.len();
     let mut chain: Vec<String> = Vec::new();
     for (start, end, text) in cues {
-        let line = wrap_caption_text(&text, 42);
+        let line = wrap_caption_text_by_width(&text, max_w, &font_name, base_size);
         let mut text_value = escape_drawtext_value(&line);
         text_value = text_value.replace('\n', "\\n");
 
@@ -842,9 +1069,15 @@ pub(crate) fn build_drawtext_caption_filter_with_limit(
         if scale_lock {
             parts.push(format!("fontsize={fixed_size:.2}"));
         } else {
-            parts.push(format!(
-                "fontsize=(max({base_size:.2}*{min_scale:.2}\\,min({base_size:.2}*{max_scale:.2}\\,{max_w:.2}/max(text_w\\,1)*{base_size:.2})))"
-            ));
+            if let Some(width) = max_line_width_px(&line, &font_name, base_size) {
+                let scaled = max_w / width * base_size;
+                let size = scaled.clamp(base_size * min_scale, base_size * max_scale);
+                parts.push(format!("fontsize={size:.2}"));
+            } else {
+                parts.push(format!(
+                    "fontsize=(max({base_size:.2}*{min_scale:.2}\\,min({base_size:.2}*{max_scale:.2}\\,{max_w:.2}/max(text_w\\,1)*{base_size:.2})))"
+                ));
+            }
         }
         if let Some(font) = cfg.font.as_ref() {
             parts.push(drawtext_font_arg(font));
@@ -860,6 +1093,18 @@ pub(crate) fn build_drawtext_caption_filter_with_limit(
         parts.push(format!("enable='between(t,{start:.3},{end:.3})'"));
 
         chain.push(format!("drawtext={}", parts.join(":")));
+        if cfg.debug {
+            let width = max_line_width_px(&line, &font_name, base_size)
+                .unwrap_or_else(|| line.chars().map(char_width_units).sum::<f32>() * base_size * glyph_ratio);
+            eprintln!(
+                "captions: drawtext cue {:.2}-{:.2} width {:.1}/{:.1} text '{}'",
+                start,
+                end,
+                width,
+                max_w,
+                line.replace('\n', " | ")
+            );
+        }
     }
 
     DrawtextBuildResult::Chain {

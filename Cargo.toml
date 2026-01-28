@@ -25,7 +25,7 @@ whisper = ["whisper-rs"]
 ort = ["dep:ort"]
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Gdi"] }
 
 [target.'cfg(not(windows))'.dependencies]
 fs2 = "0.4"
