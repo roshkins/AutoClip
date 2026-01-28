@@ -145,6 +145,24 @@ fn expand_rect_width_to_aspect(rect: NormalizedRect, target_aspect: f32) -> Norm
     NormalizedRect::from_center(rect.center().clamp_unit(), new_w, rect.h)
 }
 
+fn ensure_min_face_rect(
+    rect: NormalizedRect,
+    bounds: NormalizedRect,
+    min_ratio: f32,
+    target_aspect: f32,
+) -> NormalizedRect {
+    let bounds = normalize_bounds(bounds);
+    let min_ratio = min_ratio.clamp(MIN_CROP_RATIO, 1.0);
+    let min_h = (bounds.h * min_ratio).clamp(MIN_CROP_RATIO, bounds.h);
+    let mut min_w = min_h;
+    if target_aspect.is_finite() && target_aspect > 0.0 {
+        min_w = (min_h * target_aspect).clamp(MIN_CROP_RATIO, bounds.w);
+    }
+    let w = rect.w.max(min_w).min(bounds.w.max(MIN_CROP_RATIO));
+    let h = rect.h.max(min_h).min(bounds.h.max(MIN_CROP_RATIO));
+    centered_rect_in_bounds(rect.center().clamp_unit(), w, h, bounds)
+}
+
 fn frame_rect_for_face(
     face_rect: NormalizedRect,
     spec: FaceFrameSpec,
@@ -526,9 +544,31 @@ pub fn build_stacked_filter_graph(
     let face_h = dims.face_h;
     let game_h = dims.game_h;
     let target_aspect = out_w as f32 / face_h as f32;
-    let face_rect = face_crop_rect(layout, hints, target_aspect);
-    let face_rect = face_rect.map(|rect| expand_rect_width_to_aspect(rect, target_aspect));
-    let tracked = build_tracked_face_crop(layout, hints, target_aspect);
+    let bounds = hints.face_region.unwrap_or(NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    });
+    let min_ratio = env::var("CLIP_FACE_MIN_STACKED_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.clamp(0.1, 1.0))
+        .unwrap_or(0.25);
+    let center_override = hints
+        .face_focus
+        .or_else(|| hints.face_box.map(|b| b.center()))
+        .map(|c| c.clamp_unit());
+    let face_rect = face_crop_rect(layout, hints, target_aspect).map(|rect| {
+        let mut rect = rect;
+        if let Some(center) = center_override {
+            rect = centered_rect_in_bounds(center, rect.w, rect.h, bounds);
+        }
+        rect = ensure_min_face_rect(rect, bounds, min_ratio, target_aspect);
+        expand_rect_width_to_aspect(rect, target_aspect)
+    });
+    let tracked = build_tracked_face_crop(layout, hints, target_aspect, Some(min_ratio));
     let face_crop = if let Some(tracked) = tracked {
         tracked.crop_expr
     } else {
@@ -563,7 +603,7 @@ pub fn build_face_only_filter_graph(
     let target_aspect = out_w as f32 / out_h as f32;
     let face_rect = face_crop_rect(layout, hints, target_aspect);
     let face_rect = face_rect.map(|rect| expand_rect_width_to_aspect(rect, target_aspect));
-    let tracked = build_tracked_face_crop(layout, hints, target_aspect);
+    let tracked = build_tracked_face_crop(layout, hints, target_aspect, None);
     let face_crop = if let Some(tracked) = tracked {
         tracked.crop_expr
     } else {
@@ -813,6 +853,7 @@ fn build_tracked_face_crop(
     layout: &ClipLayoutConfig,
     hints: &ClipLayoutHints,
     target_aspect: f32,
+    min_ratio: Option<f32>,
 ) -> Option<TrackedFaceCrop> {
     if layout.face_crop.is_some() {
         return None;
@@ -838,6 +879,9 @@ fn build_tracked_face_crop(
 
     let mut samples: Vec<TrackSample> = Vec::with_capacity(points.len());
     let frame_spec = hints.face_frame_spec;
+    let min_ratio = min_ratio
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.clamp(MIN_CROP_RATIO, 1.0));
     for point in points {
         let rect = if let Some(spec) = frame_spec {
             frame_rect_for_face(point.rect, spec, target_aspect, bounds)
@@ -845,6 +889,11 @@ fn build_tracked_face_crop(
             expand_rect_in_bounds(point.rect, layout.face_context_scale, bounds)
         };
         let rect = expand_rect_width_to_aspect(rect, target_aspect);
+        let rect = if let Some(min_ratio) = min_ratio {
+            ensure_min_face_rect(rect, bounds, min_ratio, target_aspect)
+        } else {
+            rect
+        };
         let rect = apply_face_zoom(rect, layout.face_zoom, bounds);
         samples.push(TrackSample {
             time: point.time.max(0.0),

@@ -3,9 +3,11 @@
 //! These helpers call `nvidia-smi` to decide whether GPU usage is safe and
 //! provide a simple lease mechanism to avoid concurrent GPU-heavy workloads.
 
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn parse_nvidia_smi_entries(stdout: &str) -> Vec<(u32, u64)> {
     let mut entries = Vec::new();
@@ -14,6 +16,23 @@ fn parse_nvidia_smi_entries(stdout: &str) -> Vec<(u32, u64)> {
         if parts.len() >= 2 {
             if let (Ok(idx), Ok(mem)) = (parts[0].parse::<u32>(), parts[1].parse::<u64>()) {
                 entries.push((idx, mem));
+            }
+        }
+    }
+    entries
+}
+
+fn parse_nvidia_smi_entries_util(stdout: &str) -> Vec<(u32, u64, u64)> {
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 3 {
+            if let (Ok(idx), Ok(util), Ok(mem_util)) = (
+                parts[0].parse::<u32>(),
+                parts[1].parse::<u64>(),
+                parts[2].parse::<u64>(),
+            ) {
+                entries.push((idx, util, mem_util));
             }
         }
     }
@@ -131,18 +150,7 @@ pub fn query_nvidia_free_vram_all() -> Option<Vec<(u32, u64)>> {
 
 /// Pick the NVIDIA device with the most free VRAM that meets `min_free_mb`.
 pub fn pick_best_nvidia_device(min_free_mb: u64, label: &str) -> Option<u32> {
-    let reserve = gpu_vram_reserve_mb();
-    let required = min_free_mb.saturating_add(reserve);
-    let mut entries = query_nvidia_free_vram_all()?;
-    entries.retain(|(_, mem)| *mem >= required);
-    if entries.is_empty() {
-        eprintln!(
-            "gpu vram guard: no GPU meets {required} MB (min {min_free_mb} + reserve {reserve}) for {label}"
-        );
-        return None;
-    }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
-    entries.first().map(|(idx, _)| *idx)
+    pick_best_nvidia_device_with_exclusions(min_free_mb, None, label)
 }
 
 /// Pick the NVIDIA device with the most free VRAM excluding a specific device.
@@ -151,11 +159,182 @@ pub fn pick_best_nvidia_device_excluding(
     exclude: Option<u32>,
     label: &str,
 ) -> Option<u32> {
+    pick_best_nvidia_device_with_exclusions(min_free_mb, exclude, label)
+}
+
+/// Pick the NVIDIA device using an explicit strategy ("free" or "total").
+pub fn pick_best_nvidia_device_with_strategy(
+    min_free_mb: u64,
+    label: &str,
+    strategy: &str,
+) -> Option<u32> {
+    let normalized = strategy.trim().to_ascii_lowercase();
+    pick_best_nvidia_device_with_exclusions_and_strategy(min_free_mb, None, label, &normalized)
+}
+
+fn gpu_pick_strategy() -> String {
+    env::var("GPU_PICK_STRATEGY")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "free".to_string())
+}
+
+pub fn query_nvidia_total_vram_all() -> Option<Vec<(u32, u64)>> {
+    let output = Command::new("nvidia-smi")
+        .arg("--query-gpu=index,memory.total")
+        .arg("--format=csv,noheader,nounits")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let entries = parse_nvidia_smi_entries(&stdout);
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
+/// Query GPU utilization for all NVIDIA devices (percent).
+pub fn query_nvidia_utilization_all() -> Option<Vec<(u32, u64, u64)>> {
+    let output = Command::new("nvidia-smi")
+        .arg("--query-gpu=index,utilization.gpu,utilization.memory")
+        .arg("--format=csv,noheader,nounits")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let entries = parse_nvidia_smi_entries_util(&stdout);
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
+/// Log a VRAM/utilization snapshot for all NVIDIA devices.
+pub fn log_nvidia_snapshot(label: &str) {
+    let free = query_nvidia_free_vram_all();
+    let total = query_nvidia_total_vram_all();
+    let util = query_nvidia_utilization_all();
+
+    if free.is_none() && total.is_none() && util.is_none() {
+        eprintln!("gpu snapshot ({label}): nvidia-smi unavailable");
+        return;
+    }
+
+    let mut indices = BTreeSet::new();
+    let mut free_map: HashMap<u32, u64> = HashMap::new();
+    let mut total_map: HashMap<u32, u64> = HashMap::new();
+    let mut util_map: HashMap<u32, (u64, u64)> = HashMap::new();
+
+    if let Some(entries) = free {
+        for (idx, mb) in entries {
+            indices.insert(idx);
+            free_map.insert(idx, mb);
+        }
+    }
+    if let Some(entries) = total {
+        for (idx, mb) in entries {
+            indices.insert(idx);
+            total_map.insert(idx, mb);
+        }
+    }
+    if let Some(entries) = util {
+        for (idx, gpu_util, mem_util) in entries {
+            indices.insert(idx);
+            util_map.insert(idx, (gpu_util, mem_util));
+        }
+    }
+
+    for idx in indices {
+        let free_s = free_map
+            .get(&idx)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let total_s = total_map
+            .get(&idx)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let (gpu_util_s, mem_util_s) = util_map
+            .get(&idx)
+            .map(|(g, m)| (g.to_string(), m.to_string()))
+            .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
+        eprintln!(
+            "gpu snapshot ({label}): idx={idx} free={free_s}MB total={total_s}MB util={gpu_util_s}% mem={mem_util_s}%"
+        );
+    }
+}
+
+/// Log snapshots at most once per interval for a given label.
+pub fn log_nvidia_snapshot_throttled(label: &str, min_interval_secs: u64) {
+    static LAST_LOG: OnceLock<Mutex<HashMap<String, u128>>> = OnceLock::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut map = match LAST_LOG.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        Ok(lock) => lock,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(last) = map.get(label) {
+        let min_ms = (min_interval_secs as u128).saturating_mul(1000);
+        if now.saturating_sub(*last) < min_ms {
+            return;
+        }
+    }
+    map.insert(label.to_string(), now);
+    drop(map);
+    log_nvidia_snapshot(label);
+}
+
+fn pick_best_nvidia_device_with_exclusions(
+    min_free_mb: u64,
+    exclude: Option<u32>,
+    label: &str,
+) -> Option<u32> {
+    let strategy = gpu_pick_strategy();
+    pick_best_nvidia_device_with_exclusions_and_strategy(min_free_mb, exclude, label, &strategy)
+}
+
+fn pick_best_nvidia_device_with_exclusions_and_strategy(
+    min_free_mb: u64,
+    exclude: Option<u32>,
+    label: &str,
+    strategy: &str,
+) -> Option<u32> {
     let reserve = gpu_vram_reserve_mb();
     let required = min_free_mb.saturating_add(reserve);
-    let mut entries = query_nvidia_free_vram_all()?;
-    entries.retain(|(idx, mem)| *mem >= required && Some(*idx) != exclude);
-    if entries.is_empty() {
+    let free_entries = query_nvidia_free_vram_all()?;
+    let free_map: std::collections::HashMap<u32, u64> = free_entries.iter().cloned().collect();
+    let mut candidates: Vec<(u32, u64, u64)> = match strategy {
+        "total" => {
+            let totals = query_nvidia_total_vram_all().unwrap_or_default();
+            totals
+                .into_iter()
+                .filter_map(|(idx, total)| {
+                    let free = *free_map.get(&idx)?;
+                    if free >= required && Some(idx) != exclude {
+                        Some((idx, total, free))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+        _ => free_entries
+            .into_iter()
+            .filter(|(idx, free)| *free >= required && Some(*idx) != exclude)
+            .map(|(idx, free)| (idx, free, free))
+            .collect(),
+    };
+
+    if candidates.is_empty() {
         if let Some(exclude) = exclude {
             eprintln!(
                 "gpu vram guard: no GPU meets {required} MB excluding device {exclude} for {label}"
@@ -167,8 +346,13 @@ pub fn pick_best_nvidia_device_excluding(
         }
         return None;
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
-    entries.first().map(|(idx, _)| *idx)
+
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    candidates.first().map(|(idx, _, _)| *idx)
 }
 
 fn gpu_vram_reserve_mb() -> u64 {
@@ -290,6 +474,7 @@ mod tests {
         let mut env = EnvGuard::new();
         env.set("GPU_VRAM_OVERRIDE_LIST", "0:3000,1:7000");
         env.set("GPU_VRAM_RESERVE_MB", "512");
+        env.set("GPU_PICK_STRATEGY", "free");
         let best = pick_best_nvidia_device(3000, "test").expect("expected device");
         assert_eq!(best, 1);
     }
@@ -299,6 +484,7 @@ mod tests {
         let mut env = EnvGuard::new();
         env.set("GPU_VRAM_OVERRIDE_LIST", "0:6000,1:4000");
         env.set("GPU_VRAM_RESERVE_MB", "0");
+        env.set("GPU_PICK_STRATEGY", "free");
         let best = pick_best_nvidia_device_excluding(1000, Some(0), "test")
             .expect("expected device");
         assert_eq!(best, 1);
@@ -309,7 +495,18 @@ mod tests {
         let mut env = EnvGuard::new();
         env.set("GPU_VRAM_OVERRIDE_LIST", "0:800,1:200");
         env.set("GPU_VRAM_RESERVE_MB", "0");
+        env.set("GPU_PICK_STRATEGY", "free");
         let best = pick_best_nvidia_device_excluding(500, Some(0), "test");
         assert!(best.is_none());
+    }
+
+    #[test]
+    fn pick_best_device_prefers_total_when_configured() {
+        let mut env = EnvGuard::new();
+        env.set("GPU_VRAM_OVERRIDE_LIST", "0:3000,1:7000");
+        env.set("GPU_VRAM_RESERVE_MB", "0");
+        env.set("GPU_PICK_STRATEGY", "total");
+        let best = pick_best_nvidia_device(1000, "test").expect("expected device");
+        assert_eq!(best, 1);
     }
 }

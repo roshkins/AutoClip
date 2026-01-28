@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use m3u8_rs::{MasterPlaylist, MediaPlaylist, VariantStream};
 use reqwest::{header, Client, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 use tokio::process::Command;
@@ -54,6 +55,15 @@ pub struct StreamHeaders {
     pub origin: Option<String>,
     /// Optional Cookie header for authenticated streams.
     pub cookie: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KickVodInfo {
+    pub id: u64,
+    pub title: Option<String>,
+    pub duration: Option<f64>,
+    pub created_at: Option<String>,
+    pub source: String,
 }
 
 impl StreamHeaders {
@@ -125,6 +135,68 @@ impl HlsClient {
             .build()
             .context("building reqwest client")?;
         Ok(Self { client })
+    }
+
+    pub async fn fetch_kick_latest_vod(
+        &self,
+        page_url: &str,
+        slug: &str,
+    ) -> Result<KickVodInfo> {
+        #[derive(Debug, Deserialize)]
+        struct KickVodRaw {
+            id: u64,
+            title: Option<String>,
+            duration: Option<f64>,
+            created_at: Option<String>,
+            source: Option<String>,
+            is_live: Option<bool>,
+        }
+
+        let api_url = format!("https://kick.com/api/v2/channels/{slug}/videos");
+        let origin = origin_for_page(page_url).unwrap_or_else(|| "https://kick.com".to_string());
+        let cookie_header = collect_env_cookies();
+        let body = self
+            .fetch_text_with_headers(
+                &api_url,
+                Some(page_url),
+                Some(&origin),
+                cookie_header.as_deref(),
+            )
+            .await
+            .with_context(|| format!("fetching Kick VOD list from {}", api_url))?;
+        let list: Vec<KickVodRaw> =
+            serde_json::from_str(&body).context("parsing Kick VOD list JSON")?;
+        if list.is_empty() {
+            anyhow::bail!("Kick returned no VODs for channel {slug}");
+        }
+
+        let mut fallback: Option<KickVodInfo> = None;
+        for vod in &list {
+            let source = vod
+                .source
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            if source.is_none() {
+                continue;
+            }
+            let info = KickVodInfo {
+                id: vod.id,
+                title: vod.title.clone(),
+                duration: vod.duration,
+                created_at: vod.created_at.clone(),
+                source: source.clone().unwrap(),
+            };
+            let is_live = vod.is_live.unwrap_or(false);
+            let duration_ok = vod.duration.unwrap_or(0.0) > 0.0;
+            if !is_live && duration_ok {
+                return Ok(info);
+            }
+            if fallback.is_none() {
+                fallback = Some(info);
+            }
+        }
+        fallback.ok_or_else(|| anyhow::anyhow!("Kick VOD list had no downloadable sources"))
     }
 
     /// Fetch and parse a master playlist with optional headers.

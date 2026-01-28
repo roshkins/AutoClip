@@ -3,6 +3,7 @@
 //! This module handles both stream audio and microphone wake detection using
 //! whisper.cpp/whisper-rs, plus optional emotion-based triggers.
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::ffi::CStr;
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -208,6 +209,77 @@ struct WhisperHandle {
     cpu_state: Option<whisper_rs::WhisperState>,
 }
 
+struct ClipCache<K, V> {
+    map: HashMap<K, V>,
+}
+
+impl<K, V> Default for ClipCache<K, V> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+}
+
+impl<K, V> ClipCache<K, V>
+where
+    K: Eq + std::hash::Hash,
+{
+    #[cfg(test)]
+    fn get_or_insert_with(&mut self, key: K, make: impl FnOnce() -> V) -> &mut V {
+        match self.map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(make()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ClipWhisperKey {
+    model_path: PathBuf,
+    gpu_device: Option<i32>,
+}
+
+type ClipWhisperCache = ClipCache<ClipWhisperKey, Arc<Mutex<WhisperHandle>>>;
+
+fn clip_whisper_key(model_path: &Path, gpu_device: Option<i32>) -> ClipWhisperKey {
+    let normalized = model_path
+        .canonicalize()
+        .unwrap_or_else(|_| model_path.to_path_buf());
+    ClipWhisperKey {
+        model_path: normalized,
+        gpu_device,
+    }
+}
+
+fn clip_whisper_cache() -> &'static Mutex<ClipWhisperCache> {
+    static CACHE: OnceLock<Mutex<ClipWhisperCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ClipWhisperCache::default()))
+}
+
+fn get_clip_whisper_handle(
+    model_path: &Path,
+    prefer_gpu: bool,
+    gpu_device: Option<i32>,
+) -> Result<Arc<Mutex<WhisperHandle>>> {
+    let key = clip_whisper_key(model_path, gpu_device);
+    let mut cache = clip_whisper_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("clip whisper cache lock poisoned"))?;
+    if let Some(existing) = cache.map.get(&key) {
+        return Ok(Arc::clone(existing));
+    }
+    eprintln!(
+        "whisper clip: creating cached handle for {} (gpu={})",
+        key.model_path.display(),
+        prefer_gpu
+    );
+    let handle = WhisperHandle::new_with_gpu_device(model_path, prefer_gpu, gpu_device)?;
+    let shared = Arc::new(Mutex::new(handle));
+    cache.map.insert(key, Arc::clone(&shared));
+    Ok(shared)
+}
+
 impl WhisperHandle {
     fn new(model_path: &Path) -> Result<Self> {
         let device = whisper_gpu_device_override().map(|v| v as i32);
@@ -250,6 +322,7 @@ impl WhisperHandle {
                     Err(err)
                 }
             })?;
+        log_whisper_gpu_status("init", gpu_device, use_gpu);
         eprintln!("whisper: creating state (use_gpu={use_gpu})");
         let state = ctx.create_state().context("creating whisper state")?;
         eprintln!("whisper: state created (use_gpu={use_gpu})");
@@ -411,6 +484,13 @@ fn whisper_clip_vram_overhead_mb() -> u64 {
         .unwrap_or(512)
 }
 
+fn whisper_clip_vram_extra_mb() -> u64 {
+    env::var("WHISPER_CLIP_VRAM_EXTRA_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1024)
+}
+
 fn whisper_clip_gpu_device_override() -> Option<u32> {
     env::var("WHISPER_CLIP_GPU_DEVICE")
         .ok()
@@ -441,20 +521,62 @@ fn whisper_clip_vram_requirement_mb(model_path: &Path) -> Option<u64> {
     Some(required.ceil() as u64)
 }
 
-fn whisper_clip_pick_gpu_device(model_path: &Path) -> Option<u32> {
+fn whisper_clip_vram_requirements_mb(model_path: &Path) -> (u64, u64, u64) {
     let min_free = whisper_clip_min_free_vram_mb();
-    let required = whisper_clip_vram_requirement_mb(model_path).unwrap_or(min_free);
-    let required = required.max(min_free);
+    let base = whisper_clip_vram_requirement_mb(model_path).unwrap_or(min_free);
+    let extra = whisper_clip_vram_extra_mb();
+    let relaxed = base.saturating_add(extra);
+    let strict = base.max(min_free).saturating_add(extra);
+    (strict, relaxed, min_free)
+}
+
+fn whisper_clip_gpu_allowed_for_model(model_path: &Path, device: Option<u32>) -> bool {
+    let (strict, relaxed, min_free) = whisper_clip_vram_requirements_mb(model_path);
+    if gpu::gpu_vram_allows(strict, device, "whisper clip") {
+        return true;
+    }
+    if relaxed < strict && gpu::gpu_vram_allows(relaxed, device, "whisper clip (relaxed)") {
+        eprintln!(
+            "whisper clip: relaxing VRAM guard from {strict} MB to {relaxed} MB (min {min_free})"
+        );
+        return true;
+    }
+    false
+}
+
+fn whisper_clip_pick_gpu_device(model_path: &Path) -> Option<u32> {
+    let (strict, relaxed, min_free) = whisper_clip_vram_requirements_mb(model_path);
     if let Some(device) = whisper_clip_gpu_device_override() {
-        if gpu::gpu_vram_allows(required, Some(device), "whisper clip") {
+        if gpu::gpu_vram_allows(strict, Some(device), "whisper clip") {
+            return Some(device);
+        }
+        if relaxed < strict && gpu::gpu_vram_allows(relaxed, Some(device), "whisper clip") {
+            eprintln!(
+                "whisper clip: relaxing VRAM guard from {strict} MB to {relaxed} MB (min {min_free})"
+            );
             return Some(device);
         }
         eprintln!(
-            "whisper clip: GPU device {device} has insufficient VRAM (need ~{required} MB); using CPU"
+            "whisper clip: GPU device {device} has insufficient VRAM (need ~{strict} MB); using CPU"
         );
         return None;
     }
-    gpu::pick_best_nvidia_device(required, "whisper clip")
+    if let Some(device) =
+        gpu::pick_best_nvidia_device_with_strategy(strict, "whisper clip", "total")
+    {
+        return Some(device);
+    }
+    if relaxed < strict {
+        eprintln!(
+            "whisper clip: relaxing VRAM guard from {strict} MB to {relaxed} MB (min {min_free})"
+        );
+        if let Some(device) =
+            gpu::pick_best_nvidia_device_with_strategy(relaxed, "whisper clip (relaxed)", "total")
+        {
+            return Some(device);
+        }
+    }
+    None
 }
 
 fn whisper_clip_gpu_device_for_model(model_path: &Path) -> Option<i32> {
@@ -470,7 +592,12 @@ fn whisper_clip_gpu_device_for_model(model_path: &Path) -> Option<i32> {
     if !prefer {
         return None;
     }
-    whisper_clip_pick_gpu_device(model_path).map(|v| v as i32)
+    let device = whisper_clip_pick_gpu_device(model_path)?;
+    if !whisper_clip_gpu_allowed_for_model(model_path, Some(device)) {
+        eprintln!("whisper clip: GPU free memory dropped below guard; using CPU");
+        return None;
+    }
+    Some(device as i32)
 }
 
 fn create_whisper_context(
@@ -741,7 +868,7 @@ where
             }
         }
 
-        let _ = ffmpeg.kill();
+        kill_child_and_wait(&mut ffmpeg, "ffmpeg wake stream");
 
         if fired.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
             break;
@@ -764,11 +891,6 @@ pub fn select_best_model_path() -> PathBuf {
         return p;
     }
 
-    let target: f32 = env::var("WHISPER_RT_TARGET")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_RT_TARGET);
-
     let candidates = env::var("WHISPER_MODEL_CANDIDATES")
         .ok()
         .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
@@ -780,6 +902,31 @@ pub fn select_best_model_path() -> PathBuf {
                 "ggml-tiny.en.bin".to_string(),
             ]
         });
+
+    if !whisper_model_benchmark_enabled() {
+        for name in &candidates {
+            let path = if Path::new(name).is_absolute() {
+                PathBuf::from(name)
+            } else {
+                Path::new("models").join(name)
+            };
+            if path.exists() {
+                eprintln!("whisper model select: using {}", path.display());
+                return path;
+            }
+        }
+        let fallback = PathBuf::from("models/ggml-tiny.en.bin");
+        eprintln!(
+            "whisper model select: no candidates found; falling back to {}",
+            fallback.display()
+        );
+        return fallback;
+    }
+
+    let target: f32 = env::var("WHISPER_RT_TARGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RT_TARGET);
 
     let mut tested = Vec::new();
     for name in candidates {
@@ -821,6 +968,13 @@ pub fn select_best_model_path() -> PathBuf {
         eprintln!("no candidate models benchmarked; falling back to {}", fallback.display());
         fallback
     })
+}
+
+fn whisper_model_benchmark_enabled() -> bool {
+    env::var("WHISPER_MODEL_BENCHMARK")
+        .ok()
+        .and_then(|v| parse_bool_env(&v))
+        .unwrap_or(false)
 }
 
 fn benchmark_model_rt(path: &Path) -> Option<f32> {
@@ -973,7 +1127,7 @@ pub fn detect_wake_in_file(
 
     let (mut ffmpeg, mut pcm_reader) = spawn_ffmpeg_pcm_file(input_path)?;
     let result = run_wake_loop_file(&mut whisper, &mut *pcm_reader, &wake_phrases, log_raw);
-    let _ = ffmpeg.kill();
+    kill_child_and_wait(&mut ffmpeg, "ffmpeg wake file");
     result
 }
 
@@ -1082,7 +1236,8 @@ fn transcribe_audio(
             None => continue,
         };
         let segment_text = segment.to_str().context("segment text")?;
-        let trimmed = segment_text.trim();
+        let cleaned = strip_special_whisper_tokens(segment_text);
+        let trimmed = cleaned.trim();
         if !trimmed.is_empty() {
             if !text.is_empty() {
                 text.push(' ');
@@ -1104,6 +1259,9 @@ fn transcribe_audio(
                 Err(_) => continue,
             };
             let token_text = token_text.trim();
+            if is_special_whisper_token(token_text) {
+                continue;
+            }
             let norm = normalize(token_text);
             if norm.is_empty() {
                 continue;
@@ -1172,7 +1330,8 @@ pub fn transcribe_clip_audio(
         anyhow::bail!("captions require a finite clip duration");
     }
     if let Ok(test_text) = env::var("CLIP_TEST_TRANSCRIPT") {
-        let trimmed = test_text.trim();
+        let cleaned = strip_special_whisper_tokens(&test_text);
+        let trimmed = cleaned.trim();
         if !trimmed.is_empty() {
             let dur = duration.unwrap_or(0.0).max(0.0);
             let mut words = Vec::new();
@@ -1182,6 +1341,9 @@ pub fn transcribe_clip_audio(
                 let step = (dur / count).max(0.05);
                 let mut t0 = 0.0;
                 for token in tokens {
+                    if is_special_whisper_token(token) {
+                        continue;
+                    }
                     let t1 = (t0 + step).min(dur);
                     if t1 <= t0 {
                         break;
@@ -1207,17 +1369,14 @@ pub fn transcribe_clip_audio(
 
     let model_path = select_best_model_path();
     let clip_device = whisper_clip_gpu_device_for_model(&model_path);
-    let mut whisper = WhisperHandle::new_with_gpu_device(
-        &model_path,
-        clip_device.is_some(),
-        clip_device,
-    )?;
+    log_whisper_gpu_status("clip", clip_device, clip_device.is_some());
+    let handle = get_clip_whisper_handle(&model_path, clip_device.is_some(), clip_device)?;
     log_whisper_backend();
 
     let (mut ffmpeg, mut pcm_reader) =
         spawn_ffmpeg_pcm_input(input, start_offset_secs, duration, force_ts_input)?;
     let audio = read_pcm_f32(&mut *pcm_reader)?;
-    let _ = ffmpeg.kill();
+    kill_child_and_wait(&mut ffmpeg, "ffmpeg captions");
 
     if audio.is_empty() {
         return Ok(TranscriptPayload {
@@ -1226,9 +1385,12 @@ pub fn transcribe_clip_audio(
         });
     }
 
+    let mut whisper = handle
+        .lock()
+        .map_err(|_| anyhow::anyhow!("clip whisper handle lock poisoned"))?;
     let window = whisper.transcribe_full_with_fallback(&audio)?;
     if let Some(window) = window {
-        let text = if !window.text.trim().is_empty() {
+        let mut text = if !window.text.trim().is_empty() {
             window.text.trim().to_string()
         } else {
             window
@@ -1240,6 +1402,17 @@ pub fn transcribe_clip_audio(
                 .trim()
                 .to_string()
         };
+        text = strip_special_whisper_tokens(&text);
+        if text.is_empty() {
+            text = window
+                .words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string();
+        }
         return Ok(TranscriptPayload {
             text,
             words: window.words,
@@ -1337,6 +1510,31 @@ fn run_wake_loop_file(
     }
 
     Ok(None)
+}
+
+fn kill_child_and_wait(child: &mut Child, label: &str) {
+    let _ = child.kill();
+    let start = Instant::now();
+    let timeout = Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    eprintln!(
+                        "{label}: child did not exit after kill within {:?}; giving up",
+                        timeout
+                    );
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                eprintln!("{label}: failed to reap child: {err:#}");
+                return;
+            }
+        }
+    }
 }
 
 fn spawn_ffmpeg_pcm(media_url: &Url) -> Result<(Child, Box<dyn Read + Send>)> {
@@ -1478,7 +1676,7 @@ fn spawn_ffmpeg_pcm_mic(device: Option<&str>) -> Result<(Child, Box<dyn Read + S
                 if let Some(stdout) = child.stdout.take() {
                     return Ok((child, Box::new(stdout)));
                 } else {
-                    let _ = child.kill();
+                    kill_child_and_wait(&mut child, "ffmpeg mic");
                     last_err = Some(anyhow::anyhow!("ffmpeg stdout missing for input '{input}'"));
                 }
             }
@@ -1647,6 +1845,25 @@ fn read_pcm_f32(reader: &mut dyn Read) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+fn is_special_whisper_token(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    (trimmed.starts_with("[_") && trimmed.ends_with(']'))
+        || (trimmed.starts_with("<|") && trimmed.ends_with("|>"))
+}
+
+fn strip_special_whisper_tokens(text: &str) -> String {
+    let mut keep = Vec::new();
+    for token in text.split_whitespace() {
+        if !is_special_whisper_token(token) {
+            keep.push(token);
+        }
+    }
+    keep.join(" ").trim().to_string()
+}
+
 fn normalize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_space = false;
@@ -1750,6 +1967,16 @@ fn log_whisper_backend() {
     }
 }
 
+fn log_whisper_gpu_status(label: &str, gpu_device: Option<i32>, use_gpu: bool) {
+    let device = gpu_device.and_then(|v| u32::try_from(v).ok());
+    if use_gpu {
+        eprintln!("whisper {label}: gpu_device={device:?}");
+    } else {
+        eprintln!("whisper {label}: using CPU");
+    }
+    gpu::log_nvidia_snapshot_throttled("whisper", 30);
+}
+
 fn detect_nvidia_gpus_present() -> bool {
     let output = Command::new("nvidia-smi")
         .arg("--query-gpu=index")
@@ -1799,6 +2026,83 @@ mod tests {
         let payload = transcribe_clip_audio("missing.mp4", None, Some(1.0), false)?;
         assert_eq!(payload.text, "hello world");
         assert!(!payload.words.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn clip_cache_reuses_entry_for_same_key() {
+        let mut cache: ClipCache<u32, usize> = ClipCache::default();
+        let mut created = 0usize;
+        let first = cache.get_or_insert_with(7, || {
+            created += 1;
+            42
+        });
+        assert_eq!(*first, 42);
+        let second = cache.get_or_insert_with(7, || {
+            created += 1;
+            99
+        });
+        assert_eq!(*second, 42);
+        assert_eq!(created, 1);
+    }
+
+    #[test]
+    fn clip_cache_inserts_new_for_other_key() {
+        let mut cache: ClipCache<u32, usize> = ClipCache::default();
+        let mut created = 0usize;
+        let _ = cache.get_or_insert_with(1, || {
+            created += 1;
+            10
+        });
+        let _ = cache.get_or_insert_with(2, || {
+            created += 1;
+            20
+        });
+        assert_eq!(created, 2);
+    }
+
+    #[test]
+    fn strip_special_whisper_tokens_removes_timestamp_tags() {
+        let raw = "hello [_TT_150] world <|endoftext|>";
+        assert!(is_special_whisper_token("[_TT_150]"));
+        assert!(is_special_whisper_token("<|endoftext|>"));
+        assert!(!is_special_whisper_token("hello"));
+        assert_eq!(strip_special_whisper_tokens(raw), "hello world");
+    }
+
+    #[test]
+    fn whisper_clip_gpu_guard_respects_extra_headroom() -> Result<()> {
+        let mut env = EnvGuard::new();
+        env.set("WHISPER_CLIP_GPU", "1");
+        env.set("WHISPER_CLIP_VRAM_FACTOR", "1.0");
+        env.set("WHISPER_CLIP_VRAM_OVERHEAD_MB", "0");
+        env.set("WHISPER_CLIP_VRAM_EXTRA_MB", "15");
+        env.set("WHISPER_CLIP_MIN_FREE_VRAM_MB", "1");
+        env.set("WHISPER_MIN_FREE_VRAM_MB", "1");
+        env.set("GPU_VRAM_RESERVE_MB", "0");
+        env.set("GPU_VRAM_OVERRIDE_LIST", "0:20");
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("autoclip_whisper_vram_{stamp}"));
+        std::fs::create_dir_all(&dir)?;
+        let model_path = dir.join("model.bin");
+        std::fs::write(&model_path, vec![0u8; 8 * 1024 * 1024])?;
+
+        assert!(
+            !whisper_clip_gpu_allowed_for_model(&model_path, Some(0)),
+            "expected guard to reject GPU when extra headroom exceeds free"
+        );
+
+        env.set("WHISPER_CLIP_VRAM_EXTRA_MB", "0");
+        assert!(
+            whisper_clip_gpu_allowed_for_model(&model_path, Some(0)),
+            "expected guard to allow GPU when free meets requirement"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }

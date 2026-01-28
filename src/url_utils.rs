@@ -147,6 +147,47 @@ pub fn stream_id_from_url(url: &str) -> String {
     sanitize_stream_id(&normalized)
 }
 
+/// Extract a Kick channel slug from a Kick URL (e.g., https://kick.com/slug).
+pub fn kick_slug_from_url(url: &str) -> Option<String> {
+    let normalized = normalize_page_url(url);
+    let parsed = Url::parse(&normalized).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if host != "kick.com" && !host.ends_with(".kick.com") {
+        return None;
+    }
+    let mut segments = parsed.path_segments()?.filter(|s| !s.is_empty());
+    let first = segments.next()?;
+    if first.eq_ignore_ascii_case("video") || first.eq_ignore_ascii_case("videos") {
+        return None;
+    }
+    Some(first.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kick_slug_from_url_parses_channel() {
+        assert_eq!(
+            kick_slug_from_url("https://kick.com/kingbushcamp"),
+            Some("kingbushcamp".to_string())
+        );
+        assert_eq!(
+            kick_slug_from_url("kick.com/QueenBushCamp"),
+            Some("QueenBushCamp".to_string())
+        );
+    }
+
+    #[test]
+    fn kick_slug_from_url_rejects_video_path() {
+        assert_eq!(
+            kick_slug_from_url("https://kick.com/video/abc123"),
+            None
+        );
+    }
+}
+
 /// Extract a meta image URL (`og:image`, `twitter:image`, etc.) from HTML.
 ///
 /// `key` should be a snippet like `property="og:image"` used to locate the

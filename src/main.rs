@@ -55,12 +55,15 @@ use layout_utils::{
     face_rect_for_gameplay_guess, face_rect_from_hints, guess_gameplay_low_resource,
     parse_resolution, rect_area, rect_contains_rect,
 };
-use hls_client::{HlsClient, StreamHeaders, is_http_status};
+use hls_client::{HlsClient, KickVodInfo, StreamHeaders, is_http_status};
 use low_resource::{ensure_live_detect_budgets, low_resource_enabled, refresh_low_resource_state};
 use captions::{
-    SubtitleSpec, TempSubtitle, build_caption_drawtext_chain, build_caption_words,
-    build_srt_from_payload, caption_y_for_layout, closed_captions_enabled,
-    read_caption_config, subtitle_codec_for_output, write_temp_srt,
+    CaptionRender, SubtitleSpec, TempSubtitle, adjust_caption_font_size,
+    build_ass_from_payload_with_limits, build_caption_subtitles_filter,
+    build_drawtext_caption_filter_with_limit, DrawtextBuildResult,
+    build_srt_from_payload_with_limits, caption_render_mode, caption_y_for_layout,
+    captions_enabled, closed_captions_enabled, read_caption_config, subtitle_codec_for_output,
+    write_temp_ass, write_temp_srt,
 };
 use profile::profile_span;
 use rolling_buffer::RollingBuffer;
@@ -78,7 +81,10 @@ use text_utils::{
     fallback_title_from_transcript, normalize_title_whitespace, sanitize_title_for_filename,
     trim_transcript,
 };
-use url_utils::{normalize_page_url, signed_url_expiry, stream_id_from_url};
+use url_utils::{
+    kick_slug_from_url, normalize_page_url, origin_for_page, sanitize_m3u8_url,
+    signed_url_expiry, stream_id_from_url,
+};
 #[cfg(feature = "whisper")]
 mod stream_audio_wake;
 #[cfg(not(feature = "whisper"))]
@@ -296,6 +302,11 @@ impl AutoClip {
 
         let fired = Arc::new(AtomicBool::new(false));
         let mut pending_saves: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let clip_gap_watchdog = read_clip_gap_watchdog_secs();
+        let clip_gap_warn_cooldown = Duration::from_secs(60);
+        let last_clip_saved_ms = Arc::new(AtomicU64::new(now_unix_ms()));
+        let mut last_clip_gap_warned_at: Option<Instant> = None;
+        let min_wake_clip_gap = read_wake_min_clip_gap_secs();
         let mut live_config = LiveConfigState::from_env();
         if let Some(state) = live_config.as_mut() {
             state.maybe_refresh();
@@ -688,6 +699,34 @@ impl AutoClip {
                 }
             }
 
+            if let Some(limit) = clip_gap_watchdog {
+                if !skip_clip_save {
+                    let last_ms = last_clip_saved_ms.load(Ordering::Relaxed);
+                    if last_ms > 0 {
+                        let now_ms = now_unix_ms();
+                        let gap = now_ms.saturating_sub(last_ms) as f32 / 1000.0;
+                        if gap >= limit.as_secs_f32() {
+                            let now = Instant::now();
+                            let should_warn = last_clip_gap_warned_at
+                                .map(|t| now.duration_since(t) >= clip_gap_warn_cooldown)
+                                .unwrap_or(true);
+                            if should_warn {
+                                last_clip_gap_warned_at = Some(now);
+                                let msg = format!(
+                                    "clip watchdog: no clip saved for {:.1}s (threshold {:.1}s)",
+                                    gap,
+                                    limit.as_secs_f32()
+                                );
+                                eprintln!("{msg}");
+                                log_run_event(&save_root, &msg);
+                            }
+                        } else {
+                            last_clip_gap_warned_at = None;
+                        }
+                    }
+                }
+            }
+
             let target_ns = buffer_target_ns.load(Ordering::Relaxed);
             if target_ns > buffer_window_ns {
                 buffer_window_ns = target_ns;
@@ -869,14 +908,40 @@ impl AutoClip {
                             log_run_event(&save_root, &msg);
                         }
                     }
-                    if refractory_until.map(|t| Instant::now() < t).unwrap_or(false) {
-                        // Ignore rapid re-triggers until cooldown expires.
+                if refractory_until.map(|t| Instant::now() < t).unwrap_or(false) {
+                    // Ignore rapid re-triggers until cooldown expires.
+                    let force_gap = min_wake_clip_gap.and_then(|gap| {
+                        let now_ms = now_unix_ms();
+                        let last_ms = last_clip_saved_ms.load(Ordering::Relaxed);
+                        let elapsed_ms = now_ms.saturating_sub(last_ms);
+                        if elapsed_ms >= gap.as_millis() as u64 {
+                            Some(Duration::from_millis(elapsed_ms))
+                        } else {
+                            None
+                        }
+                    });
+                    if force_gap.is_none() {
                         log_run_event(&save_root, "wake detected during refractory; ignoring");
                         if let Some(wake_id) = active_wake_id {
                             log_wake_event(&save_root, wake_id, "wake_refractory", json!({}));
                         }
                         continue;
                     }
+                    let elapsed = force_gap.unwrap_or_else(|| Duration::from_secs(0));
+                    let msg = format!(
+                        "wake detected during refractory; overriding to satisfy min clip gap ({:.1}s)",
+                        elapsed.as_secs_f32()
+                    );
+                    log_run_event(&save_root, &msg);
+                    if let Some(wake_id) = active_wake_id {
+                        log_wake_event(
+                            &save_root,
+                            wake_id,
+                            "wake_refractory_override",
+                            json!({ "elapsed_secs": elapsed.as_secs_f32() }),
+                        );
+                    }
+                }
                     let detect_ns_val = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
                     let audio_ns_now = audio_ns.load(std::sync::atomic::Ordering::Relaxed);
                     let age_audio = if detect_ns_val != u64::MAX && audio_ns_now >= detect_ns_val {
@@ -1037,6 +1102,7 @@ impl AutoClip {
                         let save_root_for_log = save_root.clone();
                         let save_root_for_handle = save_root_for_log.clone();
                         let wake_id_for_log = wake_id;
+                        let last_clip_saved_ms = last_clip_saved_ms.clone();
                         let render_duration = clip_len.as_secs_f32();
                         let render_start = clip_start;
                         let save_future = async move {
@@ -1105,6 +1171,7 @@ impl AutoClip {
                                     clip_len.as_secs_f32()
                                 ),
                             );
+                            last_clip_saved_ms.store(now_unix_ms(), Ordering::Relaxed);
                             if wake_id_for_log > 0 {
                                 log_wake_event(
                                     &save_root_for_log,
@@ -1175,11 +1242,37 @@ impl AutoClip {
                     }
                 }
                 if refractory_until.map(|t| Instant::now() < t).unwrap_or(false) {
-                    log_run_event(&save_root, "wake detected during refractory; ignoring");
-                    if let Some(wake_id) = active_wake_id {
-                        log_wake_event(&save_root, wake_id, "wake_refractory", json!({}));
+                    let force_gap = min_wake_clip_gap.and_then(|gap| {
+                        let now_ms = now_unix_ms();
+                        let last_ms = last_clip_saved_ms.load(Ordering::Relaxed);
+                        let elapsed_ms = now_ms.saturating_sub(last_ms);
+                        if elapsed_ms >= gap.as_millis() as u64 {
+                            Some(Duration::from_millis(elapsed_ms))
+                        } else {
+                            None
+                        }
+                    });
+                    if force_gap.is_none() {
+                        log_run_event(&save_root, "wake detected during refractory; ignoring");
+                        if let Some(wake_id) = active_wake_id {
+                            log_wake_event(&save_root, wake_id, "wake_refractory", json!({}));
+                        }
+                        continue;
                     }
-                    continue;
+                    let elapsed = force_gap.unwrap_or_else(|| Duration::from_secs(0));
+                    let msg = format!(
+                        "wake detected during refractory; overriding to satisfy min clip gap ({:.1}s)",
+                        elapsed.as_secs_f32()
+                    );
+                    log_run_event(&save_root, &msg);
+                    if let Some(wake_id) = active_wake_id {
+                        log_wake_event(
+                            &save_root,
+                            wake_id,
+                            "wake_refractory_override",
+                            json!({ "elapsed_secs": elapsed.as_secs_f32() }),
+                        );
+                    }
                 }
                 let detect_ns_val = detect_ns.load(std::sync::atomic::Ordering::Relaxed);
                 let audio_ns_now = audio_ns.load(std::sync::atomic::Ordering::Relaxed);
@@ -1779,8 +1872,192 @@ fn auto_assign_gpus_for_tools() {
     }
 }
 
+fn log_gpu_assignments() {
+    let whisper_gpu_env = std::env::var("WHISPER_GPU").unwrap_or_else(|_| "(unset)".to_string());
+    let whisper_clip_gpu_env =
+        std::env::var("WHISPER_CLIP_GPU").unwrap_or_else(|_| "(unset)".to_string());
+    let whisper_device = std::env::var("WHISPER_GPU_DEVICE")
+        .ok()
+        .and_then(|v| parse_device_index(&v));
+    let whisper_clip_device = std::env::var("WHISPER_CLIP_GPU_DEVICE")
+        .ok()
+        .and_then(|v| parse_device_index(&v));
+    let ffmpeg_hwaccel = std::env::var("FFMPEG_HWACCEL").unwrap_or_else(|_| "(unset)".to_string());
+    let ffmpeg_device = ffmpeg_hwaccel_device_index();
+    let ffmpeg_encoder = std::env::var("FFMPEG_ENCODER").unwrap_or_else(|_| "(unset)".to_string());
+
+    eprintln!(
+        "gpu assign: whisper_gpu={whisper_gpu_env} device={:?} clip_gpu={whisper_clip_gpu_env} clip_device={:?}",
+        whisper_device, whisper_clip_device
+    );
+    eprintln!(
+        "gpu assign: ffmpeg_hwaccel={ffmpeg_hwaccel} device={:?} encoder={ffmpeg_encoder}",
+        ffmpeg_device
+    );
+    if ffmpeg_hwaccel.eq_ignore_ascii_case("cuda") {
+        if let (Some(w), Some(f)) = (whisper_device, ffmpeg_device) {
+            if w == f {
+                eprintln!(
+                    "gpu assign warning: whisper and ffmpeg share GPU {w}; VRAM contention possible"
+                );
+            }
+        }
+        if let (Some(w), Some(f)) = (whisper_clip_device, ffmpeg_device) {
+            if w == f {
+                eprintln!(
+                    "gpu assign warning: clip whisper and ffmpeg share GPU {w}; VRAM contention possible"
+                );
+            }
+        }
+    }
+    gpu::log_nvidia_snapshot("startup");
+}
+
+fn ensure_cuda_device_order() {
+    let order = std::env::var("CUDA_DEVICE_ORDER")
+        .ok()
+        .map(|v| v.trim().to_ascii_uppercase())
+        .unwrap_or_default();
+    if order.is_empty() {
+        std::env::set_var("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
+        eprintln!("cuda: defaulting CUDA_DEVICE_ORDER=PCI_BUS_ID");
+    }
+}
+
 fn ffmpeg_bin() -> String {
     std::env::var("FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string())
+}
+
+fn collect_env_cookies_for_download() -> Option<String> {
+    let mut cookie_parts: Vec<String> = Vec::new();
+    for key in ["COOKIE_HEADER", "KICK_COOKIE"] {
+        if let Ok(val) = std::env::var(key) {
+            if !val.trim().is_empty() {
+                cookie_parts.push(val);
+            }
+        }
+    }
+    if cookie_parts.is_empty() {
+        None
+    } else {
+        Some(cookie_parts.join("; "))
+    }
+}
+
+fn ffmpeg_headers_for_page(page_url: &str) -> Option<String> {
+    let mut headers: Vec<String> = Vec::new();
+    headers.push(format!("Referer: {page_url}"));
+    if let Some(origin) = origin_for_page(page_url) {
+        headers.push(format!("Origin: {origin}"));
+    }
+    if let Some(cookie) = collect_env_cookies_for_download() {
+        headers.push(format!("Cookie: {cookie}"));
+    }
+    if headers.is_empty() {
+        None
+    } else {
+        Some(headers.join("\r\n") + "\r\n")
+    }
+}
+
+async fn download_m3u8_to_mp4(source_url: &str, output: &Path, page_url: &str) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).context("creating VOD download directory")?;
+    }
+    let mut cmd = Command::new(ffmpeg_bin());
+    cmd.arg("-y").arg("-loglevel").arg("warning").arg("-stats");
+    if let Some(headers) = ffmpeg_headers_for_page(page_url) {
+        cmd.arg("-headers").arg(headers);
+    }
+    cmd.arg("-i").arg(source_url);
+    cmd.arg("-c").arg("copy");
+    cmd.arg("-bsf:a").arg("aac_adtstoasc");
+    cmd.arg("-movflags").arg("+faststart");
+    cmd.arg(output.as_os_str());
+    let output_res = cmd.output().await.context("running ffmpeg VOD download")?;
+    if !output_res.status.success() {
+        let stderr = String::from_utf8_lossy(&output_res.stderr);
+        anyhow::bail!(
+            "ffmpeg VOD download failed (status {}): {}",
+            output_res.status,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+async fn maybe_enroll_face_id_from_media(page_url: &str, input_path: &Path) {
+    if !face_id_enabled() {
+        return;
+    }
+    let file_path = face_id::face_id_file_for_stream(page_url);
+    if file_path.exists() {
+        return;
+    }
+    let Some(input) = input_path.to_str() else {
+        eprintln!(
+            "face id: skipped VOD enrollment (non-utf8 path {})",
+            input_path.display()
+        );
+        return;
+    };
+    let _ = std::env::set_var(
+        "CLIP_FACE_ID_FILE",
+        file_path.to_string_lossy().as_ref(),
+    );
+    match clip_detect::enroll_face_id_from_media_url(input, &file_path).await {
+        Ok(true) => {
+            eprintln!(
+                "face id: enrolled from VOD media -> {}",
+                file_path.display()
+            );
+        }
+        Ok(false) => {
+            eprintln!("face id: VOD media did not yield a face");
+        }
+        Err(err) => {
+            eprintln!("face id: VOD media enrollment failed: {err:#}");
+        }
+    }
+}
+
+async fn run_kick_latest_vod(page_url: &str) -> Result<()> {
+    let page_url = normalize_page_url(page_url);
+    let Some(slug) = kick_slug_from_url(&page_url) else {
+        anyhow::bail!("expected a Kick channel URL like https://kick.com/<channel>");
+    };
+    if std::env::var("CLIP_REPROCESS_CONTINUE_ON_ERROR").ok().is_none() {
+        std::env::set_var("CLIP_REPROCESS_CONTINUE_ON_ERROR", "1");
+    }
+    if std::env::var("CLIP_LLM_ENABLE").ok().is_none() {
+        std::env::set_var("CLIP_LLM_ENABLE", "1");
+    }
+    if face_id_enabled() {
+        maybe_auto_enroll_face_id(&page_url).await;
+    }
+    let hls = HlsClient::new()?;
+    let vod: KickVodInfo = hls.fetch_kick_latest_vod(&page_url, &slug).await?;
+    let source = sanitize_m3u8_url(&vod.source);
+    let inputs_dir = Path::new("inputs");
+    let safe_slug = sanitize_title_for_filename(&slug);
+    let output_path = inputs_dir.join(format!("kick_vod_{safe_slug}_{}.mp4", vod.id));
+    if output_path.exists() {
+        let size = output_path.metadata().map(|m| m.len()).unwrap_or(0);
+        if size > 0 {
+            eprintln!("kick vod: using existing download {}", output_path.display());
+            maybe_enroll_face_id_from_media(&page_url, &output_path).await;
+            return run_reprocess_ts(output_path.to_str().unwrap()).await;
+        }
+    }
+    eprintln!(
+        "kick vod: downloading latest VOD {} (duration {:?}s)",
+        vod.id,
+        vod.duration
+    );
+    download_m3u8_to_mp4(&source, &output_path, &page_url).await?;
+    eprintln!("kick vod: downloaded to {}", output_path.display());
+    maybe_enroll_face_id_from_media(&page_url, &output_path).await;
+    run_reprocess_ts(output_path.to_str().unwrap()).await
 }
 
 fn ffmpeg_has_encoder(name: &str) -> bool {
@@ -1960,6 +2237,22 @@ fn stderr_indicates_filter_issue(stderr: &str) -> bool {
         || s.contains("error while processing the decoded data for stream")
 }
 
+fn ffmpeg_status_indicates_crash(status: &std::process::ExitStatus, stderr: &str) -> bool {
+    let stderr_lower = stderr.to_ascii_lowercase();
+    if stderr_lower.contains("0xc0000005")
+        || stderr_lower.contains("status_access_violation")
+        || stderr_lower.contains("access violation")
+    {
+        return true;
+    }
+    if let Some(code) = status.code() {
+        if code == 0xC0000005_u32 as i32 || code == -1073741819 {
+            return true;
+        }
+    }
+    false
+}
+
 fn ffmpeg_video_encoder() -> (String, bool, bool, bool) {
     if let Ok(enc) = std::env::var("FFMPEG_ENCODER") {
         if !enc.trim().is_empty() {
@@ -1986,6 +2279,21 @@ fn temp_output_path(out_path: &Path) -> PathBuf {
     let ext = out_path.extension().and_then(|v| v.to_str()).unwrap_or("");
     let mut name = String::from(stem);
     name.push_str(".partial");
+    if !ext.is_empty() {
+        name.push('.');
+        name.push_str(ext);
+    }
+    parent.join(name)
+}
+
+fn temp_output_path_with_suffix(out_path: &Path, suffix: &str) -> PathBuf {
+    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = out_path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("output");
+    let ext = out_path.extension().and_then(|v| v.to_str()).unwrap_or("");
+    let mut name = format!("{stem}.{suffix}");
     if !ext.is_empty() {
         name.push('.');
         name.push_str(ext);
@@ -2094,6 +2402,7 @@ struct FfmpegRenderSpec {
     progress: Option<ProgressSpec>,
     live_fast: bool,
     fast_preset: bool,
+    fast_seek: bool,
 }
 
 impl FfmpegRenderSpec {
@@ -2110,6 +2419,7 @@ impl FfmpegRenderSpec {
             progress: None,
             live_fast: false,
             fast_preset: false,
+            fast_seek: false,
         }
     }
 
@@ -2147,6 +2457,11 @@ impl FfmpegRenderSpec {
         self.fast_preset = fast_preset;
         self
     }
+
+    fn with_fast_seek(mut self, fast_seek: bool) -> Self {
+        self.fast_seek = fast_seek;
+        self
+    }
 }
 
 struct LayoutDecision {
@@ -2175,11 +2490,7 @@ fn decide_stacked_layout(
         y: (rect.y + rect.h / 2.0).clamp(0.0, 1.0),
     };
     let fallback_enabled = clip_layout::face_fallback_enabled();
-    let face_found = if fallback_enabled {
-        layout.face_crop.is_some() || hints.face_box.is_some() || hints.face_track.is_some()
-    } else {
-        hints.face_track.is_some()
-    };
+    let face_found = layout.face_crop.is_some() || hints.face_box.is_some() || hints.face_track.is_some();
     let mut gameplay_found = gameplay_enabled() && hints.game_center.is_some();
     let mut gameplay_guess: Option<bool> = None;
     if !gameplay_found {
@@ -2827,6 +3138,9 @@ struct LlmConfig {
 }
 
 static LLM_BACKOFF_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+static LLM_DISABLED_OFFLINE: AtomicBool = AtomicBool::new(false);
+static OPEN_CAPTIONS_DISABLED: AtomicBool = AtomicBool::new(false);
+static CLOSED_CAPTIONS_DISABLED: AtomicBool = AtomicBool::new(false);
 
 fn llm_backoff_secs() -> u64 {
     std::env::var("CLIP_LLM_BACKOFF_SECS")
@@ -2840,6 +3154,14 @@ fn llm_backoff_active() -> bool {
     until > now_unix_ms()
 }
 
+fn llm_offline_disabled() -> bool {
+    if LLM_DISABLED_OFFLINE.load(Ordering::Relaxed) && !llm_backoff_active() {
+        LLM_DISABLED_OFFLINE.store(false, Ordering::Relaxed);
+        return false;
+    }
+    LLM_DISABLED_OFFLINE.load(Ordering::Relaxed)
+}
+
 fn note_llm_failure() {
     let secs = llm_backoff_secs();
     if secs == 0 {
@@ -2847,6 +3169,12 @@ fn note_llm_failure() {
     }
     let until = now_unix_ms().saturating_add(secs.saturating_mul(1000));
     LLM_BACKOFF_UNTIL_MS.store(until, Ordering::Relaxed);
+}
+
+fn disable_llm_for_run(reason: &str) {
+    if !LLM_DISABLED_OFFLINE.swap(true, Ordering::Relaxed) {
+        eprintln!("llm: disabling for this run ({reason})");
+    }
 }
 
 fn llm_enabled() -> bool {
@@ -2858,6 +3186,9 @@ fn llm_enabled() -> bool {
 
 fn read_llm_config() -> Option<LlmConfig> {
     if !llm_enabled() {
+        return None;
+    }
+    if llm_offline_disabled() {
         return None;
     }
     if llm_backoff_active() {
@@ -2974,6 +3305,9 @@ based only on the transcript.",
     {
         Ok(resp) => resp,
         Err(err) => {
+            if llm_error_indicates_offline(&err.to_string()) {
+                disable_llm_for_run("endpoint unreachable");
+            }
             note_llm_failure();
             return Err(err).context("LLM request failed");
         }
@@ -3099,6 +3433,175 @@ fn ffmpeg_hwaccel_device_index() -> Option<u32> {
         .and_then(|v| parse_device_index(&v))
 }
 
+fn llm_error_indicates_offline(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("connection refused")
+        || msg.contains("actively refused")
+        || msg.contains("os error 10061")
+        || msg.contains("error trying to connect")
+}
+
+async fn check_llm_health() {
+    if !llm_enabled() || llm_offline_disabled() {
+        return;
+    }
+    let endpoint = std::env::var("CLIP_LLM_ENDPOINT")
+        .unwrap_or_else(|_| "".to_string())
+        .trim()
+        .to_string();
+    if endpoint.is_empty() {
+        return;
+    }
+    let timeout = Duration::from_secs(2);
+    let client = match Client::builder().timeout(timeout).build() {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("llm: failed to build health-check client: {err}");
+            return;
+        }
+    };
+    match client.get(&endpoint).send().await {
+        Ok(resp) => {
+            eprintln!("llm: endpoint reachable (status {})", resp.status());
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            if llm_error_indicates_offline(&msg) {
+                disable_llm_for_run("endpoint unreachable at startup");
+            }
+            eprintln!("llm: endpoint check failed: {msg}");
+        }
+    }
+}
+
+fn open_captions_allowed() -> bool {
+    !OPEN_CAPTIONS_DISABLED.load(Ordering::Relaxed)
+}
+
+fn closed_captions_allowed() -> bool {
+    !CLOSED_CAPTIONS_DISABLED.load(Ordering::Relaxed)
+}
+
+fn disable_closed_captions_for_run(reason: &str) {
+    if !CLOSED_CAPTIONS_DISABLED.swap(true, Ordering::Relaxed) {
+        eprintln!("captions: disabling closed captions for this run ({reason})");
+    }
+}
+
+fn disable_open_captions_for_run(reason: &str) {
+    if !OPEN_CAPTIONS_DISABLED.swap(true, Ordering::Relaxed) {
+        eprintln!("captions: disabling open captions for this run ({reason})");
+    }
+    disable_closed_captions_for_run(reason);
+}
+
+fn captions_persist_failures() -> bool {
+    std::env::var("CLIP_CAPTIONS_PERSIST_FAILURE")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+fn reset_caption_disable_for_segment() {
+    if !captions_persist_failures() {
+        if captions_enabled() {
+            OPEN_CAPTIONS_DISABLED.store(false, Ordering::Relaxed);
+        }
+        if closed_captions_enabled() {
+            CLOSED_CAPTIONS_DISABLED.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+struct TempFilterScript {
+    path: PathBuf,
+}
+
+impl TempFilterScript {
+    fn new(kind: &str, graph: &str) -> Result<Self> {
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis();
+        let filename = format!("autoclip_ffmpeg_{kind}_{stamp}.txt");
+        let path = std::env::temp_dir().join(filename);
+        fs::write(&path, graph).context("writing ffmpeg filter script")?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempFilterScript {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn should_use_filter_script(graph: &str) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    if graph.contains("drawtext=") || graph.contains("subtitles=") {
+        return true;
+    }
+    graph.len() > 8000
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct FontconfigPaths {
+    config_file: PathBuf,
+    config_dir: PathBuf,
+}
+
+#[cfg(windows)]
+fn fontconfig_paths_for_ffmpeg() -> Option<&'static FontconfigPaths> {
+    static FONTCONFIG_PATHS: OnceLock<Option<FontconfigPaths>> = OnceLock::new();
+    FONTCONFIG_PATHS
+        .get_or_init(|| {
+            let windows_dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+            let fonts_dir = Path::new(&windows_dir).join("Fonts");
+            if !fonts_dir.exists() {
+                return None;
+            }
+            let config_dir = std::env::temp_dir().join("autoclip_fontconfig");
+            if fs::create_dir_all(&config_dir).is_err() {
+                return None;
+            }
+            let config_file = config_dir.join("fonts.conf");
+            if !config_file.exists() {
+                let fonts_dir_str = fonts_dir
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let config = format!(
+                    "<?xml version=\"1.0\"?>\n\
+<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n\
+<fontconfig>\n  <dir>{}</dir>\n</fontconfig>\n",
+                    fonts_dir_str
+                );
+                if fs::write(&config_file, config).is_err() {
+                    return None;
+                }
+            }
+            Some(FontconfigPaths { config_file, config_dir })
+        })
+        .as_ref()
+}
+
+fn apply_fontconfig_env_for_ffmpeg(cmd: &mut Command) {
+    if !cfg!(windows) {
+        return;
+    }
+    if std::env::var_os("FONTCONFIG_FILE").is_some()
+        || std::env::var_os("FONTCONFIG_PATH").is_some()
+    {
+        return;
+    }
+    if let Some(paths) = fontconfig_paths_for_ffmpeg() {
+        cmd.env("FONTCONFIG_FILE", paths.config_file.as_os_str());
+        cmd.env("FONTCONFIG_PATH", paths.config_dir.as_os_str());
+    }
+}
+
 async fn run_ffmpeg_encode(
     input: &str,
     out_path: &Path,
@@ -3111,6 +3614,7 @@ async fn run_ffmpeg_encode(
     use_hw_frames: bool,
     regen_pts: bool,
     force_ts_input: bool,
+    fast_seek: bool,
     start_offset_secs: Option<f32>,
     duration_secs: Option<f32>,
     progress: Option<ProgressSpec>,
@@ -3118,6 +3622,27 @@ async fn run_ffmpeg_encode(
     subtitles: Option<&SubtitleSpec>,
 ) -> Result<std::process::Output> {
     let mut cmd = Command::new("ffmpeg");
+    let mut _filter_script: Option<TempFilterScript> = None;
+    apply_fontconfig_env_for_ffmpeg(&mut cmd);
+    let hwaccel_env = std::env::var("FFMPEG_HWACCEL").unwrap_or_default();
+    let hwaccel_label = if hwaccel_env.trim().is_empty() {
+        "(unset)".to_string()
+    } else {
+        hwaccel_env.clone()
+    };
+    let hw_device = ffmpeg_hwaccel_device_index();
+    if allow_hwaccel {
+        eprintln!(
+            "ffmpeg: encode start (encoder={encoder}, hwaccel={hwaccel_label}, device={hw_device:?}, subtitles={})",
+            subtitles.is_some()
+        );
+    } else {
+        eprintln!(
+            "ffmpeg: encode start (encoder={encoder}, hwaccel=disabled, subtitles={})",
+            subtitles.is_some()
+        );
+    }
+    gpu::log_nvidia_snapshot_throttled("ffmpeg", 30);
     cmd.arg("-y");
     // Elevate logging when using NVENC to capture filter negotiation issues.
     if use_nvenc {
@@ -3143,12 +3668,17 @@ async fn run_ffmpeg_encode(
         cmd.arg("-progress").arg("pipe:1");
         cmd.arg("-nostats");
     }
+    if let Some(ss) = start_offset_secs {
+        if fast_seek && ss > 0.0 {
+            cmd.arg("-ss").arg(format!("{ss:.3}"));
+        }
+    }
     cmd.arg("-i").arg(input);
     if let Some(subs) = subtitles {
         cmd.arg("-i").arg(subs.path.as_os_str());
     }
     if let Some(ss) = start_offset_secs {
-        if ss > 0.0 {
+        if !fast_seek && ss > 0.0 {
             cmd.arg("-ss").arg(format!("{ss:.3}"));
         }
     }
@@ -3158,10 +3688,22 @@ async fn run_ffmpeg_encode(
     match filters {
         FilterGraph::Vf(vf) => {
             cmd.arg("-map").arg("0:v:0");
-            cmd.arg("-vf").arg(vf);
+            if should_use_filter_script(vf) {
+                let script = TempFilterScript::new("vf", vf)?;
+                cmd.arg("-filter_script:v").arg(script.path.as_os_str());
+                _filter_script = Some(script);
+            } else {
+                cmd.arg("-vf").arg(vf);
+            }
         }
         FilterGraph::Complex { graph, output } => {
-            cmd.arg("-filter_complex").arg(graph);
+            if should_use_filter_script(graph) {
+                let script = TempFilterScript::new("complex", graph)?;
+                cmd.arg("-filter_complex_script").arg(script.path.as_os_str());
+                _filter_script = Some(script);
+            } else {
+                cmd.arg("-filter_complex").arg(graph);
+            }
             cmd.arg("-map").arg(format!("[{output}]"));
         }
     }
@@ -3445,6 +3987,7 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
     let mut progress = spec.progress;
     let live_fast = spec.live_fast;
     let fast_preset = spec.fast_preset;
+    let fast_seek = spec.fast_seek;
     if progress.is_none() && ffmpeg_progress_enabled() {
         progress = Some(ProgressSpec {
             total_secs: duration_secs,
@@ -3573,13 +4116,19 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
     } else {
         None
     };
-    let caption_cfg = if live_fast {
+    let mut caption_cfg = if live_fast {
         None
     } else {
         read_caption_config(out_h)
     };
+    if caption_cfg.is_some() && !open_captions_allowed() {
+        caption_cfg = None;
+    }
     let llm_cfg = if live_fast { None } else { read_llm_config() };
-    let closed_captions = if live_fast { false } else { closed_captions_enabled() };
+    let mut closed_captions = if live_fast { false } else { closed_captions_enabled() };
+    if closed_captions && !closed_captions_allowed() {
+        closed_captions = false;
+    }
     if live_fast {
         eprintln!("live render: skipping captions/LLM for faster clip output");
     }
@@ -3592,39 +4141,93 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
             let start_offset = start_offset_secs;
             let duration = duration_secs;
             let force_ts = force_ts_input;
-            transcript = match tokio::task::spawn_blocking(move || {
-                transcribe_clip_audio(&input_owned, start_offset, duration, force_ts)
-            })
-            .await
             {
-                Ok(Ok(payload)) => Some(payload),
-                Ok(Err(err)) => {
-                    eprintln!("captions: transcription failed: {err:#}");
-                    None
-                }
-                Err(err) => {
-                    eprintln!("captions: transcription task failed: {err}");
-                    None
-                }
-            };
-        }
-    }
-    let mut caption_chain: Option<String> = None;
-    if let (Some(cfg), Some(payload)) = (caption_cfg.as_ref(), transcript.as_ref()) {
-        let caption_words = build_caption_words(payload.words.clone(), cfg, duration_secs);
-        if cfg.debug && !caption_words.is_empty() {
-            for word in &caption_words {
-                eprintln!(
-                    "captions word: {:.2}-{:.2} {}",
-                    word.start, word.end, word.text
-                );
+                let _span = profile_span("captions: transcribe audio");
+                transcript = match tokio::task::spawn_blocking(move || {
+                    transcribe_clip_audio(&input_owned, start_offset, duration, force_ts)
+                })
+                .await
+                {
+                    Ok(Ok(payload)) => Some(payload),
+                    Ok(Err(err)) => {
+                        eprintln!("captions: transcription failed: {err:#}");
+                        None
+                    }
+                    Err(err) => {
+                        eprintln!("captions: transcription task failed: {err}");
+                        None
+                    }
+                };
             }
         }
-        if !caption_words.is_empty() {
-            let y = caption_y_for_layout(cfg, layout_is_stacked, stacked_dims, out_h);
-            let chain = build_caption_drawtext_chain(&caption_words, cfg, y);
-            if !chain.is_empty() {
-                caption_chain = Some(chain);
+    }
+    reset_caption_disable_for_segment();
+    let mut caption_chain: Option<String> = None;
+    let mut _open_caption_temp: Option<TempSubtitle> = None;
+    if let (Some(cfg), Some(payload)) = (caption_cfg.as_ref(), transcript.as_ref()) {
+        let adjusted_cfg = adjust_caption_font_size(cfg, payload, out_w);
+        let y = caption_y_for_layout(&adjusted_cfg, layout_is_stacked, stacked_dims, out_h);
+        let mut try_subtitles = |payload: &TranscriptPayload| {
+            if let Some(ass) = build_ass_from_payload_with_limits(
+                payload,
+                duration_secs,
+                &adjusted_cfg,
+                y,
+                out_w,
+                out_h,
+            ) {
+                match write_temp_ass(&ass) {
+                    Ok(path) => {
+                        _open_caption_temp = Some(TempSubtitle::new(path.clone()));
+                        let chain =
+                            build_caption_subtitles_filter(&path, &adjusted_cfg, y, out_w, out_h);
+                        if !chain.is_empty() {
+                            caption_chain = Some(chain);
+                        }
+                        if adjusted_cfg.debug {
+                            let cue_count = ass.lines().filter(|line| line.starts_with("Dialogue:")).count();
+                            eprintln!(
+                                "open captions: generated {cue_count} cues via subtitles filter"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("open captions: failed to write ass: {err:#}");
+                    }
+                }
+            }
+        };
+
+        match caption_render_mode() {
+            CaptionRender::Drawtext => {
+                match build_drawtext_caption_filter_with_limit(
+                    payload,
+                    duration_secs,
+                    &adjusted_cfg,
+                    y,
+                    out_w,
+                    out_h,
+                ) {
+                    DrawtextBuildResult::Chain { chain, cue_count } => {
+                        if !chain.trim().is_empty() {
+                            caption_chain = Some(chain);
+                        }
+                        if adjusted_cfg.debug {
+                            eprintln!(
+                                "open captions: generated {cue_count} cues via drawtext"
+                            );
+                        }
+                    }
+                    DrawtextBuildResult::TooManyCues { cue_count, max_cues } => {
+                        eprintln!(
+                            "open captions: drawtext cue count {cue_count} exceeds limit {max_cues}; falling back to subtitles renderer"
+                        );
+                        try_subtitles(payload);
+                    }
+                }
+            }
+            CaptionRender::Subtitles => {
+                try_subtitles(payload);
             }
         }
     }
@@ -3632,7 +4235,18 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
     let mut _subtitle_temp: Option<TempSubtitle> = None;
     if closed_captions {
         if let Some(payload) = transcript.as_ref() {
-            if let Some(srt) = build_srt_from_payload(payload, duration_secs) {
+            if let Some(srt) = build_srt_from_payload_with_limits(
+                payload,
+                duration_secs,
+                caption_cfg
+                    .as_ref()
+                    .map(|c| c.min_word_secs)
+                    .unwrap_or(0.12),
+                caption_cfg
+                    .as_ref()
+                    .map(|c| c.max_words)
+                    .unwrap_or(usize::MAX),
+            ) {
                 match write_temp_srt(&srt) {
                     Ok(path) => {
                         subtitle_spec = Some(SubtitleSpec { path: path.clone() });
@@ -3649,6 +4263,10 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
             eprintln!("closed captions: transcription unavailable");
         }
     }
+    let has_open_captions = caption_chain.is_some();
+    let has_closed_captions = subtitle_spec.is_some();
+    let has_captions = has_open_captions || has_closed_captions;
+    let subtitle_encode_spec: Option<SubtitleSpec> = None;
     let mut clip_metadata: Option<ClipMetadata> = None;
     if let (Some(cfg), Some(payload)) = (llm_cfg.as_ref(), transcript.as_ref()) {
         let mut text = payload.text.trim().to_string();
@@ -3663,6 +4281,7 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
                 .to_string();
         }
         if !text.is_empty() {
+            let _span = profile_span("llm: generate metadata");
             match generate_clip_metadata(&text, cfg).await {
                 Ok(Some(meta)) => {
                     clip_metadata = Some(meta);
@@ -3728,14 +4347,22 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
     } else {
         FilterGraph::Vf(vf_gpu)
     };
+    let captions_active = caption_chain.is_some() || subtitle_spec.is_some();
+    let filter_cpu_base = filter_cpu.clone();
     if let Some(chain) = caption_chain.as_deref() {
         filter_cpu = append_filter_graph(&filter_cpu, chain);
         filter_gpu = append_filter_graph(&filter_gpu, chain);
     }
     let force_cpu_filters =
         (is_stream_unstable(input) && is_nvenc) || layout_is_stacked || face_only || tracked_fullscreen;
-    let allow_hwaccel = !is_stream_unstable(input);
+    let mut allow_hwaccel = !is_stream_unstable(input);
     let use_cpu_filters = force_cpu_filters || !is_nvenc;
+    if captions_active && use_cpu_filters {
+        if allow_hwaccel {
+            eprintln!("ffmpeg: captions with CPU filters; disabling hwaccel decode");
+        }
+        allow_hwaccel = false;
+    }
     let use_hw_frames = allow_hwaccel && hw_decode_cuda && !use_cpu_filters;
     let cpu_hwdownload = use_hw_frames;
     if force_cpu_filters {
@@ -3799,11 +4426,12 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
         use_hw_frames,
         regen_pts,
         force_ts_input,
+        fast_seek,
         start_offset_secs,
         duration_secs,
         progress,
         clip_metadata.as_ref(),
-        subtitle_spec.as_ref(),
+        subtitle_encode_spec.as_ref(),
     )
     .await?;
 
@@ -3812,11 +4440,19 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
         let stderr_first = String::from_utf8_lossy(&output.stderr).into_owned();
         let stdout_first = String::from_utf8_lossy(&output.stdout).into_owned();
         let mut retried_cpu = false;
+        let mut retried_no_subtitles = false;
+        let mut retried_no_captions = false;
+        let mut retried_no_subtitles_reason: Option<&'static str> = None;
 
         if is_hw {
             let filter_failure = stderr_indicates_filter_issue(&stderr_first);
             if filter_failure && !layout_is_stacked {
                 mark_stream_unstable(input);
+                allow_hwaccel = false;
+            }
+            if ffmpeg_status_indicates_crash(&output.status, &stderr_first) {
+                mark_stream_unstable(input);
+                allow_hwaccel = false;
             }
             eprintln!(
                 "ffmpeg hardware path failed (status {}); falling back to CPU/libx264. stderr (truncated): {}",
@@ -3838,11 +4474,12 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
                     false,
                     regen_pts,
                     force_ts_input,
+                    fast_seek,
                     start_offset_secs,
                     duration_secs,
                     progress,
                     clip_metadata.as_ref(),
-                    subtitle_spec.as_ref(),
+                    subtitle_encode_spec.as_ref(),
                 )
                 .await?;
             }
@@ -3860,14 +4497,210 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
                     false,
                     regen_pts,
                     force_ts_input,
+                    fast_seek,
                     start_offset_secs,
                     duration_secs,
                     progress,
                     clip_metadata.as_ref(),
-                    subtitle_spec.as_ref(),
+                    subtitle_encode_spec.as_ref(),
                 )
                 .await?;
                 retried_cpu = true;
+            }
+        }
+
+        if !output.status.success() {
+            let stderr2 = String::from_utf8_lossy(&output.stderr).into_owned();
+            if ffmpeg_status_indicates_crash(&output.status, &stderr2) {
+                mark_stream_unstable(input);
+                allow_hwaccel = false;
+                let drop_subtitles = subtitle_encode_spec.is_some();
+                if drop_subtitles {
+                    eprintln!(
+                        "ffmpeg: crash detected; retrying without closed captions (keeping open captions)"
+                    );
+                } else {
+                    eprintln!("ffmpeg: crash detected; retrying with software decode/encode");
+                }
+                cleanup_temp_output(&temp_out);
+                output = run_ffmpeg_encode(
+                    input,
+                    &temp_out,
+                    &filter_cpu,
+                    "libx264",
+                    false,
+                    false,
+                    fast_preset,
+                    false,
+                    false,
+                    regen_pts,
+                    force_ts_input,
+                    fast_seek,
+                    start_offset_secs,
+                    duration_secs,
+                    progress,
+                    clip_metadata.as_ref(),
+                    if drop_subtitles {
+                        None
+                    } else {
+                        subtitle_encode_spec.as_ref()
+                    },
+                )
+                .await?;
+                if output.status.success() && drop_subtitles {
+                    retried_no_subtitles = true;
+                    retried_no_subtitles_reason = Some("ffmpeg crash");
+                }
+            }
+        }
+
+        if !output.status.success() && has_open_captions && !retried_no_captions {
+            let stderr2 = String::from_utf8_lossy(&output.stderr).into_owned();
+            if caption_render_mode() == CaptionRender::Drawtext
+                && (ffmpeg_status_indicates_crash(&output.status, &stderr2)
+                    || ffmpeg_error_indicates_caption_issue(&stderr2))
+            {
+                if let (Some(cfg), Some(payload)) = (caption_cfg.as_ref(), transcript.as_ref()) {
+                    let adjusted_cfg = adjust_caption_font_size(cfg, payload, out_w);
+                    let y = caption_y_for_layout(&adjusted_cfg, layout_is_stacked, stacked_dims, out_h);
+                    if let Some(ass) = build_ass_from_payload_with_limits(
+                        payload,
+                        duration_secs,
+                        &adjusted_cfg,
+                        y,
+                        out_w,
+                        out_h,
+                    ) {
+                        match write_temp_ass(&ass) {
+                            Ok(path) => {
+                                let chain =
+                                    build_caption_subtitles_filter(&path, &adjusted_cfg, y, out_w, out_h);
+                                _open_caption_temp = Some(TempSubtitle::new(path.clone()));
+                                if !chain.is_empty() {
+                                    let fallback_filter = append_filter_graph(&filter_cpu_base, &chain);
+                                    eprintln!(
+                                        "ffmpeg: retrying with subtitles renderer for open captions"
+                                    );
+                                    cleanup_temp_output(&temp_out);
+                                    output = run_ffmpeg_encode(
+                                        input,
+                                        &temp_out,
+                                        &fallback_filter,
+                                        "libx264",
+                                        false,
+                                        false,
+                                        fast_preset,
+                                        false,
+                                        false,
+                                        regen_pts,
+                                        force_ts_input,
+                                        fast_seek,
+                                        start_offset_secs,
+                                        duration_secs,
+                                        progress,
+                                        clip_metadata.as_ref(),
+                                        None,
+                                    )
+                                    .await?;
+                                    // on success we keep subtitles renderer result
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("open captions: failed to write ass: {err:#}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            if output.status.success() {
+                // Successfully recovered with subtitles renderer.
+            } else if ffmpeg_status_indicates_crash(&output.status, &stderr2) {
+                eprintln!("ffmpeg: crash detected; retrying without open captions");
+                cleanup_temp_output(&temp_out);
+                output = run_ffmpeg_encode(
+                    input,
+                    &temp_out,
+                    &filter_cpu_base,
+                    "libx264",
+                    false,
+                    false,
+                    fast_preset,
+                    false,
+                    false,
+                    regen_pts,
+                    force_ts_input,
+                    fast_seek,
+                    start_offset_secs,
+                    duration_secs,
+                    progress,
+                    clip_metadata.as_ref(),
+                    None,
+                )
+                .await?;
+                if output.status.success() {
+                    retried_no_captions = true;
+                }
+            }
+        }
+
+        if !output.status.success() {
+            cleanup_temp_output(&temp_out);
+            let stderr2 = String::from_utf8_lossy(&output.stderr).into_owned();
+            if has_captions && ffmpeg_error_indicates_caption_issue(&stderr2) {
+                if has_open_captions && subtitle_encode_spec.is_some() {
+                    eprintln!("ffmpeg: captions failed; retrying without closed captions");
+                    cleanup_temp_output(&temp_out);
+                    output = run_ffmpeg_encode(
+                        input,
+                        &temp_out,
+                        &filter_cpu,
+                        "libx264",
+                        false,
+                        false,
+                        fast_preset,
+                        allow_hwaccel,
+                        false,
+                        regen_pts,
+                        force_ts_input,
+                        fast_seek,
+                        start_offset_secs,
+                        duration_secs,
+                        progress,
+                        clip_metadata.as_ref(),
+                        None,
+                    )
+                    .await?;
+                    retried_no_subtitles = output.status.success();
+                    if retried_no_subtitles && retried_no_subtitles_reason.is_none() {
+                        retried_no_subtitles_reason = Some("font/render failure");
+                    }
+                }
+                if !output.status.success() {
+                    eprintln!("ffmpeg: captions failed; retrying without captions");
+                    cleanup_temp_output(&temp_out);
+                    output = run_ffmpeg_encode(
+                        input,
+                        &temp_out,
+                        &filter_cpu_base,
+                        "libx264",
+                        false,
+                        false,
+                        fast_preset,
+                        allow_hwaccel,
+                        false,
+                        regen_pts,
+                        force_ts_input,
+                        fast_seek,
+                        start_offset_secs,
+                        duration_secs,
+                        progress,
+                        clip_metadata.as_ref(),
+                        None,
+                    )
+                    .await?;
+                    retried_no_captions = true;
+                }
             }
         }
 
@@ -3881,13 +4714,58 @@ async fn run_ffmpeg_internal(spec: FfmpegRenderSpec) -> Result<()> {
                 stdout2.trim(),
                 stderr2.trim()
             );
-        } else if retried_cpu {
+        }
+        if retried_cpu {
             eprintln!(
                 "ffmpeg fallback succeeded with CPU/libx264 after GPU pipeline failure. Previous stderr (truncated): {} | stdout (truncated): {}",
                 tail_trunc(&stderr_first, 200),
                 tail_trunc(&stdout_first, 200)
             );
         }
+        if retried_no_subtitles {
+            let reason = retried_no_subtitles_reason.unwrap_or("font/render failure");
+            if captions_persist_failures() {
+                disable_closed_captions_for_run(reason);
+            }
+            eprintln!(
+                "ffmpeg retry succeeded without closed captions after {reason}. Previous stderr (truncated): {}",
+                tail_trunc(&stderr_first, 200)
+            );
+        }
+        if retried_no_captions {
+            if captions_persist_failures() {
+                disable_open_captions_for_run("ffmpeg crash");
+            }
+            eprintln!(
+                "ffmpeg retry succeeded without captions after crash. Previous stderr (truncated): {}",
+                tail_trunc(&stderr_first, 200)
+            );
+        }
+    }
+
+    if let Some(subs) = subtitle_spec.as_ref() {
+        let muxed_out = temp_output_path_with_suffix(&temp_out, "muxed");
+        cleanup_temp_output(&muxed_out);
+        let output = run_ffmpeg_mux_subtitles(&temp_out, &muxed_out, subs).await?;
+        if !output.status.success() {
+            cleanup_temp_output(&muxed_out);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            anyhow::bail!(
+                "ffmpeg subtitle mux failed with status {}\nstdout: {}\nstderr: {}",
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            );
+        }
+        cleanup_temp_output(&temp_out);
+        fs::rename(&muxed_out, &temp_out).with_context(|| {
+            format!(
+                "renaming subtitle mux output {} -> {}",
+                muxed_out.display(),
+                temp_out.display()
+            )
+        })?;
     }
 
     finalize_output_path(&temp_out, out_path)?;
@@ -3990,6 +4868,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_FFMPEG_PROGRESS_STALL_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_AUDIO_NORM", mode: EnvValueMode::Optional },
     EnvSpec { env: "GPU_VRAM_RESERVE_MB", mode: EnvValueMode::Required },
+    EnvSpec { env: "GPU_PICK_STRATEGY", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_CAPTIONS", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_CAPTIONS_POSITION", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_CAPTIONS_FONT", mode: EnvValueMode::Required },
@@ -4001,6 +4880,13 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_CAPTIONS_MAX_WORDS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_CAPTIONS_CHEST_RATIO", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_CAPTIONS_MARGIN_OFFSET", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_CAPTIONS_RENDER", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_CAPTIONS_SCALE_MIN", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_CAPTIONS_SCALE_MAX", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_CAPTIONS_SCALE_LOCK", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_CAPTIONS_DRAWTEXT_MAX", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_CAPTIONS_PERSIST_FAILURE", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_CAPTIONS_BUCKET_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_CAPTIONS_DEBUG", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_CLOSED_CAPTIONS", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_LLM_ENABLE", mode: EnvValueMode::Optional },
@@ -4026,6 +4912,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_REPROCESS_CHUNK_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_REPROCESS_SUBCHUNK_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_REPROCESS_FAST", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_REPROCESS_CONTINUE_ON_ERROR", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_TS_REALTIME", mode: EnvValueMode::Flag },
     EnvSpec { env: "CLIP_GAMEPLAY", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_REGION_DETECT", mode: EnvValueMode::Optional },
@@ -4042,6 +4929,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_STREAM_OFFLINE_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_WAKE_WORDS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_PROFILE", mode: EnvValueMode::Optional },
+    EnvSpec { env: "CLIP_WATCHDOG_GAP_SECS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_EMOTION_ENABLE", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_EMOTION_AUDIO", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_EMOTION_FACE", mode: EnvValueMode::Optional },
@@ -4064,6 +4952,7 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "CLIP_GAMEPLAY_SIZE", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_GAMEPLAY_LABELS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_GAMEPLAY_NEG_LABELS", mode: EnvValueMode::Required },
+    EnvSpec { env: "CLIP_GAMEPLAY_BUDGET_SECS", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_GAMEPLAY_DEBUG", mode: EnvValueMode::Optional },
     EnvSpec { env: "CLIP_CAM_LABELS", mode: EnvValueMode::Required },
     EnvSpec { env: "CLIP_CAM_NEG_LABELS", mode: EnvValueMode::Required },
@@ -4093,12 +4982,14 @@ const ENV_SPECS: &[EnvSpec] = &[
     EnvSpec { env: "WHISPER_MODEL", mode: EnvValueMode::Required },
     EnvSpec { env: "WHISPER_RT_TARGET", mode: EnvValueMode::Required },
     EnvSpec { env: "WHISPER_MODEL_CANDIDATES", mode: EnvValueMode::Required },
+    EnvSpec { env: "WHISPER_MODEL_BENCHMARK", mode: EnvValueMode::Optional },
     EnvSpec { env: "WHISPER_GPU", mode: EnvValueMode::Optional },
     EnvSpec { env: "WHISPER_CLIP_GPU", mode: EnvValueMode::Optional },
     EnvSpec { env: "WHISPER_MIN_FREE_VRAM_MB", mode: EnvValueMode::Required },
     EnvSpec { env: "WHISPER_CLIP_MIN_FREE_VRAM_MB", mode: EnvValueMode::Required },
     EnvSpec { env: "WHISPER_CLIP_VRAM_FACTOR", mode: EnvValueMode::Required },
     EnvSpec { env: "WHISPER_CLIP_VRAM_OVERHEAD_MB", mode: EnvValueMode::Required },
+    EnvSpec { env: "WHISPER_CLIP_VRAM_EXTRA_MB", mode: EnvValueMode::Required },
     EnvSpec { env: "WHISPER_GPU_DEVICE", mode: EnvValueMode::Optional },
     EnvSpec { env: "WHISPER_CLIP_GPU_DEVICE", mode: EnvValueMode::Optional },
     EnvSpec { env: "WHISPER_LOG_LEVEL", mode: EnvValueMode::Required },
@@ -4320,9 +5211,33 @@ fn read_wake_buffer_restart_secs() -> Option<Duration> {
     let secs = match parsed {
         Some(v) if v.is_finite() && v > 0.0 => v,
         Some(_) => return None,
-        None => 500.0,
+        None => 300.0,
     };
     Some(Duration::from_secs_f32(secs))
+}
+
+async fn run_ffmpeg_mux_subtitles(
+    input: &Path,
+    out_path: &Path,
+    subtitles: &SubtitleSpec,
+) -> Result<std::process::Output> {
+    let mut cmd = Command::new("ffmpeg");
+    apply_fontconfig_env_for_ffmpeg(&mut cmd);
+    cmd.arg("-y");
+    cmd.arg("-i").arg(input.as_os_str());
+    cmd.arg("-i").arg(subtitles.path.as_os_str());
+    cmd.arg("-map").arg("0");
+    cmd.arg("-map").arg("1:0");
+    cmd.arg("-c").arg("copy");
+    cmd.arg("-c:s").arg(subtitle_codec_for_output(out_path));
+    cmd.arg("-metadata:s:s:0").arg("language=eng");
+    cmd.arg("-disposition:s:s:0").arg("default");
+    cmd.arg(out_path.as_os_str());
+    let output = cmd
+        .output()
+        .await
+        .context("failed to run ffmpeg subtitle mux")?;
+    Ok(output)
 }
 
 fn read_wake_no_words_secs() -> Option<Duration> {
@@ -4331,9 +5246,32 @@ fn read_wake_no_words_secs() -> Option<Duration> {
     let secs = match parsed {
         Some(v) if v.is_finite() && v > 0.0 => v,
         Some(_) => return None,
-        None => 300.0,
+        None => 180.0,
     };
     Some(Duration::from_secs_f32(secs))
+}
+
+fn read_clip_gap_watchdog_secs() -> Option<Duration> {
+    let raw = std::env::var("CLIP_WATCHDOG_GAP_SECS").ok();
+    let parsed = raw.as_deref().and_then(|v| v.parse::<f32>().ok());
+    let secs = match parsed {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(_) => return None,
+        None => 600.0,
+    };
+    Some(Duration::from_secs_f32(secs))
+}
+
+fn read_wake_min_clip_gap_secs() -> Option<Duration> {
+    let raw = std::env::var("CLIP_WAKE_MIN_CLIP_SECS").ok();
+    let parsed = raw.as_deref().and_then(|v| v.parse::<f32>().ok());
+    let secs = match parsed {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(v) if v.is_finite() && v <= 0.0 => return None,
+        Some(_) => return None,
+        None => 300.0,
+    };
+    Some(Duration::from_secs_f32(secs.clamp(5.0, 3600.0)))
 }
 
 fn read_reprocess_chunk_secs() -> Option<f32> {
@@ -4360,6 +5298,13 @@ fn read_reprocess_subchunk_secs() -> Option<f32> {
 
 fn reprocess_fast_enabled() -> bool {
     std::env::var("CLIP_REPROCESS_FAST")
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
+fn reprocess_continue_on_error() -> bool {
+    std::env::var("CLIP_REPROCESS_CONTINUE_ON_ERROR")
         .ok()
         .and_then(|v| parse_bool(&v))
         .unwrap_or(false)
@@ -4504,20 +5449,35 @@ async fn concat_media_parts(parts: &[PathBuf], output_path: &Path) -> Result<()>
     if parts.is_empty() {
         anyhow::bail!("no media parts to concatenate");
     }
-    let list_path = output_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("concat_parts.txt");
+    let cwd = std::env::current_dir().context("concat: resolving cwd")?;
+    let output_abs = if output_path.is_absolute() {
+        output_path.to_path_buf()
+    } else {
+        cwd.join(output_path)
+    };
+    let parent = output_abs.parent().unwrap_or_else(|| Path::new("."));
+    let list_path = parent.join("concat_parts.txt");
     let mut list_body = String::new();
     for part in parts {
-        let line = part.to_string_lossy().replace('\'', "'\\''");
+        let part_abs = if part.is_absolute() {
+            part.to_path_buf()
+        } else {
+            cwd.join(part)
+        };
+        if !part_abs.exists() {
+            anyhow::bail!("concat missing part {}", part_abs.display());
+        }
+        let line = part_abs
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "'\\''");
         list_body.push_str("file '");
         list_body.push_str(&line);
         list_body.push_str("'\n");
     }
     fs::write(&list_path, list_body)?;
 
-    let temp_out = temp_output_path(output_path);
+    let temp_out = temp_output_path(&output_abs);
     cleanup_temp_output(&temp_out);
     let status = Command::new(ffmpeg_bin())
         .args([
@@ -4530,7 +5490,19 @@ async fn concat_media_parts(parts: &[PathBuf], output_path: &Path) -> Result<()>
             list_path.to_string_lossy().as_ref(),
             "-fflags",
             "+genpts",
-            "-c",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-max_interleave_delta",
+            "0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-af",
+            "aresample=async=1:first_pts=0",
+            "-c:s",
             "copy",
             temp_out.to_string_lossy().as_ref(),
         ])
@@ -4541,7 +5513,7 @@ async fn concat_media_parts(parts: &[PathBuf], output_path: &Path) -> Result<()>
     if !status.success() {
         anyhow::bail!("ffmpeg concat failed with status {status}");
     }
-    finalize_output_path(&temp_out, output_path)?;
+    finalize_output_path(&temp_out, &output_abs)?;
     Ok(())
 }
 
@@ -4666,7 +5638,7 @@ fn spawn_self_restart(reason: String) {
 fn kill_child_now(child: &Arc<Mutex<Option<Child>>>) {
     if let Ok(mut guard) = child.lock() {
         if let Some(proc) = guard.as_mut() {
-            let _ = proc.kill();
+            kill_child_with_timeout(proc, "child", Duration::from_secs(2));
         }
     }
 }
@@ -4674,8 +5646,28 @@ fn kill_child_now(child: &Arc<Mutex<Option<Child>>>) {
 fn kill_child_and_wait(child: &Arc<Mutex<Option<Child>>>) {
     if let Ok(mut guard) = child.lock() {
         if let Some(mut proc) = guard.take() {
-            let _ = proc.kill();
-            let _ = proc.wait();
+            kill_child_with_timeout(&mut proc, "child", Duration::from_secs(10));
+        }
+    }
+}
+
+fn kill_child_with_timeout(child: &mut Child, label: &str, timeout: Duration) {
+    let _ = child.kill();
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    eprintln!("{label}: child did not exit after kill within {:?}", timeout);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                eprintln!("{label}: failed to reap child: {err:#}");
+                return;
+            }
         }
     }
 }
@@ -4904,6 +5896,11 @@ const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("CLIP_CAPTIONS_COLOR", "white"),
     ("CLIP_CAPTIONS_OUTLINE", "3"),
     ("CLIP_CAPTIONS_OUTLINE_COLOR", "black"),
+    ("CLIP_CAPTIONS_SCALE_MIN", "0.5"),
+    ("CLIP_CAPTIONS_SCALE_MAX", "2.5"),
+    ("CLIP_CAPTIONS_SCALE_LOCK", "0"),
+    ("CLIP_CAPTIONS_PERSIST_FAILURE", "0"),
+    ("CLIP_CAPTIONS_BUCKET_SECS", "0"),
     ("CLIP_CAPTIONS_MIN_WORD_SECS", "0.12"),
     ("CLIP_CAPTIONS_MAX_WORDS", "300"),
     ("CLIP_CAPTIONS_CHEST_RATIO", "0.65"),
@@ -4927,13 +5924,15 @@ const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("CLIP_REPROCESS_CHUNK_SECS", "60"),
     ("CLIP_REPROCESS_SUBCHUNK_SECS", "0"),
     ("CLIP_REPROCESS_FAST", "0"),
+    ("CLIP_REPROCESS_CONTINUE_ON_ERROR", "0"),
     ("CLIP_LIVE_FAST", "1"),
     ("CLIP_LIVE_LAYOUT_TTL_SECS", "120"),
     ("CLIP_LOW_RESOURCES", "0"),
     ("CLIP_WAKE_WORDS", "orange"),
-    ("WAKE_BUFFER_RESTART_SECS", "500"),
-    ("WAKE_NO_WORDS_SECS", "300"),
     ("CLIP_PROFILE", "1"),
+    ("CLIP_WATCHDOG_GAP_SECS", "600"),
+    ("WAKE_BUFFER_RESTART_SECS", "300"),
+    ("WAKE_NO_WORDS_SECS", "180"),
     ("CLIP_STREAMS_POLL_SECS", "5"),
     ("CLIP_STREAMS_MAX_CONCURRENT", "1"),
     ("CLIP_M3U8_REFRESH_SECS", "240"),
@@ -4953,10 +5952,12 @@ const LIVE_CONFIG_PREFILL: &[(&str, &str)] = &[
     ("FFMPEG_MIN_FREE_VRAM_MB", "512"),
     ("FFMPEG_ENCODE_TIMEOUT_SECS", "300"),
     ("GPU_VRAM_RESERVE_MB", "512"),
+    ("GPU_PICK_STRATEGY", "free"),
     ("WHISPER_MIN_FREE_VRAM_MB", "2048"),
     ("WHISPER_CLIP_MIN_FREE_VRAM_MB", "4096"),
     ("WHISPER_CLIP_VRAM_FACTOR", "1.35"),
     ("WHISPER_CLIP_VRAM_OVERHEAD_MB", "512"),
+    ("WHISPER_CLIP_VRAM_EXTRA_MB", "1024"),
     ("WHISPER_GPU_DEVICE", ""),
     ("WHISPER_CLIP_GPU_DEVICE", ""),
     ("WHISPER_CLIP_GPU", "0"),
@@ -5531,6 +6532,7 @@ async fn main() -> Result<()> {
     apply_env_overrides(&env_overrides);
     seed_ort_dylib_from_live_config(&live_config_path);
     refresh_low_resource_state();
+    ensure_cuda_device_order();
 
     // Ensure GPU backend is preferred when available; avoid falling back to CPU due to missing env.
     if std::env::var("WHISPER_GPU").is_err() {
@@ -5538,6 +6540,8 @@ async fn main() -> Result<()> {
     }
 
     auto_assign_gpus_for_tools();
+    log_gpu_assignments();
+    check_llm_health().await;
     let page_url_arg = positionals.get(0).map(|s| s.as_str());
 
     if let Some(cmd) = page_url_arg {
@@ -5570,6 +6574,14 @@ async fn main() -> Result<()> {
                 return Ok(());
             };
             return run_reprocess_ts(path).await;
+        }
+        if cmd.eq_ignore_ascii_case("kick-vod") || cmd.eq_ignore_ascii_case("kick-latest-vod") {
+            let Some(page_url) = positionals.get(1) else {
+                eprintln!("usage: autoclip kick-vod <kick_channel_url>");
+                return Ok(());
+            };
+            let page_url = normalize_page_url(page_url);
+            return run_kick_latest_vod(&page_url).await;
         }
         if cmd.eq_ignore_ascii_case("check-gameplay-model") {
             let model_dir = positionals.get(1).map(|s| s.as_str());
@@ -5658,7 +6670,7 @@ async fn main() -> Result<()> {
     }
 
     if page_url_arg.is_none() && std::env::var("CLIP_PAGE_URL").is_err() {
-        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-ts <ts_path> | autoclip reprocess-ts <ts_path> | autoclip check-gameplay-model [model_dir] | autoclip demo-wakeword-mic <page_url> [--phrase WORDS] [--no-log-raw-wake] | autoclip face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
+        eprintln!("usage: autoclip <page_url>  (or set CLIP_PAGE_URL) | autoclip demo-buffer | autoclip demo-hls-buffer <page_url> | autoclip demo-ts <ts_path> | autoclip reprocess-ts <ts_path> | autoclip kick-vod <kick_channel_url> | autoclip check-gameplay-model [model_dir] | autoclip demo-wakeword-mic <page_url> [--phrase WORDS] [--no-log-raw-wake] | autoclip face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
         return Ok(());
     }
 
@@ -5935,9 +6947,26 @@ async fn run_ts_wake_demo(
 
 /// Reprocess a TS snapshot into a new MP4 using the current layout settings.
 async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
+    let cfg = Config::example();
+    run_reprocess_ts_with_config(ts_path, &cfg).await
+}
+
+async fn run_reprocess_ts_with_config(ts_path: &str, cfg: &Config) -> Result<()> {
     let path = Path::new(ts_path);
     if !path.exists() {
         anyhow::bail!("media file not found: {}", path.display());
+    }
+
+    if face_id_enabled() {
+        let face_id_page = std::env::var("CLIP_PAGE_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .map(|v| normalize_page_url(&v));
+        if let Some(page_url) = face_id_page.as_deref() {
+            maybe_auto_enroll_face_id(page_url).await;
+            maybe_enroll_face_id_from_media(page_url, path).await;
+        }
     }
 
     if let Some(mut live) = LiveConfigState::from_env() {
@@ -5947,17 +6976,17 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
 
     let reprocess_fast = reprocess_fast_enabled();
     if reprocess_fast {
-        std::env::set_var("CLIP_CAPTIONS", "0");
-        std::env::set_var("CLIP_CLOSED_CAPTIONS", "0");
         std::env::set_var("CLIP_LLM_ENABLE", "0");
         std::env::set_var("CLIP_AUDIO_NORM", "0");
         std::env::set_var("CLIP_EMOTION_ENABLE", "0");
         std::env::set_var("CLIP_EMOTION_AUDIO", "0");
         std::env::set_var("CLIP_EMOTION_FACE", "0");
-        eprintln!("reprocess: fast mode enabled (captions/LLM/audio norm disabled)");
+        eprintln!("reprocess: fast mode enabled (LLM/audio norm disabled)");
     }
+    // Always enable captions during reprocess runs.
+    std::env::set_var("CLIP_CAPTIONS", "1");
+    std::env::set_var("CLIP_CLOSED_CAPTIONS", "1");
 
-    let cfg = Config::example();
     let (out_w, out_h) = parse_resolution(&cfg.resolution).unwrap_or((1080, 1920));
     let progress_total_secs = probe_media_duration_secs(path).await;
     if std::env::var("CLIP_DETECT_STEP").is_err() {
@@ -5974,6 +7003,7 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
     }
     let chunk_secs = read_reprocess_chunk_secs();
     let force_ts_input = is_ts_input(path);
+    let continue_on_error = reprocess_continue_on_error();
     let input = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-utf8 input path"))?;
@@ -6065,6 +7095,7 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
                     .filter(|v| *v > 0.0 && *v + 0.01 < duration)
                     .unwrap_or(0.0);
                 let (size, mtime_ms) = input_fingerprint(path).unwrap_or((0, 0));
+                let mut segment_failed = false;
                 if use_subchunk > 0.0 {
                     let seg_dir = reprocess_segment_dir(
                         &cfg.save_path,
@@ -6110,19 +7141,22 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
                             part_duration,
                             part_path.display()
                         );
-                        let mut attempts = 0u32;
-                        let max_retries = 1u32;
+                        let mut stall_attempts = 0u32;
+                        let max_stall_retries = 1u32;
+                        let mut error_attempts = 0u32;
+                        let max_error_retries = 1u32;
                         loop {
-                            let result = run_ffmpeg_internal(
-                                FfmpegRenderSpec::new(input, &part_path, out_w, out_h)
-                                    .with_duration(Some(part_duration))
-                                    .with_start_offset(Some(part_start))
-                                    .with_force_ts_input(force_ts_input)
-                                    .with_progress(Some(ProgressSpec {
-                                        total_secs: Some(part_duration),
-                                    }))
-                                    .with_live_fast(false)
-                                    .with_fast_preset(reprocess_fast),
+                        let result = run_ffmpeg_internal(
+                            FfmpegRenderSpec::new(input, &part_path, out_w, out_h)
+                                .with_duration(Some(part_duration))
+                                .with_start_offset(Some(part_start))
+                                .with_force_ts_input(force_ts_input)
+                                .with_fast_seek(true)
+                                .with_progress(Some(ProgressSpec {
+                                    total_secs: Some(part_duration),
+                                }))
+                                .with_live_fast(false)
+                                .with_fast_preset(reprocess_fast),
                             )
                             .await;
                             match result {
@@ -6130,15 +7164,15 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
                                 Err(err) => {
                                     let msg = err.to_string();
                                     if ffmpeg_error_indicates_stall(&msg) {
-                                        if attempts < max_retries {
-                                            attempts += 1;
+                                        if stall_attempts < max_stall_retries {
+                                            stall_attempts += 1;
                                             eprintln!(
                                                 "reprocess: ffmpeg stalled; retrying segment {}/{} part {} (retry {}/{})",
                                                 idx,
                                                 segments,
                                                 part_index + 1,
-                                                attempts,
-                                                max_retries
+                                                stall_attempts,
+                                                max_stall_retries
                                             );
                                             continue;
                                         }
@@ -6150,9 +7184,34 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
                                         );
                                         return Ok(());
                                     }
+                                    if error_attempts < max_error_retries {
+                                        error_attempts += 1;
+                                        eprintln!(
+                                            "reprocess: ffmpeg failed; retrying segment {}/{} part {} (retry {}/{})",
+                                            idx,
+                                            segments,
+                                            part_index + 1,
+                                            error_attempts,
+                                            max_error_retries
+                                        );
+                                        continue;
+                                    }
+                                    if continue_on_error {
+                                        eprintln!(
+                                            "reprocess: ffmpeg failed for segment {}/{} part {}; skipping segment: {err:#}",
+                                            idx,
+                                            segments,
+                                            part_index + 1
+                                        );
+                                        segment_failed = true;
+                                        break;
+                                    }
                                     return Err(err);
                                 }
                             }
+                        }
+                        if segment_failed {
+                            break;
                         }
                         part_index += 1;
                         part_start += part_duration;
@@ -6174,8 +7233,69 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
                         };
                         let _ = write_reprocess_resume_state(&resume_path, &resume_state);
                     }
+                    if segment_failed {
+                        let next_start = segment_end;
+                        let resume_state = ReprocessResumeState {
+                            input_path: input.to_string(),
+                            input_size: size,
+                            input_mtime_ms: mtime_ms,
+                            chunk_secs,
+                            subchunk_secs: Some(use_subchunk),
+                            total_secs: Some(total_secs),
+                            next_start_secs: next_start,
+                            next_index: idx + 1,
+                            segment_index: None,
+                            segment_start_secs: None,
+                            segment_duration_secs: None,
+                            segment_output_path: None,
+                            next_part_index: None,
+                            updated_ms: now_unix_ms(),
+                        };
+                        let _ = write_reprocess_resume_state(&resume_path, &resume_state);
+                        let _ = fs::remove_dir_all(&seg_dir);
+                        eprintln!(
+                            "reprocess: skipping segment {}/{} after ffmpeg error",
+                            idx, segments
+                        );
+                        start = next_start;
+                        idx += 1;
+                        continue;
+                    }
                     let parts = collect_part_files(&seg_dir)?;
-                    concat_media_parts(&parts, &output_path).await?;
+                    match concat_media_parts(&parts, &output_path).await {
+                        Ok(()) => {}
+                        Err(err) => {
+                            if continue_on_error {
+                                let next_start = segment_end;
+                                let resume_state = ReprocessResumeState {
+                                    input_path: input.to_string(),
+                                    input_size: size,
+                                    input_mtime_ms: mtime_ms,
+                                    chunk_secs,
+                                    subchunk_secs: Some(use_subchunk),
+                                    total_secs: Some(total_secs),
+                                    next_start_secs: next_start,
+                                    next_index: idx + 1,
+                                    segment_index: None,
+                                    segment_start_secs: None,
+                                    segment_duration_secs: None,
+                                    segment_output_path: None,
+                                    next_part_index: None,
+                                    updated_ms: now_unix_ms(),
+                                };
+                                let _ = write_reprocess_resume_state(&resume_path, &resume_state);
+                                let _ = fs::remove_dir_all(&seg_dir);
+                                eprintln!(
+                                    "reprocess: concat failed for segment {}/{}; skipping: {err:#}",
+                                    idx, segments
+                                );
+                                start = next_start;
+                                idx += 1;
+                                continue;
+                            }
+                            return Err(err);
+                        }
+                    }
                     let _ = fs::remove_dir_all(&seg_dir);
                 } else {
                     let resume_state = ReprocessResumeState {
@@ -6208,14 +7328,17 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
                         duration,
                         output_path.display()
                     );
-                    let mut attempts = 0u32;
-                    let max_retries = 1u32;
+                    let mut stall_attempts = 0u32;
+                    let max_stall_retries = 1u32;
+                    let mut error_attempts = 0u32;
+                    let max_error_retries = 1u32;
                     loop {
                         let result = run_ffmpeg_internal(
                             FfmpegRenderSpec::new(input, &output_path, out_w, out_h)
                                 .with_duration(Some(duration))
                                 .with_start_offset(Some(segment_start))
                                 .with_force_ts_input(force_ts_input)
+                                .with_fast_seek(true)
                                 .with_progress(Some(ProgressSpec {
                                     total_secs: Some(duration),
                                 }))
@@ -6228,14 +7351,14 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
                             Err(err) => {
                                 let msg = err.to_string();
                                 if ffmpeg_error_indicates_stall(&msg) {
-                                    if attempts < max_retries {
-                                        attempts += 1;
+                                    if stall_attempts < max_stall_retries {
+                                        stall_attempts += 1;
                                         eprintln!(
                                             "reprocess: ffmpeg stalled; retrying segment {}/{} (retry {}/{})",
                                             idx,
                                             segments,
-                                            attempts,
-                                            max_retries
+                                            stall_attempts,
+                                            max_stall_retries
                                         );
                                         continue;
                                     }
@@ -6247,9 +7370,51 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
                                     );
                                     return Ok(());
                                 }
+                                if error_attempts < max_error_retries {
+                                    error_attempts += 1;
+                                    eprintln!(
+                                        "reprocess: ffmpeg failed; retrying segment {}/{} (retry {}/{})",
+                                        idx,
+                                        segments,
+                                        error_attempts,
+                                        max_error_retries
+                                    );
+                                    continue;
+                                }
+                                if continue_on_error {
+                                    eprintln!(
+                                        "reprocess: ffmpeg failed for segment {}/{}; skipping: {err:#}",
+                                        idx, segments
+                                    );
+                                    segment_failed = true;
+                                    break;
+                                }
                                 return Err(err);
                             }
                         }
+                    }
+                    if segment_failed {
+                        let next_start = segment_end;
+                        let resume_state = ReprocessResumeState {
+                            input_path: input.to_string(),
+                            input_size: size,
+                            input_mtime_ms: mtime_ms,
+                            chunk_secs,
+                            subchunk_secs,
+                            total_secs: Some(total_secs),
+                            next_start_secs: next_start,
+                            next_index: idx + 1,
+                            segment_index: None,
+                            segment_start_secs: None,
+                            segment_duration_secs: None,
+                            segment_output_path: None,
+                            next_part_index: None,
+                            updated_ms: now_unix_ms(),
+                        };
+                        let _ = write_reprocess_resume_state(&resume_path, &resume_state);
+                        start = next_start;
+                        idx += 1;
+                        continue;
                     }
                 }
                 let next_start = segment_start + duration;
@@ -6280,17 +7445,25 @@ async fn run_reprocess_ts(ts_path: &str) -> Result<()> {
     }
 
     let output_path = next_output_path(&cfg.save_path, &cfg.file_name_stub)?;
-    run_ffmpeg_internal(
+    if let Err(err) = run_ffmpeg_internal(
         FfmpegRenderSpec::new(input, &output_path, out_w, out_h)
             .with_duration(progress_total_secs)
             .with_force_ts_input(force_ts_input)
+            .with_fast_seek(true)
             .with_progress(Some(ProgressSpec {
                 total_secs: progress_total_secs,
             }))
             .with_live_fast(false)
             .with_fast_preset(reprocess_fast),
     )
-    .await?;
+    .await
+    {
+        if continue_on_error {
+            eprintln!("reprocess: ffmpeg failed; skipping output: {err:#}");
+            return Ok(());
+        }
+        return Err(err);
+    }
     println!("reprocessed media clip -> {}", output_path.display());
     Ok(())
 }
@@ -6304,6 +7477,14 @@ fn is_ts_input(path: &Path) -> bool {
 
 fn ffmpeg_error_indicates_stall(message: &str) -> bool {
     message.contains("ffmpeg progress stalled") || message.contains("ffmpeg encode timed out")
+}
+
+fn ffmpeg_error_indicates_caption_issue(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("fontconfig error")
+        || msg.contains("cannot load default config file")
+        || msg.contains("libass")
+        || msg.contains("drawtext")
 }
 
 fn run_check_gameplay_model(model_dir: Option<&str>) -> Result<()> {
@@ -6617,6 +7798,7 @@ fn print_help(bin: &str) {
     println!("  {bin} demo-hls-buffer <page_url>");
     println!("  {bin} demo-ts <path_to_ts> [--phrase WORDS] [--no-log-raw-wake]");
     println!("  {bin} reprocess-ts <path_to_ts>");
+    println!("  {bin} kick-vod <kick_channel_url>");
     println!("  {bin} check-gameplay-model [model_dir]");
     println!("  {bin} demo-detect <media_path>");
     println!("  {bin} face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
@@ -6642,6 +7824,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_PAGE_URL            Default page when none is passed");
     println!("  CLIP_LAYOUT              Layout mode: stacked (default) or full");
     println!("  CLIP_FACE_RATIO          Height ratio reserved for face panel (default 0.40)");
+    println!("  CLIP_FACE_MIN_STACKED_RATIO Minimum face crop size for stacked layout (default 0.25)");
     println!("  CLIP_FACE_CROP           Face crop expr w:h:x:y (optional, overrides detection/anchor)");
     println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 6.0)");
     println!("  CLIP_FACE_ZOOM           Face crop zoom factor (>1 zooms out, <1 zooms in; default 1.0)");
@@ -6667,11 +7850,20 @@ fn print_help(bin: &str) {
     println!("  CLIP_AUDIO_NORM          Normalize clip audio loudness (default true)");
     println!("  CLIP_CAPTIONS            Enable word-by-word open captions (default false)");
     println!("  CLIP_CAPTIONS_POSITION   Caption placement: margin (default) or chest");
+    println!("  CLIP_CAPTIONS_RENDER     Open caption renderer: drawtext (default) or subtitles");
     println!("  CLIP_CAPTIONS_FONT       Caption font name or TTF path (optional)");
     println!("  CLIP_CAPTIONS_SIZE       Caption font size px or ratio (<=2 treated as ratio)");
     println!("  CLIP_CAPTIONS_COLOR      Caption text color (default white)");
     println!("  CLIP_CAPTIONS_OUTLINE    Caption outline width (default 3)");
     println!("  CLIP_CAPTIONS_OUTLINE_COLOR Caption outline color (default black)");
+    println!("  CLIP_CAPTIONS_WIDTH_RATIO Max width fraction for captions (default 0.85)");
+    println!("  CLIP_CAPTIONS_GLYPH_RATIO Glyph width multiplier for caption sizing (default 0.7)");
+    println!("  CLIP_CAPTIONS_SCALE_MIN  Drawtext min scale vs base size (default 0.5)");
+    println!("  CLIP_CAPTIONS_SCALE_MAX  Drawtext max scale vs base size (default 2.5)");
+    println!("  CLIP_CAPTIONS_SCALE_LOCK Lock drawtext font size per segment (default false)");
+    println!("  CLIP_CAPTIONS_DRAWTEXT_MAX Max drawtext cues before fallback (default 120)");
+    println!("  CLIP_CAPTIONS_PERSIST_FAILURE Keep captions disabled after failure (default false)");
+    println!("  CLIP_CAPTIONS_BUCKET_SECS Bucket size to merge words (0 disables, default 0)");
     println!("  CLIP_CAPTIONS_MIN_WORD_SECS Minimum per-word on-screen time (default 0.12s)");
     println!("  CLIP_CAPTIONS_MAX_WORDS  Cap on rendered words (default 300)");
     println!("  CLIP_CAPTIONS_CHEST_RATIO Caption Y ratio when placed on chest (default 0.65)");
@@ -6695,6 +7887,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_REPROCESS_CHUNK_SECS Chunk duration for reprocess-ts media (default 60, 0 disables)");
     println!("  CLIP_REPROCESS_SUBCHUNK_SECS Sub-chunk duration for reprocess resume (default unset)");
     println!("  CLIP_REPROCESS_FAST      Speed-focused reprocess (skip captions/LLM/audio norm, faster encode)");
+    println!("  CLIP_REPROCESS_CONTINUE_ON_ERROR Keep reprocess running after ffmpeg errors (default false)");
     println!("  CLIP_FACE_BUDGET_SECS    Override face detection time budget in seconds");
     println!("  CLIP_FACE_TILE_MIN_SCORE Tile search min score (default 0.60; set <= 0 to disable)");
     println!("  CLIP_FACE_TILE_MAX_DEPTH Max bisection depth for tile search (default 3)");
@@ -6774,6 +7967,7 @@ fn print_help(bin: &str) {
     println!("  CLIP_GAMEPLAY_NEG_LABELS CLIP gameplay negative labels");
     println!("  CLIP_GAMEPLAY_SCORE      CLIP gameplay score threshold (default 0.12)");
     println!("  CLIP_GAMEPLAY_TOPK       CLIP gameplay top-k patches (default 6)");
+    println!("  CLIP_GAMEPLAY_BUDGET_SECS Override gameplay sampling time budget in seconds");
     println!("  CLIP_CAM_LABELS          CLIP cam positive labels");
     println!("  CLIP_CAM_NEG_LABELS      CLIP cam negative labels");
     println!("  CLIP_CAM_SCORE           CLIP cam score threshold (default CLIP_GAMEPLAY_SCORE)");
@@ -6785,16 +7979,20 @@ fn print_help(bin: &str) {
     println!("  HEADLESS_M3U8_SCRIPT / HEADLESS_M3U8_SCRIPT_TIKTOK   Override Playwright scripts");
     println!("  WAKE_REFRACTORY_SECS     Cooldown between wake detections (default 12)");
     println!("  WAKE_BUFFER_HEADROOM_SECS   Extra buffer headroom for wake timing (default 20)");
-    println!("  WAKE_BUFFER_RESTART_SECS    Restart if buffer exceeds seconds (default 500, 0 disables)");
-    println!("  WAKE_NO_WORDS_SECS       Restart if wake worker stalls for seconds (default 300, 0 disables)");
+    println!("  WAKE_BUFFER_RESTART_SECS    Restart if buffer exceeds seconds (default 300, 0 disables)");
+    println!("  WAKE_NO_WORDS_SECS       Restart if wake worker stalls for seconds (default 180, 0 disables)");
+    println!("  CLIP_WATCHDOG_GAP_SECS   Alert if no clip saved for seconds (default 600, 0 disables)");
+    println!("  CLIP_WAKE_MIN_CLIP_SECS  Force a wake clip if last saved clip exceeds this gap (default 300, 0 disables)");
     println!("  SKIP_CLIP_SAVE           If set to 1/true, skip writing clips");
     println!("  WHISPER_MODEL            Path to whisper model (default auto)");
     println!("  WHISPER_GPU              Enable GPU for live wake (default true)");
     println!("  WHISPER_CLIP_GPU         Enable GPU for clip transcription (default false)");
+    println!("  WHISPER_MODEL_BENCHMARK  Benchmark multiple models to meet RT target (default false)");
     println!("  WHISPER_MIN_FREE_VRAM_MB Min free VRAM before using whisper GPU (default 2048)");
     println!("  WHISPER_CLIP_MIN_FREE_VRAM_MB Min free VRAM before using whisper GPU for clips (default 4096)");
     println!("  WHISPER_CLIP_VRAM_FACTOR Scale factor for estimating clip GPU VRAM use (default 1.35)");
     println!("  WHISPER_CLIP_VRAM_OVERHEAD_MB Extra VRAM cushion for clip GPU use (default 512)");
+    println!("  WHISPER_CLIP_VRAM_EXTRA_MB Extra safety headroom before using clip GPU (default 1024)");
     println!("  WHISPER_GPU_DEVICE       Force NVIDIA device id for live wake (default auto)");
     println!("  WHISPER_CLIP_GPU_DEVICE  Force NVIDIA device id for clip transcription (default auto)");
     println!("  WHISPER_ISOLATE          Run live wake in a helper process (default false)");
@@ -6805,6 +8003,7 @@ fn print_help(bin: &str) {
     println!("  FFMPEG_ENCODE_TIMEOUT_SECS   Hard cap for ffmpeg encode wall time (seconds)");
     println!("  CLIP_FFMPEG_NO_LIMITS   Disable ffmpeg stall + encode timeouts");
     println!("  GPU_VRAM_RESERVE_MB      Always keep this much VRAM free (default 512)");
+    println!("  GPU_PICK_STRATEGY        GPU selection: free (default) or total");
     println!("  LOG_M3U8_HEADERS         Log request headers when fetching playlists");
     println!("  TWITCH_CLIENT_ID         Twitch Client-ID for playback token (default web client)");
     println!("  TWITCH_OAUTH_TOKEN / TWITCH_AUTH_TOKEN   Twitch OAuth token for gated streams (optional)");
@@ -6821,7 +8020,8 @@ mod tests {
     use super::*;
     use crate::captions::{
         CaptionConfig, CaptionPosition, CaptionWord, build_caption_drawtext_chain,
-        build_srt_from_payload, default_caption_font, format_srt_time, wrap_caption_text,
+        build_ass_from_payload_with_limits, build_srt_from_payload, default_caption_font,
+        format_srt_time, wrap_caption_text,
     };
     use crate::clip_layout::FaceAnchor;
     use crate::clip_layout::NormalizedRect;
@@ -6830,12 +8030,65 @@ mod tests {
     use crate::url_utils::sanitize_m3u8_url;
     use std::process::Command as SysCommand;
 
+    struct CaptionFlagGuard {
+        open_disabled: bool,
+        closed_disabled: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CaptionFlagGuard {
+        fn new() -> Self {
+            static CAPTION_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = CAPTION_FLAG_LOCK.lock().expect("caption flag lock");
+            let open_disabled = OPEN_CAPTIONS_DISABLED.load(Ordering::Relaxed);
+            let closed_disabled = CLOSED_CAPTIONS_DISABLED.load(Ordering::Relaxed);
+            OPEN_CAPTIONS_DISABLED.store(false, Ordering::Relaxed);
+            CLOSED_CAPTIONS_DISABLED.store(false, Ordering::Relaxed);
+            Self {
+                open_disabled,
+                closed_disabled,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for CaptionFlagGuard {
+        fn drop(&mut self) {
+            OPEN_CAPTIONS_DISABLED.store(self.open_disabled, Ordering::Relaxed);
+            CLOSED_CAPTIONS_DISABLED.store(self.closed_disabled, Ordering::Relaxed);
+        }
+    }
+
     fn tool_available(tool: &str) -> bool {
         SysCommand::new(tool)
             .arg("-version")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn llm_error_indicates_offline_matches_connection_refused() {
+        let msg = "error trying to connect: tcp connect error: No connection could be made because the target machine actively refused it. (os error 10061)";
+        assert!(llm_error_indicates_offline(msg));
+        let other = "timeout while waiting for response";
+        assert!(!llm_error_indicates_offline(other));
+    }
+
+    #[test]
+    fn disable_closed_captions_for_run_disables_only_closed() {
+        let _guard = CaptionFlagGuard::new();
+        disable_closed_captions_for_run("test");
+        assert!(open_captions_allowed());
+        assert!(!closed_captions_allowed());
+    }
+
+    #[test]
+    fn disable_open_captions_for_run_disables_both() {
+        let _guard = CaptionFlagGuard::new();
+        disable_open_captions_for_run("test");
+        assert!(!open_captions_allowed());
+        assert!(!closed_captions_allowed());
     }
 
     fn generate_test_video(path: &Path) -> Result<()> {
@@ -6935,6 +8188,73 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("failed to parse signalstats YAVG"))
     }
 
+    #[test]
+    fn ffmpeg_caption_error_detection_catches_fontconfig() {
+        assert!(ffmpeg_error_indicates_caption_issue(
+            "Fontconfig error: Cannot load default config file: No such file: (null)"
+        ));
+        assert!(ffmpeg_error_indicates_caption_issue(
+            "libass: cannot find system fonts"
+        ));
+        assert!(!ffmpeg_error_indicates_caption_issue(
+            "ffmpeg progress stalled for 120.0s; terminating"
+        ));
+    }
+
+    fn temp_face_id_path(label: &str) -> PathBuf {
+        let stamp = now_unix_ms();
+        std::env::temp_dir().join(format!("autoclip_face_id_{label}_{stamp}.json"))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn face_id_enroll_skips_when_embedding_exists() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_FACE_ID", "1");
+        let out_path = temp_face_id_path("existing");
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&out_path, "{}").unwrap();
+        env.set("CLIP_FACE_ID_FILE", out_path.to_string_lossy().as_ref());
+
+        maybe_enroll_face_id_from_media("https://kick.com/kingbushcamp", Path::new("C:\\fake")).await;
+
+        assert!(out_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn face_id_enrolls_from_network_image() -> Result<()> {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_FACE_ID", "1");
+        env.remove("CLIP_FACE_ID_FILE");
+
+        let model_path = std::env::var("CLIP_FACE_ID_MODEL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "models/face_id/arcface.onnx".to_string());
+        assert!(
+            Path::new(&model_path).exists(),
+            "face id model missing at {}",
+            model_path
+        );
+        let face_model = std::env::var("CLIP_FACE_MODEL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "models/face_detection_yunet_2023mar.onnx".to_string());
+        assert!(
+            Path::new(&face_model).exists(),
+            "face detector model missing at {}",
+            face_model
+        );
+
+        let out_path = temp_face_id_path("network");
+        let image_url = "https://upload.wikimedia.org/wikipedia/commons/8/8d/President_Barack_Obama.jpg";
+        let ok = clip_detect::enroll_face_id_from_image_url(image_url, &out_path).await?;
+        assert!(ok, "expected face id enrollment from image");
+        assert!(out_path.exists(), "expected embedding output to exist");
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn run_stub_succeeds() {
         // Ensure no network-dependent env vars force the main path.
@@ -7001,6 +8321,21 @@ mod tests {
             "C:\\videos\\clip.ts"
         );
         assert_eq!(normalize_page_url("/var/tmp/clip.ts"), "/var/tmp/clip.ts");
+    }
+
+    #[test]
+    fn wake_min_clip_gap_defaults_to_five_minutes() {
+        let mut env = EnvGuard::new();
+        env.remove("CLIP_WAKE_MIN_CLIP_SECS");
+        let gap = read_wake_min_clip_gap_secs().expect("expected default wake min clip gap");
+        assert_eq!(gap.as_secs(), 300);
+    }
+
+    #[test]
+    fn wake_min_clip_gap_can_disable() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_WAKE_MIN_CLIP_SECS", "0");
+        assert!(read_wake_min_clip_gap_secs().is_none());
     }
 
     #[test]
@@ -7170,12 +8505,13 @@ mod tests {
     #[test]
     fn build_srt_from_payload_falls_back_to_text() {
         let payload = TranscriptPayload {
-            text: "Hello world".to_string(),
+            text: "Hello [_TT_150] world".to_string(),
             words: Vec::new(),
         };
         let srt = build_srt_from_payload(&payload, Some(2.5)).unwrap();
         assert!(srt.contains("00:00:00,000 --> 00:00:02,500"));
         assert!(srt.contains("Hello world"));
+        assert!(!srt.contains("[_TT_"));
     }
 
     #[test]
@@ -7198,7 +8534,59 @@ mod tests {
             ],
         };
         let srt = build_srt_from_payload(&payload, Some(2.0)).unwrap();
-        assert!(srt.contains("00:00:00,000 --> 00:00:01,000"));
+        assert!(srt.contains("00:00:00,000 --> 00:00:00,400"));
+        assert!(srt.contains("Hello"));
+        assert!(srt.contains("00:00:00,500 --> 00:00:01,000"));
+        assert!(srt.contains("world"));
+    }
+
+    #[test]
+    fn build_srt_from_payload_avoids_early_word_start() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_CAPTIONS_BUCKET_SECS", "0");
+        let payload = TranscriptPayload {
+            text: "Hello world".to_string(),
+            words: vec![
+                WordTiming {
+                    text: "Hello".to_string(),
+                    norm: "hello".to_string(),
+                    t0: 0.0,
+                    t1: 0.6,
+                },
+                WordTiming {
+                    text: "world".to_string(),
+                    norm: "world".to_string(),
+                    t0: 0.4,
+                    t1: 0.8,
+                },
+            ],
+        };
+        let srt = build_srt_from_payload(&payload, Some(2.0)).unwrap();
+        assert!(srt.contains("00:00:00,400 --> 00:00:00,800"));
+    }
+
+    #[test]
+    fn captions_merge_words_with_whisper_bucket() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_CAPTIONS_BUCKET_SECS", "0.10");
+        let payload = TranscriptPayload {
+            text: "Hello world".to_string(),
+            words: vec![
+                WordTiming {
+                    text: "Hello".to_string(),
+                    norm: "hello".to_string(),
+                    t0: 0.051,
+                    t1: 0.080,
+                },
+                WordTiming {
+                    text: "world".to_string(),
+                    norm: "world".to_string(),
+                    t0: 0.052,
+                    t1: 0.090,
+                },
+            ],
+        };
+        let srt = build_srt_from_payload(&payload, Some(1.0)).unwrap();
         assert!(srt.contains("Hello world"));
     }
 
@@ -7279,6 +8667,34 @@ mod tests {
     }
 
     #[test]
+    fn stacked_layout_uses_face_box_without_fallback() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_GAMEPLAY", "1");
+        env.set("CLIP_LOW_RESOURCES", "0");
+        env.set("CLIP_FACE_FALLBACK", "0");
+
+        let layout = ClipLayoutConfig {
+            mode: ClipLayoutMode::Stacked,
+            face_ratio: 0.4,
+            face_crop: None,
+            face_anchor: FaceAnchor::TopLeft,
+            face_context_scale: 1.5,
+            face_zoom: 1.0,
+        };
+        let mut hints = ClipLayoutHints::default();
+        hints.face_box = Some(NormalizedRect {
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.2,
+        });
+        hints.game_center = Some(NormalizedPoint { x: 0.5, y: 0.5 });
+        let decision = decide_stacked_layout(&layout, &hints, None);
+        assert!(decision.layout_is_stacked);
+        assert!(!decision.fullscreen_fill);
+    }
+
+    #[test]
     fn stacked_layout_uses_low_resource_gameplay_guess() {
         let mut env = EnvGuard::new();
         env.set("CLIP_GAMEPLAY", "0");
@@ -7329,6 +8745,17 @@ mod tests {
         env.set("CLIP_LOW_RESOURCES", "0");
         refresh_low_resource_state();
         assert_eq!(std::env::var("CLIP_FACE_TRACK").ok().as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn cuda_device_order_defaults_to_pci_bus_id() {
+        let mut env = EnvGuard::new();
+        env.remove("CUDA_DEVICE_ORDER");
+        ensure_cuda_device_order();
+        assert_eq!(
+            std::env::var("CUDA_DEVICE_ORDER").ok().as_deref(),
+            Some("PCI_BUS_ID")
+        );
     }
 
     #[test]
@@ -7455,6 +8882,7 @@ mod tests {
             eprintln!("skipping: ffmpeg/ffprobe not available");
             return Ok(());
         }
+        let _guard = CaptionFlagGuard::new();
         let stamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
@@ -7501,6 +8929,7 @@ mod tests {
             eprintln!("skipping: ffmpeg not available");
             return Ok(());
         }
+        let _guard = CaptionFlagGuard::new();
         let stamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
@@ -7552,6 +8981,210 @@ mod tests {
             cap_y > base_y + 1.0,
             "expected captions to raise average luma (baseline {base_y:.2}, captions {cap_y:.2})"
         );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn captions_font_size_scales_down_for_long_words() {
+        let cfg = CaptionConfig {
+            position: CaptionPosition::Margin,
+            font: None,
+            font_size: 80.0,
+            color: "white".to_string(),
+            outline_color: "black".to_string(),
+            outline: 2,
+            min_word_secs: 0.12,
+            max_words: 300,
+            chest_ratio: 0.65,
+            margin_offset_px: 0.0,
+            debug: false,
+        };
+        let payload = TranscriptPayload {
+            text: "supercalifragilisticexpialidocious".to_string(),
+            words: vec![WordTiming {
+                text: "supercalifragilisticexpialidocious".to_string(),
+                norm: "supercalifragilisticexpialidocious".to_string(),
+                t0: 0.0,
+                t1: 1.0,
+            }],
+        };
+        let adjusted = adjust_caption_font_size(&cfg, &payload, 1080);
+        assert!(
+            adjusted.font_size < cfg.font_size,
+            "expected font size to shrink for long words"
+        );
+    }
+
+    #[test]
+    fn captions_font_size_accounts_for_width_ratio() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_CAPTIONS_WIDTH_RATIO", "0.6");
+        env.set("CLIP_CAPTIONS_BUCKET_SECS", "0");
+        let cfg = CaptionConfig {
+            position: CaptionPosition::Margin,
+            font: None,
+            font_size: 80.0,
+            color: "white".to_string(),
+            outline_color: "black".to_string(),
+            outline: 2,
+            min_word_secs: 0.12,
+            max_words: 300,
+            chest_ratio: 0.65,
+            margin_offset_px: 0.0,
+            debug: false,
+        };
+        let payload = TranscriptPayload {
+            text: "SUPERCALIFRAGILISTICEXPIALIDOCIOUS".to_string(),
+            words: vec![WordTiming {
+                text: "SUPERCALIFRAGILISTICEXPIALIDOCIOUS".to_string(),
+                norm: "supercalifragilisticexpialidocious".to_string(),
+                t0: 0.0,
+                t1: 1.0,
+            }],
+        };
+        let adjusted = adjust_caption_font_size(&cfg, &payload, 1080);
+        assert!(
+            adjusted.font_size < cfg.font_size,
+            "expected width ratio to reduce font size"
+        );
+    }
+
+    #[test]
+    fn captions_ass_scales_per_cue_when_unlocked() {
+        let mut env = EnvGuard::new();
+        env.set("CLIP_CAPTIONS_SCALE_LOCK", "0");
+        env.set("CLIP_CAPTIONS_BUCKET_SECS", "0");
+        let cfg = CaptionConfig {
+            position: CaptionPosition::Margin,
+            font: None,
+            font_size: 80.0,
+            color: "white".to_string(),
+            outline_color: "black".to_string(),
+            outline: 2,
+            min_word_secs: 0.12,
+            max_words: 300,
+            chest_ratio: 0.65,
+            margin_offset_px: 0.0,
+            debug: false,
+        };
+        let payload = TranscriptPayload {
+            text: "hi supercalifragilisticexpialidocious".to_string(),
+            words: vec![
+                WordTiming {
+                    text: "hi".to_string(),
+                    norm: "hi".to_string(),
+                    t0: 0.0,
+                    t1: 0.4,
+                },
+                WordTiming {
+                    text: "supercalifragilisticexpialidocious".to_string(),
+                    norm: "supercalifragilisticexpialidocious".to_string(),
+                    t0: 0.6,
+                    t1: 1.4,
+                },
+            ],
+        };
+        let ass = build_ass_from_payload_with_limits(&payload, Some(2.0), &cfg, 120.0, 1080, 1920)
+            .expect("expected ass output");
+        let mut sizes: Vec<u32> = Vec::new();
+        let mut rest = ass.as_str();
+        while let Some(idx) = rest.find("\\fs") {
+            let after = &rest[idx + 3..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(value) = digits.parse::<u32>() {
+                sizes.push(value);
+            }
+            rest = after;
+        }
+        assert!(
+            ass.contains("\\pos(") && ass.contains("\\an8"),
+            "expected ASS overrides to center captions"
+        );
+        sizes.sort_unstable();
+        sizes.dedup();
+        assert!(
+            sizes.len() > 1,
+            "expected per-cue font sizes to differ when unlocked"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn captions_fallback_when_font_invalid() -> Result<()> {
+        if !tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg not available");
+            return Ok(());
+        }
+        let _guard = CaptionFlagGuard::new();
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("autoclip_bad_font_{stamp}"));
+        fs::create_dir_all(&dir)?;
+        let input = dir.join("input.mp4");
+        let output = dir.join("output.mp4");
+        let fake_font = dir.join("fake_font.ttf");
+        fs::write(&fake_font, b"not a font")?;
+        generate_test_video(&input)?;
+
+        let mut env = EnvGuard::new();
+        env.set("CLIP_LAYOUT", "full");
+        env.set("CLIP_DETECT", "0");
+        env.set("CLIP_FACE_TRACK", "0");
+        env.set("CLIP_LIVE_FAST", "0");
+        env.set("FFMPEG_ENCODER", "libx264");
+        env.set("FFMPEG_HWACCEL", "none");
+        env.set("CLIP_CAPTIONS", "1");
+        env.set("CLIP_CLOSED_CAPTIONS", "0");
+        env.set("CLIP_CAPTIONS_FONT", fake_font.to_string_lossy().as_ref());
+        env.set("CLIP_TEST_TRANSCRIPT", "hello world");
+
+        run_ffmpeg_internal(
+            FfmpegRenderSpec::new(input.to_string_lossy().as_ref(), &output, 320, 180)
+                .with_duration(Some(1.0))
+                .with_regen_pts(true),
+        )
+        .await?;
+
+        assert!(output.exists(), "expected output even with bad font");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reprocess_continues_on_invalid_media_when_enabled() -> Result<()> {
+        if !tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg not available");
+            return Ok(());
+        }
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("autoclip_reprocess_bad_{stamp}"));
+        fs::create_dir_all(&dir)?;
+        let input = dir.join("broken.mp4");
+        fs::write(&input, b"not a real mp4")?;
+
+        let mut cfg = Config::example();
+        cfg.save_path = dir.join("out").to_string_lossy().to_string();
+        cfg.file_name_stub = "clip".to_string();
+
+        let mut env = EnvGuard::new();
+        env.set("CLIP_REPROCESS_CONTINUE_ON_ERROR", "1");
+        env.set("CLIP_REPROCESS_CHUNK_SECS", "0");
+        env.set("CLIP_REPROCESS_FAST", "1");
+        env.set("CLIP_TEST_TRANSCRIPT", "hello world");
+        env.set("CLIP_LAYOUT", "full");
+        env.set("CLIP_DETECT", "0");
+        env.set("CLIP_FACE_TRACK", "0");
+        env.set("CLIP_LIVE_FAST", "0");
+        env.set("FFMPEG_ENCODER", "libx264");
+        env.set("FFMPEG_HWACCEL", "none");
+
+        let result = run_reprocess_ts_with_config(input.to_string_lossy().as_ref(), &cfg).await;
+        assert!(result.is_ok(), "expected reprocess to continue on error");
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

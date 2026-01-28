@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -63,6 +63,7 @@ pub struct ClipDetectConfig {
     pub face_track_step_secs: Option<f32>,
     pub face_budget_override: Option<Duration>,
     pub analysis_budget: Option<Duration>,
+    pub gameplay_budget_override: Option<Duration>,
 }
 
 const DEFAULT_SAMPLE_COUNT: usize = 3;
@@ -77,6 +78,7 @@ const DEFAULT_FACE_TILE_MIN_SCORE: f32 = 0.60;
 const DEFAULT_FACE_TILE_MAX_DEPTH: usize = 3;
 const DEFAULT_FACE_PICK_RAW: bool = true;
 const DEFAULT_FACE_TRACK_STEP_SECS: f32 = 2.0;
+const DEFAULT_GAMEPLAY_BUDGET_MIN_SECS: f32 = 2.0;
 const MAX_FULL_SAMPLES: usize = 60;
 const MAX_FACE_CANDIDATES: usize = 24;
 const FACE_EDGE_MARGIN: f32 = 0.02;
@@ -115,6 +117,56 @@ const POSE_TRACT_OPT_DEFAULT: bool = false;
 const POSE_INPUT_SIZE_DEFAULT: u32 = 256;
 const POSE_INPUT_MAX_DEFAULT: u32 = 512;
 const POSE_LOAD_TIMEOUT_SECS_DEFAULT: u64 = 60;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FaceDetectorKey {
+    model_path: Option<String>,
+    backend: FaceBackend,
+    frame_w: u32,
+    frame_h: u32,
+    score_threshold_bits: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PoseDetectorKey {
+    enabled: bool,
+    model_path: Option<String>,
+    model_exists: bool,
+    backend: FaceBackend,
+    input_size: u32,
+    input_max: u32,
+    input_scale_bits: u32,
+    model_min_mb: u64,
+    model_max_mb: u64,
+    load_timeout_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FaceMeshDetectorKey {
+    enabled: bool,
+    model_path: Option<String>,
+    model_exists: bool,
+    backend: FaceBackend,
+    input_size: u32,
+    input_max: u32,
+    input_scale_bits: u32,
+    model_min_mb: u64,
+    model_max_mb: u64,
+    load_timeout_secs: u64,
+}
+
+struct CachedDetector<T, K> {
+    key: K,
+    detector: Option<Arc<T>>,
+}
+
+static FACE_DETECTOR_CACHE: OnceLock<Mutex<Option<CachedDetector<YunetDetector, FaceDetectorKey>>>> =
+    OnceLock::new();
+static POSE_DETECTOR_CACHE: OnceLock<Mutex<Option<CachedDetector<PoseDetector, PoseDetectorKey>>>> =
+    OnceLock::new();
+static FACE_MESH_DETECTOR_CACHE: OnceLock<
+    Mutex<Option<CachedDetector<FaceMeshDetector, FaceMeshDetectorKey>>>,
+> = OnceLock::new();
 
 #[cfg(feature = "ort")]
 static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
@@ -634,6 +686,11 @@ pub fn read_clip_detect_config() -> ClipDetectConfig {
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
         .map(Duration::from_secs_f32);
+    let gameplay_budget_override = std::env::var("CLIP_GAMEPLAY_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(Duration::from_secs_f32);
 
     let face_model_path = std::env::var("CLIP_FACE_MODEL")
         .ok()
@@ -661,7 +718,128 @@ pub fn read_clip_detect_config() -> ClipDetectConfig {
         face_track_step_secs,
         face_budget_override,
         analysis_budget,
+        gameplay_budget_override,
     }
+}
+
+fn f32_key(value: f32) -> u32 {
+    value.to_bits()
+}
+
+fn pose_model_path_raw() -> Option<String> {
+    if !pose_enabled() {
+        return None;
+    }
+    let path = std::env::var("CLIP_POSE_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "models/pose/movenet_singlepose_thunder.onnx".to_string());
+    Some(path)
+}
+
+fn face_mesh_model_path_raw() -> Option<String> {
+    if !face_mesh_enabled() {
+        return None;
+    }
+    let path = std::env::var("CLIP_FACE_MESH_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_FACE_MESH_MODEL_PATH.to_string());
+    Some(path)
+}
+
+fn face_detector_key(config: &ClipDetectConfig) -> FaceDetectorKey {
+    FaceDetectorKey {
+        model_path: config.face_model_path.clone(),
+        backend: config.face_backend,
+        frame_w: config.frame_width,
+        frame_h: config.frame_height,
+        score_threshold_bits: f32_key(config.face_score_threshold),
+    }
+}
+
+fn pose_detector_key() -> PoseDetectorKey {
+    let model_path = pose_model_path_raw();
+    let model_exists = model_path
+        .as_deref()
+        .map(|path| Path::new(path).exists())
+        .unwrap_or(false);
+    PoseDetectorKey {
+        enabled: pose_enabled(),
+        model_path,
+        model_exists,
+        backend: pose_backend(),
+        input_size: pose_input_size(),
+        input_max: pose_input_max(),
+        input_scale_bits: f32_key(pose_input_scale()),
+        model_min_mb: pose_model_min_mb(),
+        model_max_mb: pose_model_max_mb(),
+        load_timeout_secs: pose_load_timeout().as_secs(),
+    }
+}
+
+fn face_mesh_detector_key() -> FaceMeshDetectorKey {
+    let model_path = face_mesh_model_path_raw();
+    let model_exists = model_path
+        .as_deref()
+        .map(|path| Path::new(path).exists())
+        .unwrap_or(false);
+    FaceMeshDetectorKey {
+        enabled: face_mesh_enabled(),
+        model_path,
+        model_exists,
+        backend: face_mesh_backend(),
+        input_size: face_mesh_input_size(),
+        input_max: face_mesh_input_max(),
+        input_scale_bits: f32_key(face_mesh_input_scale()),
+        model_min_mb: face_mesh_model_min_mb(),
+        model_max_mb: face_mesh_model_max_mb(),
+        load_timeout_secs: face_mesh_load_timeout().as_secs(),
+    }
+}
+
+fn cached_detector<T, K, F>(
+    cache: &OnceLock<Mutex<Option<CachedDetector<T, K>>>>,
+    key: K,
+    build: F,
+) -> Result<Option<Arc<T>>>
+where
+    K: PartialEq,
+    F: FnOnce() -> Result<Option<T>>,
+{
+    let cache = cache.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().map_err(|_| anyhow::anyhow!("model cache lock poisoned"))?;
+        if let Some(entry) = guard.as_ref() {
+            if entry.key == key {
+                return Ok(entry.detector.clone());
+            }
+        }
+    }
+    let detector = build()?.map(Arc::new);
+    let mut guard = cache.lock().map_err(|_| anyhow::anyhow!("model cache lock poisoned"))?;
+    *guard = Some(CachedDetector {
+        key,
+        detector: detector.clone(),
+    });
+    Ok(detector)
+}
+
+fn cached_face_detector(config: &ClipDetectConfig) -> Result<Option<Arc<YunetDetector>>> {
+    let key = face_detector_key(config);
+    cached_detector(&FACE_DETECTOR_CACHE, key, || YunetDetector::new(config))
+}
+
+fn cached_pose_detector(config: &ClipDetectConfig) -> Result<Option<Arc<PoseDetector>>> {
+    let key = pose_detector_key();
+    cached_detector(&POSE_DETECTOR_CACHE, key, || PoseDetector::new(config))
+}
+
+fn cached_face_mesh_detector(config: &ClipDetectConfig) -> Result<Option<Arc<FaceMeshDetector>>> {
+    let key = face_mesh_detector_key();
+    cached_detector(&FACE_MESH_DETECTOR_CACHE, key, || FaceMeshDetector::new(config))
 }
 
 /// Summary statistics for a face-score sweep run.
@@ -683,13 +861,23 @@ struct FaceSweepInput {
 fn split_analysis_budget(
     budget: Option<Duration>,
     face_override: Option<Duration>,
+    gameplay_override: Option<Duration>,
+    gameplay_enabled: bool,
 ) -> (Option<Duration>, Option<Duration>) {
     if let Some(face_override) = face_override {
         if let Some(total) = budget {
-            let face_budget = face_override.min(total);
+            let mut face_budget = face_override.min(total);
             let gameplay_budget = total.checked_sub(face_budget);
-            let gameplay_budget = gameplay_budget
+            let mut gameplay_budget = gameplay_budget
                 .filter(|v| v.as_secs_f32().is_finite() && v.as_secs_f32() > 0.0);
+            if gameplay_enabled && gameplay_budget.is_none() {
+                let fallback = Duration::from_secs_f32(DEFAULT_GAMEPLAY_BUDGET_MIN_SECS);
+                let reserve = gameplay_override.unwrap_or(fallback).min(total);
+                if reserve.as_secs_f32() > 0.05 && total > reserve {
+                    face_budget = total.saturating_sub(reserve);
+                    gameplay_budget = Some(reserve);
+                }
+            }
             return (Some(face_budget), gameplay_budget);
         }
         return (Some(face_override), None);
@@ -706,9 +894,18 @@ fn split_analysis_budget(
         .min(20.0)
         .min(total_secs);
     let face_budget = Duration::from_secs_f32(face_secs);
-    let gameplay_budget = budget
+    let mut gameplay_budget = budget
         .checked_sub(face_budget)
         .filter(|remaining| remaining.as_secs_f32() > 0.05);
+    if gameplay_enabled {
+        if let Some(override_budget) = gameplay_override {
+            let reserve = override_budget.min(budget);
+            if reserve.as_secs_f32() > 0.05 && budget > reserve {
+                gameplay_budget = Some(reserve);
+                return (Some(budget.saturating_sub(reserve)), gameplay_budget);
+            }
+        }
+    }
     (Some(face_budget), gameplay_budget)
 }
 
@@ -734,7 +931,7 @@ pub async fn run_face_threshold_sweep(
     sweep_config.track_face = false;
     sweep_config.analysis_budget = None;
 
-    let detector = match YunetDetector::new(&sweep_config)? {
+    let detector = match cached_face_detector(&sweep_config)? {
         Some(detector) => detector,
         None => anyhow::bail!("face model not available for sweep"),
     };
@@ -744,10 +941,20 @@ pub async fn run_face_threshold_sweep(
         positives.len(),
         negatives.len()
     );
-    let pos_inputs =
-        build_face_sweep_inputs(positives, &sweep_config, &detector, "positives").await?;
-    let neg_inputs =
-        build_face_sweep_inputs(negatives, &sweep_config, &detector, "negatives").await?;
+    let pos_inputs = build_face_sweep_inputs(
+        positives,
+        &sweep_config,
+        detector.as_ref(),
+        "positives",
+    )
+    .await?;
+    let neg_inputs = build_face_sweep_inputs(
+        negatives,
+        &sweep_config,
+        detector.as_ref(),
+        "negatives",
+    )
+    .await?;
     eprintln!(
         "face sweep: sample load complete (positives={}, negatives={})",
         pos_inputs.len(),
@@ -776,7 +983,7 @@ pub async fn run_face_threshold_sweep(
             if select_face_with_relaxation(
                 &input.samples,
                 input.total_samples,
-                &detector,
+                detector.as_ref(),
                 *score,
             )
             .is_some()
@@ -793,7 +1000,7 @@ pub async fn run_face_threshold_sweep(
             if select_face_with_relaxation(
                 &input.samples,
                 input.total_samples,
-                &detector,
+                detector.as_ref(),
                 *score,
             )
             .is_some()
@@ -1012,8 +1219,12 @@ pub async fn detect_layout_hints(
             config.sample_step_secs.max(0.0)
         );
     }
-    let (face_budget, gameplay_budget) =
-        split_analysis_budget(config.analysis_budget, config.face_budget_override);
+    let (face_budget, gameplay_budget) = split_analysis_budget(
+        config.analysis_budget,
+        config.face_budget_override,
+        config.gameplay_budget_override,
+        gameplay_detection,
+    );
     let has_budget = config.analysis_budget.is_some();
 
     let mut face_samples: Vec<FaceSample> = Vec::new();
@@ -1027,41 +1238,53 @@ pub async fn detect_layout_hints(
     let mut face_best: Option<FaceConsensus> = None;
     let mut face_observations: Vec<FaceObservation> = Vec::new();
     let mut gameplay_config = None;
-    let mut clip_detector: Option<ClipGameplayDetector> = None;
+    let mut clip_detector: Option<Arc<ClipGameplayDetector>> = None;
     let mut gameplay_labels: Option<ClipLabelSet> = None;
     let mut cam_labels: Option<ClipLabelSet> = None;
 
-    let face_detector = match YunetDetector::new(config) {
-        Ok(detector) => detector,
-        Err(err) => {
-            eprintln!("clip detect: failed to load face model: {err:#}");
-            None
+    let face_detector = {
+        let _span = profile_span("clip detect: init face detector");
+        match cached_face_detector(config) {
+            Ok(detector) => detector,
+            Err(err) => {
+                eprintln!("clip detect: failed to load face model: {err:#}");
+                None
+            }
         }
     };
     let face_id_matcher = FaceIdMatcher::from_env();
-    let face_mesh_detector = match FaceMeshDetector::new(config) {
-        Ok(detector) => detector,
-        Err(err) => {
-            eprintln!("clip detect: failed to load face mesh model: {err:#}");
-            None
+    let face_mesh_detector = {
+        let _span = profile_span("clip detect: init face mesh detector");
+        match cached_face_mesh_detector(config) {
+            Ok(detector) => detector,
+            Err(err) => {
+                eprintln!("clip detect: failed to load face mesh model: {err:#}");
+                None
+            }
         }
     };
-    let pose_detector = match PoseDetector::new(config) {
-        Ok(detector) => detector,
-        Err(err) => {
-            eprintln!("clip detect: failed to load pose model: {err:#}");
-            None
+    let pose_detector = {
+        let _span = profile_span("clip detect: init pose detector");
+        match cached_pose_detector(config) {
+            Ok(detector) => detector,
+            Err(err) => {
+                eprintln!("clip detect: failed to load pose model: {err:#}");
+                None
+            }
         }
     };
 
     if gameplay_detection {
         let cfg = read_clip_gameplay_config(config.frame_width, config.frame_height);
         gameplay_config = Some(cfg.clone());
-        let detector = match ClipGameplayDetector::new(&cfg) {
-            Ok(detector) => detector,
-            Err(err) => {
-                eprintln!("clip detect: failed to load CLIP model: {err:#}");
-                None
+        let detector = {
+            let _span = profile_span("clip detect: init gameplay detector");
+            match ClipGameplayDetector::get_cached(&cfg) {
+                Ok(detector) => detector,
+                Err(err) => {
+                    eprintln!("clip detect: failed to load CLIP model: {err:#}");
+                    None
+                }
             }
         };
         if let Some(detector) = detector {
@@ -1132,6 +1355,7 @@ pub async fn detect_layout_hints(
     }
 
     if face_total_samples > 0 {
+        let _span = profile_span("clip detect: face sampling");
         if let Some(detector) = face_detector.as_ref() {
             let face_start = Instant::now();
             let face_tick = Some(LoadingTicker::start(
@@ -1166,12 +1390,12 @@ pub async fn detect_layout_hints(
                     source_dims,
                     hints.face_region,
                     face_id_matcher.as_ref(),
-                    face_mesh_detector.as_ref(),
+                    face_mesh_detector.as_deref(),
                     &mut face_frame_cache,
                 )
                 .await;
                 let pose = if !candidates.is_empty() {
-                    if let Some(detector) = pose_detector.as_ref() {
+                    if let Some(detector) = pose_detector.as_deref() {
                         detect_pose_observation(
                             input,
                             seek_arg,
@@ -1244,6 +1468,7 @@ pub async fn detect_layout_hints(
         }
     }
     if gameplay_detection && gameplay_total_samples > 0 {
+        let _span = profile_span("clip detect: gameplay sampling");
         if has_budget && gameplay_budget.is_none() {
             eprintln!("clip detect: gameplay time budget 0.0s; skipping gameplay samples");
         } else {
@@ -1516,7 +1741,7 @@ async fn enroll_face_id_from_input(
     strict: bool,
 ) -> Result<bool> {
     let cfg = read_clip_detect_config();
-    let Some(detector) = YunetDetector::new(&cfg)? else {
+    let Some(detector) = cached_face_detector(&cfg)? else {
         anyhow::bail!("face detector unavailable; cannot enroll");
     };
     let face_cfg = face_id_config()
@@ -1542,7 +1767,7 @@ async fn enroll_face_id_from_input(
         let (frame, candidates) = match detect_faces_in_region_with_frame(
             input,
             seek_arg,
-            &detector,
+            detector.as_ref(),
             full_region,
             source_dims,
             &mut cache,
@@ -6742,6 +6967,7 @@ mod tests {
             face_track_step_secs: None,
             face_budget_override: None,
             analysis_budget: None,
+            gameplay_budget_override: None,
         };
         let times = build_sample_times(&config, true, Some(10.0));
         assert!(times.len() >= 2);
@@ -6749,6 +6975,24 @@ mod tests {
         let last = *times.last().unwrap();
         assert!((first - 1.0).abs() < 1e-6);
         assert!(last > 7.0, "expected samples to reach near the clip end");
+    }
+
+    #[test]
+    fn split_analysis_budget_reserves_gameplay_when_face_override_consumes_total() {
+        let total = Duration::from_secs_f32(15.0);
+        let (face_budget, gameplay_budget) =
+            split_analysis_budget(Some(total), Some(total), None, true);
+        let face_budget = face_budget.expect("expected face budget");
+        let gameplay_budget = gameplay_budget.expect("expected gameplay budget");
+        assert!(
+            gameplay_budget.as_secs_f32() > 0.05,
+            "gameplay budget should be reserved"
+        );
+        let summed = face_budget.as_secs_f32() + gameplay_budget.as_secs_f32();
+        assert!(
+            summed <= total.as_secs_f32() + 0.01,
+            "face + gameplay should fit in total budget"
+        );
     }
 
     #[test]

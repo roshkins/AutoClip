@@ -123,8 +123,30 @@ fn run_stream_listener(
         }
     }
 
-    let _ = child.kill();
+    kill_child_and_wait(&mut child);
     Ok(())
+}
+
+fn kill_child_and_wait(child: &mut Child) {
+    let _ = child.kill();
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    eprintln!("stream listener: child did not exit after kill; giving up");
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(err) => {
+                eprintln!("stream listener: failed to reap child: {err:#}");
+                return;
+            }
+        }
+    }
 }
 
 fn spawn_stream(stream_exe: &Path, model_path: &Path) -> Result<Child> {

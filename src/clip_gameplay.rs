@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 use tract_onnx::prelude::*;
@@ -39,6 +40,30 @@ pub struct ClipGameplayConfig {
     pub positive_labels: Vec<String>,
     pub negative_labels: Vec<String>,
 }
+
+fn f32_key(value: f32) -> u32 {
+    value.to_bits()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GameplayDetectorKey {
+    enabled: bool,
+    text_model_path: PathBuf,
+    vision_model_path: PathBuf,
+    tokenizer_path: PathBuf,
+    stride: u32,
+    top_k: usize,
+    score_min_bits: u32,
+    positive_labels: Vec<String>,
+    negative_labels: Vec<String>,
+}
+
+struct CachedGameplayDetector {
+    key: GameplayDetectorKey,
+    detector: Option<Arc<ClipGameplayDetector>>,
+}
+
+static GAMEPLAY_DETECTOR_CACHE: OnceLock<Mutex<Option<CachedGameplayDetector>>> = OnceLock::new();
 
 /// A scored observation for a candidate gameplay region.
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +181,46 @@ pub fn read_clip_gameplay_config(
     }
 }
 
+fn gameplay_detector_key(config: &ClipGameplayConfig) -> GameplayDetectorKey {
+    GameplayDetectorKey {
+        enabled: config.enabled,
+        text_model_path: config.text_model_path.clone(),
+        vision_model_path: config.vision_model_path.clone(),
+        tokenizer_path: config.tokenizer_path.clone(),
+        stride: config.stride,
+        top_k: config.top_k,
+        score_min_bits: f32_key(config.score_min),
+        positive_labels: config.positive_labels.clone(),
+        negative_labels: config.negative_labels.clone(),
+    }
+}
+
+fn cached_gameplay_detector(
+    config: &ClipGameplayConfig,
+) -> Result<Option<Arc<ClipGameplayDetector>>> {
+    let key = gameplay_detector_key(config);
+    let cache = GAMEPLAY_DETECTOR_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gameplay model cache lock poisoned"))?;
+        if let Some(entry) = guard.as_ref() {
+            if entry.key == key {
+                return Ok(entry.detector.clone());
+            }
+        }
+    }
+    let detector = ClipGameplayDetector::new(config)?.map(Arc::new);
+    let mut guard = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("gameplay model cache lock poisoned"))?;
+    *guard = Some(CachedGameplayDetector {
+        key,
+        detector: detector.clone(),
+    });
+    Ok(detector)
+}
+
 fn default_onnx_path(onnx_dir: &PathBuf, candidates: &[&str]) -> PathBuf {
     for name in candidates {
         let path = onnx_dir.join(name);
@@ -180,6 +245,11 @@ pub struct ClipGameplayDetector {
 }
 
 impl ClipGameplayDetector {
+    /// Build or reuse a cached gameplay detector for the given config.
+    pub fn get_cached(config: &ClipGameplayConfig) -> Result<Option<Arc<Self>>> {
+        cached_gameplay_detector(config)
+    }
+
     /// Build a gameplay detector from config, returning `None` when disabled.
     pub fn new(config: &ClipGameplayConfig) -> Result<Option<Self>> {
         if !config.enabled {
@@ -191,6 +261,8 @@ impl ClipGameplayDetector {
         if !config.tokenizer_path.exists() {
             return Ok(None);
         }
+
+        let _span = profile_span("clip gameplay: init");
 
         let tokenizer_start = Instant::now();
         let tokenizer_tick =
@@ -462,6 +534,7 @@ impl ClipGameplayDetector {
     }
 
     fn encode_prompts(&self, prompts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let _span = profile_span("clip gameplay: encode prompts");
         let mut out = Vec::new();
         let input_count = self.text_model.model().input_outlets()?.len();
         if input_count == 0 {

@@ -67,13 +67,13 @@ pub async fn maybe_auto_enroll_face_id(page_url: &str) {
         return;
     }
     let file_path = face_id_file_for_stream(page_url);
-    if file_path.exists() {
-        return;
-    }
     let _ = std::env::set_var(
         "CLIP_FACE_ID_FILE",
         file_path.to_string_lossy().as_ref(),
     );
+    if file_path.exists() {
+        return;
+    }
     let image_url = match fetch_profile_image_url(page_url).await {
         Ok(Some(url)) => url,
         Ok(None) => {
