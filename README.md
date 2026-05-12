@@ -18,6 +18,12 @@
 - Then run:
   - `cargo run -- "https://kick.com/leckatv"`
 
+**Live config**
+- Copy `config.env.example` to `config.env` once; the binary polls it while
+  running so edits apply within ~2s without restart.
+- `config.env` is gitignored so per-developer paths (model locations, dll
+  paths, etc.) stay local.
+
 **Notes**
 - `cargo run` needs CUDA DLLs on PATH (the helper above sets them).
 - The EXE does not need `--` before the URL; `cargo run` does.
