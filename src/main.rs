@@ -1,11 +1,22 @@
-//! AutoClip MVP stub.
-//! Current behavior: headless-grab an m3u8 from a page (Kick-style), pick the
-//! top variant, and save a 30s vertical clip via FFmpeg. Everything else (rolling
-//! buffering, wake-word detection, VRAM budgeting) is logged-only scaffolding.
+//! AutoClip binary entry point.
+//!
+//! Pipeline:
+//!   1. Headless-grab an m3u8 from a stream page (Kick / Twitch / TikTok).
+//!   2. Pick the highest-resolution variant and keep a rolling TS buffer.
+//!   3. Run Whisper on stream or mic audio to detect the wake phrase.
+//!   4. On trigger, freeze the buffer and ffmpeg-encode a vertical MP4
+//!      (face cam stacked over gameplay), then resume buffering.
+//!
+//! `run_with_page(None)` prints a preflight summary instead of running the
+//! pipeline; this is the path the unit tests exercise without touching the
+//! network. Real runs come through `run_with_page(Some(url))` or the
+//! `CLIP_PAGE_URL` env var, both of which call `run_until_wake_and_clip`.
 
 use anyhow::{Context, Result};
-use m3u8_rs::{MasterPlaylist, MediaPlaylist, VariantStream};
-use reqwest::{header, Client, StatusCode};
+// m3u8_rs / reqwest are used through `crate::hls`; the orchestrator only
+// needs status-code matching plus a plain `Client` for profile-image and
+// LLM-titler requests.
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -25,13 +36,22 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::collections::HashMap;
 
+mod cli;
 mod clip_detect;
 mod clip_gameplay;
 mod clip_layout;
 mod gpu;
+mod hls;
 mod loading;
 mod profile;
 mod rolling_buffer;
+mod ts;
+use cli::{apply_env_overrides, parse_cli_args, print_help, ParsedCli, ENV_SPECS};
+use ts::{choose_segment_duration, pts_duration_from_ts};
+use hls::{
+    is_http_status, normalize_page_url, parse_resolution, signed_url_expiry, HlsClient,
+    StreamHeaders,
+};
 use clip_detect::{detect_layout_hints, read_clip_detect_config, run_face_threshold_sweep};
 use clip_gameplay::{read_clip_gameplay_config, ClipGameplayDetector};
 use clip_layout::{
@@ -117,8 +137,9 @@ impl AutoClip {
 
     /// Orchestrates the current flow:
     /// - When given a page URL (arg or CLIP_PAGE_URL), grab its m3u8 via headless
-    ///   script and save a 30s vertical clip with FFmpeg using the best variant.
-    /// - Otherwise, run stubbed logging for buffering / wake-word / post-process.
+    ///   script and save a vertical clip with FFmpeg using the best variant.
+    /// - Otherwise, print a config preflight and return; the binary's CLI prints
+    ///   usage so callers know how to provide a page URL.
     pub async fn run_with_page(&self, page_url_override: Option<&str>) -> Result<()> {
         // Take an explicit page URL if provided; otherwise fall back to CLIP_PAGE_URL env if set.
         if let Some(page_url) = page_url_override
@@ -131,34 +152,27 @@ impl AutoClip {
             return Ok(());
         }
 
-        // Fallback to stubbed flow when no page provided.
-        self.buffer_stream().await?;
-        self.detect_wake_word().await?;
-        self.post_process_clip().await
-    }
-
-    async fn buffer_stream(&self) -> Result<()> {
-        println!(
-            "[stub] buffering stream from {} with before={}s after={}s", // minimal log
-            self.config.kick_url, self.config.before_buffer_length, self.config.after_buffer_length
-        );
+        self.preflight_summary();
         Ok(())
     }
 
-    async fn detect_wake_word(&self) -> Result<()> {
+    /// Print a short summary of the loaded config; used when no page URL is
+    /// configured so the operator can see how the binary parsed env/CLI.
+    fn preflight_summary(&self) {
         println!(
-            "[stub] listening for activation phrase '{}'", // stubbed wake-word detection
-            self.config.activation_phrase
+            "autoclip preflight: no page URL configured (pass a URL arg or set CLIP_PAGE_URL).\n  \
+             activation phrase: {phrase}\n  \
+             before/after: {before}s / {after}s\n  \
+             resolution: {res}\n  \
+             save_path: {save}\n  \
+             file prefix: {stub}",
+            phrase = self.config.activation_phrase,
+            before = self.config.before_buffer_length,
+            after = self.config.after_buffer_length,
+            res = self.config.resolution,
+            save = self.config.save_path,
+            stub = self.config.file_name_stub,
         );
-        Ok(())
-    }
-
-    async fn post_process_clip(&self) -> Result<()> {
-        println!(
-            "[stub] post-processing to {} and saving under {} with prefix {}",
-            self.config.resolution, self.config.save_path, self.config.file_name_stub
-        );
-        Ok(())
     }
 
     /// Fetch master from a page (headless Playwright), pick best variant, and run
@@ -210,8 +224,20 @@ impl AutoClip {
         let monitor_clip = clip_window;
         let monitor_start = wake_start.clone();
         std::thread::spawn(move || {
+            // Predictive headroom: track both the all-time max latency *and* a
+            // short-window EMA of recent latency samples. The buffer target
+            // grows from `max(max_latency, ema * SAFETY)` so a sustained
+            // cold-start latency floor grows the buffer before the first wake
+            // fires, not just when a single new peak arrives.
+            const SAFETY_FACTOR: f32 = 1.5;
+            // EMA half-life ~5 seconds at 250ms cadence -> alpha ~= 0.033.
+            const EMA_ALPHA: f32 = 0.033;
+
             let mut max_latency = Duration::ZERO;
-            let mut warned = false;
+            let mut ema_latency_secs: f32 = 0.0;
+            let mut warned_peak = false;
+            let mut warned_trend = false;
+            let mut last_target_secs: f32 = 0.0;
             let poll = Duration::from_millis(250);
             while !monitor_stop.load(Ordering::Relaxed) {
                 let audio_ns_now = monitor_audio_ns.load(Ordering::Relaxed);
@@ -221,19 +247,59 @@ impl AutoClip {
                     let now = Instant::now();
                     if now > audio_instant {
                         let latency = now - audio_instant;
+                        let latency_secs = latency.as_secs_f32();
+
+                        // Update EMA. Initialize on first non-zero sample.
+                        if ema_latency_secs == 0.0 {
+                            ema_latency_secs = latency_secs;
+                        } else {
+                            ema_latency_secs += EMA_ALPHA * (latency_secs - ema_latency_secs);
+                        }
+
+                        let mut bumped = false;
                         if latency > max_latency {
                             max_latency = latency;
-                            if !warned && max_latency > monitor_headroom {
-                                warned = true;
+                            bumped = true;
+                            if !warned_peak && max_latency > monitor_headroom {
+                                warned_peak = true;
                                 eprintln!(
                                     "processing latency ~{:.1}s exceeds headroom ~{:.1}s; wake timing may drift (set WAKE_BUFFER_HEADROOM_SECS)",
                                     max_latency.as_secs_f32(),
                                     monitor_headroom.as_secs_f32()
                                 );
                             }
-                            let target = monitor_clip + monitor_headroom + max_latency;
+                        }
+
+                        // Predictive floor from sustained latency. Only grow,
+                        // never shrink (we don't want a transient dip to drop
+                        // the buffer target right before a wake fires).
+                        let predicted_secs = ema_latency_secs * SAFETY_FACTOR;
+                        let effective_secs = max_latency.as_secs_f32().max(predicted_secs);
+
+                        let new_target_secs = monitor_clip.as_secs_f32()
+                            + monitor_headroom.as_secs_f32()
+                            + effective_secs;
+
+                        if bumped || new_target_secs > last_target_secs + 0.1 {
+                            last_target_secs = new_target_secs;
+                            let target = Duration::from_secs_f32(new_target_secs);
                             monitor_target.store(duration_to_ns(target), Ordering::Relaxed);
-                            monitor_latency.store(duration_to_ns(max_latency), Ordering::Relaxed);
+                            monitor_latency.store(
+                                duration_to_ns(Duration::from_secs_f32(effective_secs)),
+                                Ordering::Relaxed,
+                            );
+
+                            if !warned_trend
+                                && predicted_secs > monitor_headroom.as_secs_f32()
+                                && max_latency <= monitor_headroom
+                            {
+                                warned_trend = true;
+                                eprintln!(
+                                    "predicted latency trend ~{:.1}s exceeds headroom ~{:.1}s; growing buffer target preemptively",
+                                    predicted_secs,
+                                    monitor_headroom.as_secs_f32()
+                                );
+                            }
                         }
                     }
                 }
@@ -1234,6 +1300,12 @@ struct WakeWorkerStatus {
     last_word_ns: u64,
     fired: bool,
     updated_unix_ms: u64,
+    /// Monotonically-incrementing sequence number written every writer poll
+    /// cycle, regardless of whether anything else changed. The reader uses
+    /// this to distinguish "worker alive but audio stalled" (seq advances,
+    /// audio_ns doesn't) from "worker hung" (seq stops advancing).
+    #[serde(default)]
+    seq: u64,
 }
 
 fn now_unix_ms() -> u64 {
@@ -1416,15 +1488,22 @@ fn spawn_wake_status_writer(
             last_word_ns: u64::MAX,
             fired: false,
             updated_unix_ms: 0,
+            seq: 0,
         };
+        let mut seq: u64 = 0;
         while !stop.load(Ordering::Relaxed) {
+            seq = seq.wrapping_add(1);
             let current = WakeWorkerStatus {
                 audio_ns: audio_ns.load(Ordering::Relaxed),
                 detect_ns: detect_ns.load(Ordering::Relaxed),
                 last_word_ns: last_word_ns.load(Ordering::Relaxed),
                 fired: fired.load(Ordering::Relaxed),
                 updated_unix_ms: now_unix_ms(),
+                seq,
             };
+            // Always emit when poll-interval elapses (heartbeat), or sooner if
+            // a meaningful field changed. `seq` itself doesn't gate writes —
+            // we write at most one heartbeat per `poll`.
             if current.audio_ns != last_emit.audio_ns
                 || current.detect_ns != last_emit.detect_ns
                 || current.last_word_ns != last_emit.last_word_ns
@@ -1455,6 +1534,11 @@ fn spawn_wake_status_reader(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_seen_ms = min_updated_unix_ms;
+        // Track the worker's heartbeat sequence. A stale file left over from
+        // a crashed previous run will have seq=0 (or some small frozen value)
+        // and we use that to reject leftover state at startup. Once we see a
+        // non-zero seq we require strictly-monotonic advances.
+        let mut last_seq: u64 = 0;
         while !stop.load(Ordering::Relaxed) {
             if fired.load(Ordering::Relaxed) {
                 break;
@@ -1466,8 +1550,16 @@ fn spawn_wake_status_reader(
                             std::thread::sleep(poll);
                             continue;
                         }
+                        // If we've ever seen a real heartbeat, refuse to
+                        // regress. A worker that just started fresh will have
+                        // seq starting at 1 and climbing each poll.
+                        if last_seq > 0 && status.seq != 0 && status.seq <= last_seq {
+                            std::thread::sleep(poll);
+                            continue;
+                        }
                         if status.updated_unix_ms >= last_seen_ms {
                             last_seen_ms = status.updated_unix_ms;
+                            last_seq = status.seq.max(last_seq);
                             last_status_ms.store(status.updated_unix_ms, Ordering::Relaxed);
                             detect_ns.store(status.detect_ns, Ordering::Relaxed);
                             audio_ns.store(status.audio_ns, Ordering::Relaxed);
@@ -1489,11 +1581,6 @@ fn spawn_wake_status_reader(
     })
 }
 
-const TS_PACKET_SIZE: usize = 188;
-const PTS_HZ: f64 = 90_000.0;
-const PTS_WRAP: u64 = 1 << 33;
-const PCR_HZ: f64 = 27_000_000.0;
-const PCR_WRAP: u64 = (1 << 33) * 300;
 
 fn duration_to_ns(d: Duration) -> u64 {
     let nanos = d.as_nanos();
@@ -1504,1322 +1591,7 @@ fn duration_to_ns(d: Duration) -> u64 {
     }
 }
 
-fn choose_segment_duration(pts: Option<Duration>, playlist: Duration) -> Duration {
-    if let Some(pts_dur) = pts {
-        let secs = pts_dur.as_secs_f32();
-        if secs.is_finite() && secs > 0.0 {
-            return pts_dur;
-        }
-    }
-    playlist
-}
 
-// Extract a best-effort PTS span from a TS segment to align clip timing to real stream time.
-
-fn pts_duration_from_ts(data: &[u8]) -> Option<Duration> {
-    if let Some((start, end)) = pts_span_from_ts(data) {
-        if let Some(dur) = duration_from_span(start, end, PTS_WRAP, PTS_HZ) {
-            return Some(dur);
-        }
-    }
-    pcr_duration_from_ts(data)
-}
-
-
-fn pts_span_from_ts(data: &[u8]) -> Option<(u64, u64)> {
-    let sync = find_ts_sync(data)?;
-    let mut audio_first = None;
-    let mut audio_last = None;
-    let mut video_first = None;
-    let mut video_last = None;
-
-    let mut idx = sync;
-    while idx + TS_PACKET_SIZE <= data.len() {
-        let packet = &data[idx..idx + TS_PACKET_SIZE];
-        idx += TS_PACKET_SIZE;
-
-        if packet[0] != 0x47 {
-            continue;
-        }
-
-        let payload_unit_start = (packet[1] & 0x40) != 0;
-        let adaptation_control = (packet[3] >> 4) & 0x03;
-        if adaptation_control == 0 || adaptation_control == 2 {
-            continue;
-        }
-
-        let mut payload_idx = 4usize;
-        if adaptation_control == 3 {
-            let adapt_len = packet[4] as usize;
-            payload_idx = payload_idx.saturating_add(1 + adapt_len);
-        }
-        if payload_idx >= TS_PACKET_SIZE {
-            continue;
-        }
-        if !payload_unit_start {
-            continue;
-        }
-
-        let payload = &packet[payload_idx..];
-        if payload.len() < 9 {
-            continue;
-        }
-        if payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
-            continue;
-        }
-
-        let stream_id = payload[3];
-        let is_audio = is_audio_stream_id(stream_id);
-        let is_video = is_video_stream_id(stream_id);
-        if !(is_audio || is_video) {
-            continue;
-        }
-
-        let flags = payload[7];
-        let pts_dts = (flags >> 6) & 0x03;
-        if pts_dts < 2 {
-            continue;
-        }
-
-        let pts_start = 9;
-        if payload.len() < pts_start + 5 {
-            continue;
-        }
-        let Some(pts) = parse_pts(&payload[pts_start..pts_start + 5]) else {
-            continue;
-        };
-
-        if is_audio {
-            if audio_first.is_none() {
-                audio_first = Some(pts);
-            }
-            audio_last = Some(pts);
-        } else if is_video {
-            if video_first.is_none() {
-                video_first = Some(pts);
-            }
-            video_last = Some(pts);
-        }
-    }
-
-    if let (Some(first), Some(last)) = (audio_first, audio_last) {
-        if last != first {
-            return Some((first, last));
-        }
-    }
-    if let (Some(first), Some(last)) = (video_first, video_last) {
-        if last != first {
-            return Some((first, last));
-        }
-    }
-    None
-}
-
-
-fn pcr_duration_from_ts(data: &[u8]) -> Option<Duration> {
-    let (start, end) = pcr_span_from_ts(data)?;
-    duration_from_span(start, end, PCR_WRAP, PCR_HZ)
-}
-
-fn pcr_span_from_ts(data: &[u8]) -> Option<(u64, u64)> {
-    let sync = find_ts_sync(data)?;
-    let mut first = None;
-    let mut last = None;
-
-    let mut idx = sync;
-    while idx + TS_PACKET_SIZE <= data.len() {
-        let packet = &data[idx..idx + TS_PACKET_SIZE];
-        idx += TS_PACKET_SIZE;
-
-        if packet[0] != 0x47 {
-            continue;
-        }
-        if let Some(pcr) = parse_pcr(packet) {
-            if first.is_none() {
-                first = Some(pcr);
-            }
-            last = Some(pcr);
-        }
-    }
-
-    match (first, last) {
-        (Some(f), Some(l)) if l != f => Some((f, l)),
-        _ => None,
-    }
-}
-
-fn parse_pcr(packet: &[u8]) -> Option<u64> {
-    if packet.len() < TS_PACKET_SIZE {
-        return None;
-    }
-    let adaptation_control = (packet[3] >> 4) & 0x03;
-    if adaptation_control == 0 || adaptation_control == 1 {
-        return None;
-    }
-    let adapt_len = packet[4] as usize;
-    if adapt_len < 7 || 5 + adapt_len > packet.len() {
-        return None;
-    }
-    let flags = packet[5];
-    if (flags & 0x10) == 0 {
-        return None;
-    }
-    let pcr = &packet[6..12];
-    let base = ((pcr[0] as u64) << 25)
-        | ((pcr[1] as u64) << 17)
-        | ((pcr[2] as u64) << 9)
-        | ((pcr[3] as u64) << 1)
-        | ((pcr[4] as u64) >> 7);
-    let ext = (((pcr[4] & 0x01) as u64) << 8) | (pcr[5] as u64);
-    Some(base * 300 + ext)
-}
-
-fn duration_from_span(start: u64, end: u64, wrap: u64, hz: f64) -> Option<Duration> {
-    let delta = if end >= start {
-        end - start
-    } else {
-        (end + wrap) - start
-    };
-    if delta == 0 {
-        return None;
-    }
-    let secs = (delta as f64) / hz;
-    if !secs.is_finite() || secs <= 0.0 {
-        return None;
-    }
-    Some(Duration::from_secs_f64(secs))
-}
-
-fn find_ts_sync(data: &[u8]) -> Option<usize> {
-    let max_scan = usize::min(data.len(), TS_PACKET_SIZE * 4);
-    for start in 0..max_scan {
-        if data[start] != 0x47 {
-            continue;
-        }
-        let next = start + TS_PACKET_SIZE;
-        if next < data.len() && data[next] == 0x47 {
-            return Some(start);
-        }
-    }
-    None
-}
-
-fn is_audio_stream_id(id: u8) -> bool {
-    (0xC0..=0xDF).contains(&id)
-}
-
-fn is_video_stream_id(id: u8) -> bool {
-    (0xE0..=0xEF).contains(&id)
-}
-
-fn parse_pts(data: &[u8]) -> Option<u64> {
-    if data.len() < 5 {
-        return None;
-    }
-    let b0 = data[0];
-    if (b0 & 0xF0) != 0x20 && (b0 & 0xF0) != 0x30 {
-        return None;
-    }
-    let b1 = data[1];
-    let b2 = data[2];
-    let b3 = data[3];
-    let b4 = data[4];
-
-    let pts = (((b0 >> 1) & 0x07) as u64) << 30
-        | (b1 as u64) << 22
-        | (((b2 >> 1) & 0x7F) as u64) << 15
-        | (b3 as u64) << 7
-        | (((b4 >> 1) & 0x7F) as u64);
-    Some(pts)
-}
-
-#[derive(Debug)]
-struct HttpStatusError {
-    status: StatusCode,
-    url: String,
-}
-
-impl HttpStatusError {
-    fn new(status: StatusCode, url: &str) -> Self {
-        Self {
-            status,
-            url: url.to_string(),
-        }
-    }
-}
-
-impl std::fmt::Display for HttpStatusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "non-success status {} for {}", self.status, self.url)
-    }
-}
-
-impl std::error::Error for HttpStatusError {}
-
-fn is_http_status(err: &anyhow::Error, status: StatusCode) -> bool {
-    err.downcast_ref::<HttpStatusError>()
-        .map(|e| e.status == status)
-        .unwrap_or(false)
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct StreamHeaders {
-    pub referer: Option<String>,
-    pub origin: Option<String>,
-    pub cookie: Option<String>,
-}
-
-impl StreamHeaders {
-    fn for_page(page_url: &str, origin: Option<String>, cookie: Option<String>) -> Self {
-        Self {
-            referer: Some(page_url.to_string()),
-            origin,
-            cookie,
-        }
-    }
-}
-
-fn collect_env_cookies() -> Option<String> {
-    let mut cookie_parts: Vec<String> = Vec::new();
-    for key in ["COOKIE_HEADER", "KICK_COOKIE", "TIKTOK_COOKIE", "TWITCH_COOKIE"] {
-        if let Ok(val) = std::env::var(key) {
-            if !val.trim().is_empty() {
-                cookie_parts.push(val);
-            }
-        }
-    }
-    if cookie_parts.is_empty() {
-        None
-    } else {
-        Some(cookie_parts.join("; "))
-    }
-}
-
-fn headless_script_for_page(page_url: &str) -> String {
-    if page_url.contains("tiktok.com") {
-        std::env::var("HEADLESS_M3U8_SCRIPT_TIKTOK")
-            .unwrap_or_else(|_| "scripts/capture_m3u8_tiktok.js".to_string())
-    } else {
-        std::env::var("HEADLESS_M3U8_SCRIPT")
-            .unwrap_or_else(|_| "scripts/capture_m3u8.js".to_string())
-    }
-}
-
-/// Minimal client to fetch and parse HLS playlists.
-#[derive(Clone)]
-pub struct HlsClient {
-    client: Client,
-}
-
-impl HlsClient {
-    pub fn new() -> Result<Self> {
-        let mut headers = header::HeaderMap::new();
-        headers.insert(
-            header::USER_AGENT,
-            header::HeaderValue::from_static(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            ),
-        );
-        headers.insert(header::ACCEPT, header::HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"));
-        headers.insert(header::ACCEPT_LANGUAGE, header::HeaderValue::from_static("en-US,en;q=0.9"));
-        let client = Client::builder()
-            .default_headers(headers)
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .context("building reqwest client")?;
-        Ok(Self { client })
-    }
-
-    /// Fetch and parse a master playlist from the provided URL.
-    pub async fn fetch_master(&self, url: &str) -> Result<MasterPlaylist> {
-        let body = self.fetch_bytes(url).await?;
-        self.parse_master_or_media(url, &body)
-    }
-
-    pub async fn fetch_master_with_headers(
-        &self,
-        url: &str,
-        referer: Option<&str>,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<MasterPlaylist> {
-        let body = self
-            .fetch_bytes_with_headers(url, referer, origin, cookie)
-            .await?;
-        self.parse_master_or_media(url, &body)
-    }
-
-    /// Fetch a page via headless Playwright, extract the first m3u8 URL, and parse
-    /// it as a master playlist. Adds Referer/Origin tied to the page URL. Forwards
-    /// COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE / TWITCH_COOKIE if present. If
-    /// M3U8_URL_OVERRIDE is set, use
-    /// that master URL directly instead of headless extraction.
-    pub async fn fetch_master_from_page_with_headers(
-        &self,
-        page_url: &str,
-    ) -> Result<(String, MasterPlaylist, StreamHeaders)> {
-        let env_cookie = collect_env_cookies();
-        let origin = origin_for_page(page_url).unwrap_or_else(|| "https://kick.com".to_string());
-        let base_headers = StreamHeaders::for_page(page_url, Some(origin.clone()), env_cookie.clone());
-
-        let is_tiktok = page_url.contains("tiktok.com");
-        let is_twitch = page_url.contains("twitch.tv");
-        let headless_script = headless_script_for_page(page_url);
-
-        if let Ok(override_url) = std::env::var("M3U8_URL_OVERRIDE") {
-            let master = self
-                .fetch_master_with_headers(
-                    &override_url,
-                    base_headers.referer.as_deref(),
-                    base_headers.origin.as_deref(),
-                    base_headers.cookie.as_deref(),
-                )
-                .await?;
-            return Ok((override_url, master, base_headers));
-        }
-
-        if is_tiktok {
-            if let Some((url, master)) = self
-                .try_fetch_tiktok_master(page_url, env_cookie.as_deref())
-                .await?
-            {
-                return Ok((url, master, base_headers));
-            }
-            eprintln!("TikTok HTTP discovery failed or stream offline; falling back to headless");
-        }
-        if is_twitch {
-            if let Some((url, master)) = self
-                .try_fetch_twitch_master(page_url, env_cookie.as_deref())
-                .await?
-            {
-                return Ok((url, master, base_headers));
-            }
-            eprintln!("Twitch HTTP discovery failed or stream offline; falling back to headless");
-        }
-
-        self.fetch_master_with_headless_with_headers(
-            page_url,
-            env_cookie.as_deref(),
-            &headless_script,
-        )
-        .await
-    }
-
-    pub async fn fetch_master_from_page(&self, page_url: &str) -> Result<(String, MasterPlaylist)> {
-        let (master_url, master, _headers) = self.fetch_master_from_page_with_headers(page_url).await?;
-        Ok((master_url, master))
-    }
-
-    /// Force a headless discovery pass to refresh the master playlist + headers.
-    pub async fn fetch_master_from_page_headless_with_headers(
-        &self,
-        page_url: &str,
-    ) -> Result<(String, MasterPlaylist, StreamHeaders)> {
-        let env_cookie = collect_env_cookies();
-        let headless_script = headless_script_for_page(page_url);
-        self.fetch_master_with_headless_with_headers(
-            page_url,
-            env_cookie.as_deref(),
-            &headless_script,
-        )
-        .await
-    }
-
-    /// Force a headless discovery pass to refresh the master playlist.
-    pub async fn fetch_master_from_page_headless(
-        &self,
-        page_url: &str,
-    ) -> Result<(String, MasterPlaylist)> {
-        let (master_url, master, _headers) =
-            self.fetch_master_from_page_headless_with_headers(page_url).await?;
-        Ok((master_url, master))
-    }
-
-    /// Use a headless browser (Node + Playwright script) to capture an m3u8 URL.
-    async fn fetch_master_with_headless(
-        &self,
-        page_url: &str,
-        cookie_env: Option<&str>,
-        script_path: &str,
-    ) -> Result<(String, MasterPlaylist)> {
-        let (master_url, master, _headers) = self
-            .fetch_master_with_headless_with_headers(page_url, cookie_env, script_path)
-            .await?;
-        Ok((master_url, master))
-    }
-
-    async fn fetch_master_with_headless_with_headers(
-        &self,
-        page_url: &str,
-        cookie_env: Option<&str>,
-        script_path: &str,
-    ) -> Result<(String, MasterPlaylist, StreamHeaders)> {
-        let output = Command::new("node")
-            .arg(script_path)
-            .arg(page_url)
-            .output()
-            .await
-            .with_context(|| format!("running headless script {script_path}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "headless script exited with {}: {}",
-                output.status,
-                stderr.trim()
-            );
-        }
-
-        let mut m3u8_url_line: Option<String> = None;
-        let mut cookie_from_headless: Option<String> = None;
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if m3u8_url_line.is_none() && trimmed.to_lowercase().contains(".m3u8") {
-                m3u8_url_line = Some(trimmed.to_string());
-            }
-            if let Some(rest) = trimmed.strip_prefix("COOKIES:") {
-                if !rest.trim().is_empty() {
-                    cookie_from_headless = Some(rest.trim().to_string());
-                }
-            }
-        }
-
-        let m3u8_url_raw = m3u8_url_line
-            .ok_or_else(|| anyhow::anyhow!("headless script did not emit an m3u8 url; stderr: {}", stderr.trim()))?;
-        let m3u8_url_raw = sanitize_m3u8_url(&m3u8_url_raw);
-        // Use the raw URL from headless to avoid invalidating any signed token.
-        let m3u8_url = m3u8_url_raw;
-        eprintln!("headless extracted m3u8 url: {}", m3u8_url);
-
-        let combined_cookie = match (cookie_env, cookie_from_headless.as_deref()) {
-            (Some(env_c), Some(headless_c)) => Some(format!("{env_c}; {headless_c}")),
-            (Some(env_c), None) => Some(env_c.to_string()),
-            (None, Some(headless_c)) => Some(headless_c.to_string()),
-            (None, None) => None,
-        };
-
-        let origin = origin_for_page(page_url);
-
-        let body = self
-            .fetch_bytes_with_headers(
-                &m3u8_url,
-                Some(page_url),
-                origin.as_deref(),
-                combined_cookie.as_deref(),
-            )
-            .await?;
-
-        let parsed = self.parse_master_or_media(&m3u8_url, &body)?;
-        let headers = StreamHeaders::for_page(page_url, origin, combined_cookie);
-        Ok((m3u8_url, parsed, headers))
-    }
-
-    async fn try_fetch_tiktok_master(
-        &self,
-        page_url: &str,
-        cookie_env: Option<&str>,
-    ) -> Result<Option<(String, MasterPlaylist)>> {
-        let origin = origin_for_page(page_url).unwrap_or_else(|| "https://www.tiktok.com".to_string());
-        let cookie_header = cookie_env
-            .filter(|c| !c.trim().is_empty())
-            .map(|c| c.to_string());
-
-        let html = match self
-            .fetch_text_with_headers(page_url, Some(page_url), Some(&origin), cookie_header.as_deref())
-            .await
-        {
-            Ok(h) => h,
-            Err(err) => {
-                eprintln!("TikTok: failed to fetch page HTML: {err:#}");
-                return Ok(None);
-            }
-        };
-
-        let room_id = match extract_tiktok_room_id(&html) {
-            Some(id) => id,
-            None => {
-                eprintln!("TikTok: no room_id found; stream may be offline");
-                return Ok(None);
-            }
-        };
-
-        let mut live_info: Option<Value> = None;
-        let mut attempts = 0;
-        while attempts < 3 {
-            match self
-                .fetch_tiktok_room_info(&room_id, page_url, Some(&origin), cookie_header.as_deref())
-                .await
-            {
-                Ok(v) => {
-                    live_info = Some(v);
-                    break;
-                }
-                Err(err) => {
-                    attempts += 1;
-                    if attempts >= 3 {
-                        eprintln!("TikTok: room info fetch failed: {err:#}");
-                        return Ok(None);
-                    }
-                    sleep(Duration::from_millis(300)).await;
-                }
-            }
-        }
-
-        let live_info = live_info.unwrap_or(Value::Null);
-        let mut candidates = collect_tiktok_hls_candidates(&live_info);
-
-        if candidates.is_empty() {
-            if let Some(fallback_url) = self
-                .fetch_tiktok_live_detail_url(&room_id, page_url, Some(&origin), cookie_header.as_deref())
-                .await?
-            {
-                candidates.push(("live_detail".to_string(), fallback_url));
-            }
-        }
-
-        if candidates.is_empty() {
-            eprintln!("TikTok: no HLS candidates from room info or detail API");
-            return Ok(None);
-        }
-
-        let selected = pick_best_tiktok_hls(&candidates).unwrap_or_else(|| candidates[0].1.clone());
-        let master = self
-            .fetch_master_with_headers(&selected, Some(page_url), Some(&origin), cookie_header.as_deref())
-            .await?;
-        Ok(Some((selected, master)))
-    }
-
-    async fn try_fetch_twitch_master(
-        &self,
-        page_url: &str,
-        cookie_env: Option<&str>,
-    ) -> Result<Option<(String, MasterPlaylist)>> {
-        let login = match extract_twitch_login(page_url) {
-            Some(name) => name,
-            None => {
-                eprintln!("Twitch: could not determine channel login from URL");
-                return Ok(None);
-            }
-        };
-
-        let origin = origin_for_page(page_url).unwrap_or_else(|| "https://www.twitch.tv".to_string());
-        let cookie_header = cookie_env.filter(|c| !c.trim().is_empty());
-
-        let (sig, token) = match self
-            .fetch_twitch_playback_token(&login, page_url, Some(&origin), cookie_header)
-            .await
-        {
-            Ok(t) => t,
-            Err(err) => {
-                eprintln!("Twitch: playback token fetch failed: {err:#}");
-                return Ok(None);
-            }
-        };
-
-        let hls_url = build_twitch_hls_url(&login, &sig, &token)?;
-        let master = self
-            .fetch_master_with_headers(&hls_url, Some(page_url), Some(&origin), cookie_header)
-            .await?;
-        Ok(Some((hls_url, master)))
-    }
-
-    async fn fetch_twitch_playback_token(
-        &self,
-        login: &str,
-        referer: &str,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<(String, String)> {
-        const DEFAULT_TWITCH_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
-        const TWITCH_PLAYBACK_HASH: &str =
-            "0828119ded2d05bcfcf8e4da97d91aa47a1ec89be12f0161a2367c6a6fc1ce2c";
-
-        let client_id = std::env::var("TWITCH_CLIENT_ID").unwrap_or_else(|_| DEFAULT_TWITCH_CLIENT_ID.to_string());
-        let auth_token = std::env::var("TWITCH_OAUTH_TOKEN")
-            .or_else(|_| std::env::var("TWITCH_AUTH_TOKEN"))
-            .ok()
-            .and_then(|v| twitch_auth_header(&v));
-
-        let payload = serde_json::json!({
-            "operationName": "PlaybackAccessToken",
-            "variables": {
-                "isLive": true,
-                "login": login,
-                "isVod": false,
-                "vodID": "",
-                "playerType": "site"
-            },
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": TWITCH_PLAYBACK_HASH
-                }
-            }
-        });
-
-        let mut req = self
-            .client
-            .post("https://gql.twitch.tv/gql")
-            .header("Client-ID", client_id)
-            .header(header::ACCEPT, "application/json")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("Referer", referer);
-        if let Some(o) = origin {
-            req = req.header("Origin", o);
-        }
-        if let Some(c) = cookie {
-            req = req.header(header::COOKIE, c);
-        }
-        if let Some(auth) = auth_token {
-            req = req.header(header::AUTHORIZATION, auth);
-        }
-
-        let resp = req
-            .json(&payload)
-            .send()
-            .await
-            .context("requesting Twitch playback token")?;
-        let status = resp.status();
-        let body = resp.text().await.context("reading Twitch playback token body")?;
-        if !status.is_success() {
-            eprintln!("Twitch token status {} body: {}", status, truncate_str(&body, 500));
-            anyhow::bail!("Twitch token request returned status {status}");
-        }
-
-        let json: Value = serde_json::from_str(&body).context("parsing Twitch token JSON")?;
-        if let Some((sig, value)) = extract_twitch_playback_token(&json) {
-            return Ok((sig, value));
-        }
-        anyhow::bail!("Twitch token response missing playback access token");
-    }
-
-    async fn fetch_text_with_headers(
-        &self,
-        url: &str,
-        referer: Option<&str>,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<String> {
-        let mut req = self.client.get(url);
-        if let Some(r) = referer {
-            req = req.header("Referer", r);
-        }
-        if let Some(o) = origin {
-            req = req.header("Origin", o);
-        }
-        if let Some(c) = cookie {
-            req = req.header(header::COOKIE, c);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("request failed for {url}"))?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .with_context(|| format!("reading body for {url}"))?;
-        if !status.is_success() {
-            eprintln!("fetch {} -> status {} body preview: {}", url, status, truncate_str(&text, 500));
-            anyhow::bail!("non-success status {} for {}", status, url);
-        }
-        Ok(text)
-    }
-
-    async fn fetch_tiktok_room_info(
-        &self,
-        room_id: &str,
-        referer: &str,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<Value> {
-        let url = "https://webcast.tiktok.com/webcast/room/info";
-        let mut req = self.client.get(url).query(&[
-            ("room_id", room_id),
-            ("aid", "1988"),
-            ("device_platform", "web"),
-            ("app_name", "tiktok_web"),
-            ("language", "en"),
-        ]);
-        req = req.header("Referer", referer);
-        if let Some(o) = origin {
-            req = req.header("Origin", o);
-        }
-        if let Some(c) = cookie {
-            req = req.header(header::COOKIE, c);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| "requesting TikTok room info")?;
-        let status = resp.status();
-        let body = resp.text().await.context("reading TikTok room info body")?;
-        if !status.is_success() {
-            eprintln!("TikTok room info status {} body: {}", status, truncate_str(&body, 500));
-            anyhow::bail!("TikTok room info returned status {status}");
-        }
-        let json: Value = serde_json::from_str(&body).context("parsing TikTok room info JSON")?;
-        let data = json.get("data").cloned().unwrap_or(Value::Null);
-        Ok(data)
-    }
-
-    async fn fetch_tiktok_live_detail_url(
-        &self,
-        room_id: &str,
-        referer: &str,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<Option<String>> {
-        let url = format!("https://www.tiktok.com/api/live/detail/?roomID={room_id}");
-        let mut req = self.client.get(&url);
-        req = req.header("Referer", referer);
-        if let Some(o) = origin {
-            req = req.header("Origin", o);
-        }
-        if let Some(c) = cookie {
-            req = req.header(header::COOKIE, c);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| "requesting TikTok live detail")?;
-        let status = resp.status();
-        let body = resp.text().await.context("reading TikTok live detail body")?;
-        if !status.is_success() {
-            return Ok(None);
-        }
-        let json: Value = serde_json::from_str(&body).context("parsing TikTok live detail JSON")?;
-        Ok(json
-            .get("liveUrl")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()))
-    }
-
-    /// Pick the highest-quality variant from a master playlist and return its joined URL.
-    pub fn highest_variant_url(&self, master_url: &str, master: &MasterPlaylist) -> Result<Url> {
-        let base = Url::parse(master_url).context("invalid master playlist url")?;
-
-        let variant = master
-            .variants
-            .iter()
-            .max_by(|a, b| compare_variant_quality(a, b))
-            .context("master playlist has no variants")?;
-
-        let uri = &variant.uri;
-        let resolved = base.join(uri).context("joining variant uri")?;
-        Ok(resolved)
-    }
-
-    /// Fetch and parse a media playlist (variant) from the provided URL.
-    pub async fn fetch_media(&self, url: &str) -> Result<MediaPlaylist> {
-        let body = self.fetch_bytes(url).await?;
-        let parsed = m3u8_rs::parse_media_playlist_res(&body)
-            .map_err(|e| anyhow::anyhow!("failed to parse media playlist: {e}"))?;
-        Ok(parsed)
-    }
-
-    pub async fn fetch_media_with_headers(
-        &self,
-        url: &str,
-        headers: &StreamHeaders,
-    ) -> Result<MediaPlaylist> {
-        let body = self
-            .fetch_bytes_with_headers(
-                url,
-                headers.referer.as_deref(),
-                headers.origin.as_deref(),
-                headers.cookie.as_deref(),
-            )
-            .await?;
-        let parsed = m3u8_rs::parse_media_playlist_res(&body)
-            .map_err(|e| anyhow::anyhow!("failed to parse media playlist: {e}"))?;
-        Ok(parsed)
-    }
-
-    /// Refresh the best variant URL from a page using headless discovery.
-    pub async fn refresh_media_url_from_page_headless(&self, page_url: &str) -> Result<Url> {
-        let (master_url, master) = self.fetch_master_from_page_headless(page_url).await?;
-        self.highest_variant_url(&master_url, &master)
-    }
-
-    pub async fn refresh_media_url_from_page_headless_with_headers(
-        &self,
-        page_url: &str,
-    ) -> Result<(Url, StreamHeaders)> {
-        let (master_url, master, headers) =
-            self.fetch_master_from_page_headless_with_headers(page_url).await?;
-        let media_url = self.highest_variant_url(&master_url, &master)?;
-        Ok((media_url, headers))
-    }
-
-    /// Fetch the first media segment bytes from a media playlist URL.
-    pub async fn fetch_first_segment(&self, playlist_url: &str) -> Result<Vec<u8>> {
-        let media = self.fetch_media(playlist_url).await?;
-        let first = media
-            .segments
-            .first()
-            .map(|s| &s.uri)
-            .context("media playlist has no segments")?;
-
-        let playlist_url = Url::parse(playlist_url).context("invalid playlist url")?;
-        let segment_url = playlist_url
-            .join(first)
-            .context("joining segment url")?;
-
-        self.fetch_bytes(segment_url.as_str()).await
-    }
-
-    /// Fetch an arbitrary segment (by URI) relative to a media playlist URL.
-    pub async fn fetch_segment_from_playlist(
-        &self,
-        playlist_url: &Url,
-        segment_uri: &str,
-    ) -> Result<Vec<u8>> {
-        let segment_url = playlist_url
-            .join(segment_uri)
-            .context("joining segment url")?;
-        self.fetch_bytes(segment_url.as_str()).await
-    }
-
-    pub async fn fetch_segment_from_playlist_with_headers(
-        &self,
-        playlist_url: &Url,
-        segment_uri: &str,
-        headers: &StreamHeaders,
-    ) -> Result<Vec<u8>> {
-        let segment_url = playlist_url
-            .join(segment_uri)
-            .context("joining segment url")?;
-        self.fetch_bytes_with_headers(
-            segment_url.as_str(),
-            headers.referer.as_deref(),
-            headers.origin.as_deref(),
-            headers.cookie.as_deref(),
-        )
-        .await
-    }
-
-    async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        self.fetch_bytes_with_headers(url, None, None, None).await
-    }
-
-    async fn fetch_bytes_with_headers(
-        &self,
-        url: &str,
-        referer: Option<&str>,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-    ) -> Result<Vec<u8>> {
-        let mut req = self.client.get(url);
-        if let Some(r) = referer {
-            req = req.header("Referer", r);
-        }
-        if let Some(o) = origin {
-            req = req.header("Origin", o);
-        }
-        if let Some(c) = cookie {
-            req = req.header(header::COOKIE, c);
-        }
-        req = req.header(header::ACCEPT, "application/vnd.apple.mpegurl,application/x-mpegURL,application/octet-stream");
-
-        // Log the effective headers for troubleshooting signed/authorized endpoints.
-        if std::env::var("LOG_M3U8_HEADERS").is_ok() {
-            let mut dbg_headers = Vec::new();
-            if let Some(r) = referer {
-                dbg_headers.push(format!("Referer={r}"));
-            }
-            if let Some(o) = origin {
-                dbg_headers.push(format!("Origin={o}"));
-            }
-            if let Some(c) = cookie {
-                dbg_headers.push(format!("Cookie={}...", c.chars().take(80).collect::<String>()));
-            }
-            eprintln!("m3u8 request headers: {}", dbg_headers.join(" | "));
-        }
-
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("request failed for {url}"))?;
-        let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .with_context(|| format!("reading body for {url}"))?;
-        if !status.is_success() {
-            let preview = String::from_utf8_lossy(&bytes);
-            eprintln!("fetch {} -> status {} body preview: {}", url, status, preview.chars().take(500).collect::<String>());
-            return Err(HttpStatusError::new(status, url).into());
-        }
-        Ok(bytes.to_vec())
-    }
-
-}
-
-impl HlsClient {
-    fn parse_master_or_media(&self, m3u8_url: &str, body: &[u8]) -> Result<MasterPlaylist> {
-        match m3u8_rs::parse_master_playlist_res(body) {
-            Ok(master) if !master.variants.is_empty() => return Ok(master),
-            Ok(_master) => {
-                // Empty variants; try media parse and wrap as single-variant master.
-                if let Ok(_media) = m3u8_rs::parse_media_playlist_res(body) {
-                    let variant = VariantStream {
-                        uri: m3u8_url.to_string(),
-                        ..Default::default()
-                    };
-                    let mut out = MasterPlaylist::default();
-                    out.variants.push(variant);
-                    return Ok(out);
-                }
-                // Fall through to error below if media parse fails.
-            }
-            Err(e) => {
-                // Try media parse before bailing.
-                if let Ok(_media) = m3u8_rs::parse_media_playlist_res(body) {
-                    let variant = VariantStream {
-                        uri: m3u8_url.to_string(),
-                        ..Default::default()
-                    };
-                    let mut out = MasterPlaylist::default();
-                    out.variants.push(variant);
-                    return Ok(out);
-                }
-                return Err(anyhow::anyhow!("failed to parse master playlist: {e}"));
-            }
-        }
-
-        Err(anyhow::anyhow!("failed to parse playlist at {m3u8_url}"))
-    }
-}
-
-fn extract_tiktok_room_id(html: &str) -> Option<String> {
-    for marker in ["id=\"SIGI_STATE\"", "id=\"sigi-persisted-data\"", "id=\"__UNIVERSAL_DATA_FOR_REHYDRATION__\""] {
-        if let Some(block) = extract_json_script_block(html, marker) {
-            if let Ok(json) = serde_json::from_str::<Value>(&block) {
-                if let Some(id) = find_room_id_value(&json) {
-                    return Some(id);
-                }
-                // Some pages nest under __DEFAULT_SCOPE__ for the universal data script.
-                if let Some(default_scope) = json.get("__DEFAULT_SCOPE__") {
-                    if let Some(id) = find_room_id_value(default_scope) {
-                        return Some(id);
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: scan for roomId in the HTML.
-    if let Some(idx) = html.find("roomId\":\"") {
-        let start = idx + "roomId\":\"".len();
-        let rest = &html[start..];
-        let end = rest.find('"').unwrap_or(rest.len());
-        let candidate = &rest[..end];
-        if !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_digit()) {
-            return Some(candidate.to_string());
-        }
-    }
-
-    None
-}
-
-fn extract_json_script_block(html: &str, marker: &str) -> Option<String> {
-    let tag_start = html.find(marker)?;
-    let after_tag = html[tag_start..].find('>')?;
-    let script_start = tag_start + after_tag + 1;
-    let script_end_rel = html[script_start..].find("</script>")?;
-    let script_end = script_start + script_end_rel;
-    Some(html[script_start..script_end].to_string())
-}
-
-fn find_room_id_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Object(map) => {
-            for (k, v) in map {
-                if k.eq_ignore_ascii_case("roomid") || k.eq_ignore_ascii_case("room_id") {
-                    if let Some(s) = v.as_str() {
-                        if !s.is_empty() {
-                            return Some(s.to_string());
-                        }
-                    } else if let Some(n) = v.as_i64() {
-                        return Some(n.to_string());
-                    }
-                }
-                if let Some(found) = find_room_id_value(v) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(arr) => {
-            for v in arr {
-                if let Some(found) = find_room_id_value(v) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn collect_tiktok_hls_candidates(live_info: &Value) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-
-    if let Some(stream_data) = live_info
-        .get("stream_url")
-        .and_then(|v| v.get("live_core_sdk_data"))
-        .and_then(|v| v.get("pull_data"))
-        .and_then(|v| v.get("stream_data"))
-    {
-        if let Some(map) = stream_data.as_object() {
-            for (quality, entry) in map {
-                let parsed = if let Some(s) = entry.as_str() {
-                    serde_json::from_str::<Value>(s).ok()
-                } else {
-                    Some(entry.clone())
-                };
-
-                if let Some(val) = parsed {
-                    if let Some(hls) = extract_hls_from_stream_entry(&val) {
-                        out.push((quality.clone(), hls));
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(map) = live_info
-        .get("stream_url")
-        .and_then(|v| v.get("hls_pull_url_map"))
-        .and_then(|v| v.as_object())
-    {
-        for (quality, url) in map {
-            if let Some(u) = url.as_str() {
-                out.push((quality.clone(), u.to_string()));
-            }
-        }
-    }
-
-    if let Some(url) = live_info
-        .get("stream_url")
-        .and_then(|v| v.get("hls_pull_url"))
-        .and_then(|v| v.as_str())
-    {
-        out.push(("hls_pull".to_string(), url.to_string()));
-    }
-
-    out
-}
-
-fn extract_hls_from_stream_entry(entry: &Value) -> Option<String> {
-    let main = entry.get("main");
-    let candidates = [
-        main.and_then(|v| v.get("https_hls")),
-        main.and_then(|v| v.get("hls")),
-        main.and_then(|v| v.get("hls_pull_url")),
-    ];
-
-    for candidate in candidates.into_iter().flatten() {
-        if let Some(url) = candidate.as_str() {
-            if url.to_ascii_lowercase().contains("m3u8") {
-                return Some(url.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-fn pick_best_tiktok_hls(candidates: &[(String, String)]) -> Option<String> {
-    if candidates.is_empty() {
-        return None;
-    }
-
-    let preferred = [
-        "origion",
-        "origin",
-        "full_hd1",
-        "uhd",
-        "hd1",
-        "hd",
-        "sd2",
-        "sd1",
-        "sd",
-        "ld",
-    ];
-
-    for pref in preferred {
-        if let Some((_, url)) = candidates
-            .iter()
-            .find(|(q, _)| q.to_ascii_lowercase() == pref)
-        {
-            return Some(url.clone());
-        }
-    }
-
-    candidates.first().map(|(_, url)| url.clone())
-}
-
-fn extract_twitch_login(page_url: &str) -> Option<String> {
-    let url = Url::parse(page_url).ok()?;
-    let host = url.host_str()?.to_ascii_lowercase();
-    if !host.ends_with("twitch.tv") {
-        return None;
-    }
-
-    for (k, v) in url.query_pairs() {
-        if k.eq_ignore_ascii_case("channel") || k.eq_ignore_ascii_case("login") {
-            if is_valid_twitch_login(&v) {
-                return Some(v.to_string());
-            }
-        }
-    }
-
-    let mut segments = url.path_segments()?.filter(|s| !s.is_empty());
-    let first = segments.next()?;
-    let first_lc = first.to_ascii_lowercase();
-    if first_lc == "popout" || first_lc == "embed" {
-        if let Some(next) = segments.next() {
-            if is_valid_twitch_login(next) {
-                return Some(next.to_string());
-            }
-        }
-    }
-
-    if is_valid_twitch_login(first) {
-        return Some(first.to_string());
-    }
-
-    None
-}
-
-fn is_valid_twitch_login(login: &str) -> bool {
-    let lower = login.to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-    let reserved = [
-        "videos",
-        "directory",
-        "p",
-        "settings",
-        "downloads",
-        "friends",
-        "inventory",
-        "jobs",
-        "store",
-        "login",
-        "signup",
-        "search",
-        "prime",
-        "bits",
-    ];
-    if reserved.contains(&lower.as_str()) {
-        return false;
-    }
-    login.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn twitch_auth_header(token: &str) -> Option<String> {
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("oauth ") {
-        return Some(trimmed.to_string());
-    }
-    if lower.starts_with("oauth:") {
-        return Some(format!("OAuth {}", trimmed[6..].trim()));
-    }
-    if lower.starts_with("bearer ") {
-        return Some(format!("OAuth {}", trimmed[7..].trim()));
-    }
-    Some(format!("OAuth {}", trimmed))
-}
-
-fn extract_twitch_playback_token(value: &Value) -> Option<(String, String)> {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                if let Some(tok) = extract_twitch_playback_token(item) {
-                    return Some(tok);
-                }
-            }
-            None
-        }
-        Value::Object(_) => {
-            let data = value.get("data")?;
-            let token = data
-                .get("streamPlaybackAccessToken")
-                .or_else(|| data.get("playbackAccessToken"))?;
-            let sig = token.get("signature")?.as_str()?;
-            let value = token.get("value")?.as_str()?;
-            Some((sig.to_string(), value.to_string()))
-        }
-        _ => None,
-    }
-}
-
-fn build_twitch_hls_url(login: &str, sig: &str, token: &str) -> Result<String> {
-    let mut url = Url::parse(&format!("https://usher.ttvnw.net/api/channel/hls/{login}.m3u8"))
-        .context("parsing Twitch usher URL")?;
-    {
-        let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("sig", sig);
-        pairs.append_pair("token", token);
-        pairs.append_pair("allow_source", "true");
-        pairs.append_pair("allow_audio_only", "true");
-        pairs.append_pair("allow_spectre", "true");
-        pairs.append_pair("player", "twitchweb");
-        pairs.append_pair("playlist_include_framerate", "true");
-        pairs.append_pair("fast_bread", "true");
-    }
-    Ok(url.to_string())
-}
-
-/// Compare variants by average bandwidth, then bandwidth, then resolution pixels, then fallback to order.
-fn compare_variant_quality(a: &VariantStream, b: &VariantStream) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    let a_band: Option<u64> = a
-        .average_bandwidth
-        .map(|v| v as u64)
-        .or(Some(a.bandwidth as u64));
-    let b_band: Option<u64> = b
-        .average_bandwidth
-        .map(|v| v as u64)
-        .or(Some(b.bandwidth as u64));
-
-    match (a_band, b_band) {
-        (Some(a_bw), Some(b_bw)) if a_bw != b_bw => return a_bw.cmp(&b_bw),
-        _ => {}
-    }
-
-    let a_pixels = a.resolution.map(|r| r.width as u64 * r.height as u64);
-    let b_pixels = b.resolution.map(|r| r.width as u64 * r.height as u64);
-
-    match (a_pixels, b_pixels) {
-        (Some(a_px), Some(b_px)) if a_px != b_px => return a_px.cmp(&b_px),
-        _ => {}
-    }
-
-    Ordering::Equal
-}
-
-fn parse_resolution(res: &str) -> Option<(u32, u32)> {
-    let parts: Vec<_> = res.split('x').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let w = parts[0].parse().ok()?;
-    let h = parts[1].parse().ok()?;
-    Some((w, h))
-}
 
 fn rect_area(rect: NormalizedRect) -> f32 {
     let area = rect.w * rect.h;
@@ -2861,92 +1633,6 @@ fn rect_contains_rect(outer: NormalizedRect, inner: NormalizedRect, margin: f32)
         && inner.y >= top
         && (inner.x + inner.w) <= right
         && (inner.y + inner.h) <= bottom
-}
-
-fn normalize_page_url(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return trimmed.to_string();
-    }
-    if Url::parse(trimmed).is_ok() {
-        return trimmed.to_string();
-    }
-    if trimmed.contains("://") || looks_like_path(trimmed) {
-        return trimmed.to_string();
-    }
-    format!("https://{trimmed}")
-}
-
-fn looks_like_path(value: &str) -> bool {
-    let value = value.trim();
-    if value.is_empty() {
-        return false;
-    }
-    if value.starts_with("./")
-        || value.starts_with("../")
-        || value.starts_with('/')
-        || value.starts_with('\\')
-    {
-        return true;
-    }
-    let bytes = value.as_bytes();
-    bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/')
-}
-
-fn sanitize_m3u8_url(raw: &str) -> String {
-    raw.trim()
-        .trim_matches('\'')
-        .trim_matches('"')
-        .trim_end_matches('\\')
-        .to_string()
-}
-
-fn signed_url_expiry(url: &Url) -> Option<SystemTime> {
-    let mut best: Option<SystemTime> = None;
-    for (key, value) in url.query_pairs() {
-        let key = key.to_ascii_lowercase();
-        let key = key.as_str();
-        let is_exp = matches!(
-            key,
-            "exp"
-                | "expires"
-                | "expire"
-                | "expiry"
-                | "token_exp"
-                | "hdntl_exp"
-                | "hls_exp"
-                | "sig_exp"
-        ) || key.ends_with("_exp");
-        if !is_exp {
-            continue;
-        }
-        let raw = value.trim();
-        if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let mut secs = match raw.parse::<u64>() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if secs > 1_000_000_000_000 {
-            secs /= 1000;
-        }
-        if secs > 10_000_000_000 {
-            secs /= 1000;
-        }
-        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-        best = Some(best.map_or(ts, |prev| prev.min(ts)));
-    }
-    best
-}
-
-fn origin_for_page(page_url: &str) -> Option<String> {
-    if let Ok(u) = Url::parse(page_url) {
-        if let Some(host) = u.host_str() {
-            return Some(format!("{}://{}", u.scheme(), host));
-        }
-    }
-    None
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -5269,366 +3955,6 @@ async fn run_ffmpeg_internal(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
-enum EnvValueMode {
-    Required,
-    Optional,
-    Flag,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct EnvSpec {
-    env: &'static str,
-    mode: EnvValueMode,
-}
-
-const ENV_SPECS: &[EnvSpec] = &[
-    EnvSpec { env: "CLIP_PAGE_URL", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LAYOUT", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_RATIO", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_CROP", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_CONTEXT", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_ZOOM", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_BOX", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_REGION", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_ANCHOR", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAME_CENTER", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAME_REGION", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MODEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_BACKEND", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_ORT_DYLIB", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_ORT_DEVICE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_ORT_GPU_MEM_LIMIT_MB", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_ORT_MIN_FREE_VRAM_MB", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_DUMP_DIR", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_DUMP_RAW", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_PICK_RAW", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_SCORE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_TRACK_STEP", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_TILE_MIN_SCORE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_TILE_MAX_DEPTH", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_FRAME_HEAD_TOP", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_FRAME_HEAD_TOP_MIN", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_FRAME_HEAD_TOP_MAX", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_FRAME_EYE_TOP_RATIO", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_FRAME_EYE_CHIN_RATIO", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_FRAME_SHOULDER_SCALE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_MESH_MODEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH_MODEL_MIN_MB", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH_MODEL_MAX_MB", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH_LOAD_TIMEOUT_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH_BACKEND", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_MESH_TRACT_OPT", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH_INPUT_SIZE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH_INPUT_MAX", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH_INPUT_SCALE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH_REGION_SCALE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH_HEADROOM", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_MESH_DEBUG", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_POSE", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_POSE_MODEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_POSE_MODEL_MIN_MB", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_POSE_MODEL_MAX_MB", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_POSE_BACKEND", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_POSE_TRACT_OPT", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_POSE_SCORE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_POSE_INPUT_SCALE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_POSE_HEAD_RATIO", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_POSE_SHOULDER_MARGIN", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_POSE_DEBUG", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_ACTIVE_MOTION", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_ACTIVE_AREA_RATIO", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_ID", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_ID_FILE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_ID_MODEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_ID_THRESHOLD", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_ID_REQUIRE_MOTION", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_ID_MOTION", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_FACE_ID_BGR", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_ID_DEBUG", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_DEBUG", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_TRACK", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_AUDIO_NORM", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_CAPTIONS", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_CAPTIONS_POSITION", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAPTIONS_FONT", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAPTIONS_SIZE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAPTIONS_COLOR", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAPTIONS_OUTLINE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAPTIONS_OUTLINE_COLOR", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAPTIONS_MIN_WORD_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAPTIONS_MAX_WORDS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAPTIONS_CHEST_RATIO", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAPTIONS_MARGIN_OFFSET", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAPTIONS_DEBUG", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_CLOSED_CAPTIONS", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_LLM_ENABLE", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_LLM_ENDPOINT", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LLM_MODEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LLM_TEMPERATURE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LLM_TIMEOUT_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LLM_BACKOFF_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LLM_MAX_TRANSCRIPT_CHARS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LLM_TITLE_MAX_CHARS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LLM_DESCRIPTION_MAX_CHARS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LLM_GPU_LAYERS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LLM_FILE_RENAME", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_LLM_DEBUG", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_FACE_BUDGET_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_DETECT", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_DETECT_SIZE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_DETECT_SAMPLES", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_DETECT_START", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_DETECT_STEP", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_DETECT_FULL", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_DETECT_BUDGET_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_TS_REALTIME", mode: EnvValueMode::Flag },
-    EnvSpec { env: "CLIP_GAMEPLAY", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_REGION_DETECT", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_LIVE_CONFIG", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LIVE_CONFIG_POLL_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_LIVE_FAST", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_LIVE_LAYOUT_TTL_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_STREAMS_FILE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_STREAMS_POLL_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_STREAMS_MAX_CONCURRENT", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_M3U8_REFRESH_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_STREAM_OFFLINE_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_WAKE_WORDS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_PROFILE", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_EMOTION_ENABLE", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_EMOTION_AUDIO", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_EMOTION_FACE", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_EMOTION_THRESHOLD", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_EMOTION_WORDS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_EMOTION_AUDIO_RMS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_EMOTION_AUDIO_PEAK", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_EMOTION_AUDIO_WEIGHT", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_EMOTION_TEXT_WEIGHT", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_EMOTION_REFRACTORY_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_EMOTION_FACE_MOTION", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_EMOTION_DEBUG", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_GAMEPLAY_MODEL_DIR", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAMEPLAY_TEXT_MODEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAMEPLAY_VISION_MODEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAMEPLAY_TOKENIZER", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAMEPLAY_STRIDE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAMEPLAY_TOPK", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAMEPLAY_SCORE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAMEPLAY_SIZE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAMEPLAY_LABELS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAMEPLAY_NEG_LABELS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_GAMEPLAY_DEBUG", mode: EnvValueMode::Optional },
-    EnvSpec { env: "CLIP_CAM_LABELS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAM_NEG_LABELS", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAM_SCORE", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAM_TOPK", mode: EnvValueMode::Required },
-    EnvSpec { env: "CLIP_CAM_REGION_SCALE", mode: EnvValueMode::Required },
-    EnvSpec { env: "M3U8_URL_OVERRIDE", mode: EnvValueMode::Required },
-    EnvSpec { env: "M3U8_TEST_URL", mode: EnvValueMode::Required },
-    EnvSpec { env: "M3U8_PAGE_URL", mode: EnvValueMode::Required },
-    EnvSpec { env: "COOKIE_HEADER", mode: EnvValueMode::Required },
-    EnvSpec { env: "KICK_COOKIE", mode: EnvValueMode::Required },
-    EnvSpec { env: "TIKTOK_COOKIE", mode: EnvValueMode::Required },
-    EnvSpec { env: "TWITCH_COOKIE", mode: EnvValueMode::Required },
-    EnvSpec { env: "HEADLESS_M3U8_SCRIPT", mode: EnvValueMode::Required },
-    EnvSpec { env: "HEADLESS_M3U8_SCRIPT_TIKTOK", mode: EnvValueMode::Required },
-    EnvSpec { env: "LOG_M3U8_HEADERS", mode: EnvValueMode::Flag },
-    EnvSpec { env: "TWITCH_CLIENT_ID", mode: EnvValueMode::Required },
-    EnvSpec { env: "TWITCH_OAUTH_TOKEN", mode: EnvValueMode::Required },
-    EnvSpec { env: "TWITCH_AUTH_TOKEN", mode: EnvValueMode::Required },
-    EnvSpec { env: "WAKE_REFRACTORY_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "WAKE_BUFFER_HEADROOM_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "WAKE_BUFFER_RESTART_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "WAKE_NO_WORDS_SECS", mode: EnvValueMode::Required },
-    EnvSpec { env: "WAKE_FF_AF", mode: EnvValueMode::Required },
-    EnvSpec { env: "SKIP_CLIP_SAVE", mode: EnvValueMode::Optional },
-    EnvSpec { env: "MIC_DEVICE", mode: EnvValueMode::Required },
-    EnvSpec { env: "WHISPER_MODEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "WHISPER_RT_TARGET", mode: EnvValueMode::Required },
-    EnvSpec { env: "WHISPER_MODEL_CANDIDATES", mode: EnvValueMode::Required },
-    EnvSpec { env: "WHISPER_GPU", mode: EnvValueMode::Optional },
-    EnvSpec { env: "WHISPER_CLIP_GPU", mode: EnvValueMode::Optional },
-    EnvSpec { env: "WHISPER_MIN_FREE_VRAM_MB", mode: EnvValueMode::Required },
-    EnvSpec { env: "WHISPER_CUBLAS", mode: EnvValueMode::Optional },
-    EnvSpec { env: "WHISPER_LOG_LEVEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "WHISPER_ISOLATE", mode: EnvValueMode::Optional },
-    EnvSpec { env: "WHISPER_WORKER_MODE", mode: EnvValueMode::Optional },
-    EnvSpec { env: "WHISPER_WORKER_STATUS_PATH", mode: EnvValueMode::Required },
-    EnvSpec { env: "WHISPER_WORKER_MEDIA_URL_PATH", mode: EnvValueMode::Required },
-    EnvSpec { env: "WHISPER_WORKER_LOG_RAW", mode: EnvValueMode::Optional },
-    EnvSpec { env: "WHISPER_WORKER_STATUS_MS", mode: EnvValueMode::Required },
-    EnvSpec { env: "GGML_LOG_LEVEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "FFMPEG_BIN", mode: EnvValueMode::Required },
-    EnvSpec { env: "FFMPEG_ENCODER", mode: EnvValueMode::Required },
-    EnvSpec { env: "FFMPEG_HWACCEL", mode: EnvValueMode::Required },
-    EnvSpec { env: "FFMPEG_HWACCEL_DEVICE", mode: EnvValueMode::Required },
-    EnvSpec { env: "FFMPEG_HWACCEL_FALLBACK", mode: EnvValueMode::Required },
-    EnvSpec { env: "FFMPEG_MIN_FREE_VRAM_MB", mode: EnvValueMode::Required },
-    EnvSpec { env: "FFMPEG_ENCODE_TIMEOUT_SECS", mode: EnvValueMode::Required },
-];
-
-struct ParsedCli {
-    positionals: Vec<String>,
-    override_phrase: Option<String>,
-    log_raw_wake: bool,
-    log_raw_wake_set: bool,
-    mic_device: Option<String>,
-    stream_urls: Vec<String>,
-    streams_file: Option<String>,
-    env_overrides: Vec<(String, String)>,
-}
-
-fn env_to_flag(env: &str) -> String {
-    env.to_ascii_lowercase().replace('_', "-")
-}
-
-fn parse_cli_args(args: &[String]) -> Result<ParsedCli> {
-    let mut positionals = Vec::new();
-    let mut env_overrides = Vec::new();
-    let mut override_phrase = None;
-    let mut log_raw_wake = true;
-    let mut log_raw_wake_set = false;
-    let mut mic_device = None;
-    let mut stream_urls: Vec<String> = Vec::new();
-    let mut streams_file: Option<String> = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--" {
-            positionals.extend(args[i + 1..].iter().cloned());
-            break;
-        }
-        if let Some(rest) = arg.strip_prefix("--phrase=") {
-            override_phrase = Some(rest.to_string());
-            i += 1;
-            continue;
-        }
-        if let Some(rest) = arg.strip_prefix("--stream=") {
-            stream_urls.extend(split_stream_list(rest));
-            i += 1;
-            continue;
-        }
-        if let Some(rest) = arg.strip_prefix("--streams=") {
-            streams_file = Some(rest.to_string());
-            i += 1;
-            continue;
-        }
-        if let Some(rest) = arg.strip_prefix("--phrases=") {
-            override_phrase = Some(rest.to_string());
-            i += 1;
-            continue;
-        }
-        if arg == "--phrase" || arg == "--phrases" {
-            i += 1;
-            let Some(val) = args.get(i) else {
-                anyhow::bail!("--phrase expects a value");
-            };
-            override_phrase = Some(val.clone());
-            i += 1;
-            continue;
-        }
-        if arg == "--stream" {
-            i += 1;
-            let Some(val) = args.get(i) else {
-                anyhow::bail!("--stream expects a value");
-            };
-            stream_urls.extend(split_stream_list(val));
-            i += 1;
-            continue;
-        }
-        if arg == "--streams" {
-            i += 1;
-            let Some(val) = args.get(i) else {
-                anyhow::bail!("--streams expects a value");
-            };
-            streams_file = Some(val.clone());
-            i += 1;
-            continue;
-        }
-        if arg == "--log-raw-wake" {
-            log_raw_wake = true;
-            log_raw_wake_set = true;
-            i += 1;
-            continue;
-        }
-        if arg == "--no-log-raw-wake" {
-            log_raw_wake = false;
-            log_raw_wake_set = true;
-            i += 1;
-            continue;
-        }
-
-        let mut handled_env = false;
-        if let Some(raw_flag) = arg.strip_prefix("--") {
-            let (flag, inline_value) = match raw_flag.split_once('=') {
-                Some((f, v)) => (f.to_ascii_lowercase(), Some(v.to_string())),
-                None => (raw_flag.to_ascii_lowercase(), None),
-            };
-            for spec in ENV_SPECS {
-                let spec_flag = env_to_flag(spec.env);
-                if spec_flag == flag {
-                    let value = match spec.mode {
-                        EnvValueMode::Required => {
-                            if let Some(val) = inline_value {
-                                val
-                            } else {
-                                let next = args.get(i + 1).ok_or_else(|| {
-                                    anyhow::anyhow!("--{flag} expects a value")
-                                })?;
-                                if next.starts_with("--") {
-                                    anyhow::bail!("--{flag} expects a value");
-                                }
-                                i += 1;
-                                next.clone()
-                            }
-                        }
-                        EnvValueMode::Optional => inline_value.unwrap_or_else(|| "1".to_string()),
-                        EnvValueMode::Flag => inline_value.unwrap_or_else(|| "1".to_string()),
-                    };
-                    if spec.env == "MIC_DEVICE" {
-                        mic_device = Some(value.clone());
-                    }
-                    env_overrides.push((spec.env.to_string(), value));
-                    handled_env = true;
-                    break;
-                }
-            }
-        }
-
-        if handled_env {
-            i += 1;
-            continue;
-        }
-
-        if arg.starts_with('-') {
-            i += 1;
-            continue;
-        }
-
-        positionals.push(arg.clone());
-        i += 1;
-    }
-
-    Ok(ParsedCli {
-        positionals,
-        override_phrase,
-        log_raw_wake,
-        log_raw_wake_set,
-        mic_device,
-        stream_urls,
-        streams_file,
-        env_overrides,
-    })
-}
-
-fn apply_env_overrides(overrides: &[(String, String)]) {
-    for (key, value) in overrides {
-        std::env::set_var(key, value);
-    }
-}
 
 fn split_wake_phrases(raw: &str) -> Vec<String> {
     raw.split(|c| matches!(c, ',' | '|' | ';' | '\n' | '\r'))
@@ -5638,13 +3964,6 @@ fn split_wake_phrases(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn split_stream_list(raw: &str) -> Vec<String> {
-    raw.split(|c| matches!(c, ',' | '|' | ';' | '\n' | '\r'))
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
 
 fn normalize_stream_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
@@ -7595,190 +5914,6 @@ fn prompt_for_mic_device() -> Option<String> {
     None
 }
 
-fn print_help(bin: &str) {
-    println!("Usage:");
-    println!("  {bin} <page_url> [options]  (scheme optional, e.g. kick.com/user)");
-    println!("  {bin} demo-buffer");
-    println!("  {bin} demo-hls-buffer <page_url>");
-    println!("  {bin} demo-ts <path_to_ts> [--phrase WORDS] [--no-log-raw-wake]");
-    println!("  {bin} reprocess-ts <path_to_ts>");
-    println!("  {bin} check-gameplay-model [model_dir]");
-    println!("  {bin} demo-detect <media_path>");
-    println!("  {bin} face-sweep <positives_dir> <negatives_dir> [score_start score_end score_step] [out_csv]");
-    println!("  {bin} demo-wakeword-mic <page_url> [--phrase WORDS] [--log-raw-wake] [--mic-device NAME]");
-    println!("");
-    println!("Options:");
-    println!("  --phrase WORDS          Override wake phrase(s), comma/pipe separated (default: 'orange')");
-    println!("  --stream URL            Add a stream URL to watch (repeat or comma/pipe separated)");
-    println!("  --streams PATH          Streams file to sync/watch for multi-stream runs");
-    println!("  --log-raw-wake         Log raw/normalized transcripts (default on)");
-    println!("  --no-log-raw-wake      Disable transcript logging");
-    println!("  --mic-device NAME      Microphone device for mic wake mode");
-    println!("  -h, --help             Show this help");
-    println!("");
-    println!("CLI overrides:");
-    println!("  Any environment variable below can be passed as a CLI flag by lowercasing");
-    println!("  and replacing '_' with '-' (e.g., CLIP_LAYOUT -> --clip-layout=stacked).");
-    println!("  For boolean env vars, use the '=true'/'=false' form to avoid ambiguity.");
-    println!("");
-    println!("Environment (selected):");
-    println!("  CLIP_PAGE_URL            Default page when none is passed");
-    println!("  CLIP_LAYOUT              Layout mode: stacked (default) or full");
-    println!("  CLIP_FACE_RATIO          Height ratio reserved for face panel (default 0.40)");
-    println!("  CLIP_FACE_CROP           Face crop expr w:h:x:y (optional, overrides detection/anchor)");
-    println!("  CLIP_FACE_CONTEXT        Face crop expansion scale for detected face (default 6.0)");
-    println!("  CLIP_FACE_ZOOM           Face crop zoom factor (>1 zooms out, <1 zooms in; default 1.0)");
-    println!("  CLIP_FACE_BOX            Normalized face box x:y:w:h (0..1) for auto-crop");
-    println!("  CLIP_FACE_REGION         Normalized face bounds x:y:w:h (0..1) for mid-shot framing");
-    println!("  CLIP_FACE_ANCHOR         Anchor for default face crop (top-left default)");
-    println!("  CLIP_GAME_CENTER         Normalized gameplay center x:y (0..1) for reticle centering");
-    println!("  CLIP_GAME_REGION         Normalized gameplay bounds x:y:w:h (0..1) for layout checks");
-    println!("  CLIP_FACE_MODEL          Face detector model path (default models/face_detection_yunet_2023mar.onnx)");
-    println!("  CLIP_FACE_BACKEND        Face detector backend: auto (default), ort, or tract");
-    println!("  CLIP_ORT_DYLIB           Path to onnxruntime.dll (optional)");
-    println!("  CLIP_ORT_DEVICE          ORT CUDA device id, auto, or cpu (default auto)");
-    println!("  CLIP_ORT_GPU_MEM_LIMIT_MB ORT CUDA arena limit in MB (default 0 = unlimited)");
-    println!("  CLIP_ORT_MIN_FREE_VRAM_MB Min free VRAM before using ORT CUDA (default 512)");
-    println!("  CLIP_FACE_DUMP_DIR       Write face debug images with rectangles to this folder");
-    println!("  CLIP_FACE_DUMP_RAW       Dump raw face candidates (no score filtering) when enabled");
-    println!("  CLIP_FACE_PICK_RAW       Pick faces using raw detector score (default true)");
-    println!("  CLIP_FACE_SCORE          Face detection confidence threshold (default 0.6)");
-    println!("  CLIP_FACE_TRACK_STEP     Seconds between face tracking samples (default 2.0)");
-    println!("  CLIP_AUDIO_NORM          Normalize clip audio loudness (default true)");
-    println!("  CLIP_CAPTIONS            Enable word-by-word open captions (default false)");
-    println!("  CLIP_CAPTIONS_POSITION   Caption placement: margin (default) or chest");
-    println!("  CLIP_CAPTIONS_FONT       Caption font name or TTF path (optional)");
-    println!("  CLIP_CAPTIONS_SIZE       Caption font size px or ratio (<=2 treated as ratio)");
-    println!("  CLIP_CAPTIONS_COLOR      Caption text color (default white)");
-    println!("  CLIP_CAPTIONS_OUTLINE    Caption outline width (default 3)");
-    println!("  CLIP_CAPTIONS_OUTLINE_COLOR Caption outline color (default black)");
-    println!("  CLIP_CAPTIONS_MIN_WORD_SECS Minimum per-word on-screen time (default 0.12s)");
-    println!("  CLIP_CAPTIONS_MAX_WORDS  Cap on rendered words (default 300)");
-    println!("  CLIP_CAPTIONS_CHEST_RATIO Caption Y ratio when placed on chest (default 0.65)");
-    println!("  CLIP_CAPTIONS_MARGIN_OFFSET Extra Y offset for margin captions (default 0)");
-    println!("  CLIP_CAPTIONS_DEBUG      Log caption timings (default false)");
-    println!("  CLIP_CLOSED_CAPTIONS     Embed closed captions track when available (default true)");
-    println!("  CLIP_LLM_ENABLE          Enable LLM metadata (default false)");
-    println!("  CLIP_LLM_ENDPOINT        LLM chat completions endpoint (default localhost:1234)");
-    println!("  CLIP_LLM_MODEL           LLM model name or path");
-    println!("  CLIP_LLM_TEMPERATURE     LLM temperature (default 0.2)");
-    println!("  CLIP_LLM_TIMEOUT_SECS    LLM request timeout seconds (default 20)");
-    println!("  CLIP_LLM_BACKOFF_SECS    LLM backoff seconds after failure (default 120)");
-    println!("  CLIP_LLM_MAX_TRANSCRIPT_CHARS Transcript truncation limit (default 4000)");
-    println!("  CLIP_LLM_TITLE_MAX_CHARS LLM title max length (default 80)");
-    println!("  CLIP_LLM_DESCRIPTION_MAX_CHARS LLM description max length (default 280)");
-    println!("  CLIP_LLM_GPU_LAYERS      LLM GPU layers (0 = CPU, empty = model default)");
-    println!("  CLIP_LLM_FILE_RENAME     Rename clip files using LLM title (default true)");
-    println!("  CLIP_LLM_DEBUG           Log LLM parse details (default false)");
-    println!("  CLIP_FACE_BUDGET_SECS    Override face detection time budget in seconds");
-    println!("  CLIP_FACE_TILE_MIN_SCORE Tile search min score (default 0.60; set <= 0 to disable)");
-    println!("  CLIP_FACE_TILE_MAX_DEPTH Max bisection depth for tile search (default 3)");
-    println!("  CLIP_FACE_FRAME_HEAD_TOP      Head top offset vs face box (default -0.28)");
-    println!("  CLIP_FACE_FRAME_HEAD_TOP_MIN  Min head top offset (default -0.8)");
-    println!("  CLIP_FACE_FRAME_HEAD_TOP_MAX  Max head top offset (default 0.2)");
-    println!("  CLIP_FACE_FRAME_EYE_TOP_RATIO Eye->top ratio for head estimate (default 0.45)");
-    println!("  CLIP_FACE_FRAME_EYE_CHIN_RATIO Eye->chin ratio for head estimate (default 0.55)");
-    println!("  CLIP_FACE_FRAME_SHOULDER_SCALE Shoulder width scale vs face (default 3.2)");
-    println!("  CLIP_FACE_MESH          Enable face mesh framing (default true)");
-    println!("  CLIP_FACE_MESH_MODEL    Face mesh ONNX model path");
-    println!("  CLIP_FACE_MESH_MODEL_MIN_MB Min face mesh model size in MB (default 1)");
-    println!("  CLIP_FACE_MESH_MODEL_MAX_MB Max face mesh model size in MB (default 64)");
-    println!("  CLIP_FACE_MESH_LOAD_TIMEOUT_SECS Max seconds to load face mesh model (default 60)");
-    println!("  CLIP_FACE_MESH_BACKEND  Face mesh backend: auto (default), ort, or tract");
-    println!("  CLIP_FACE_MESH_TRACT_OPT Enable tract optimizations for face mesh (default false)");
-    println!("  CLIP_FACE_MESH_INPUT_SIZE Fallback face mesh input size (default 192)");
-    println!("  CLIP_FACE_MESH_INPUT_MAX Max face mesh input side length before clamping (default 512)");
-    println!("  CLIP_FACE_MESH_INPUT_SCALE Input scale for face mesh model (default 1/255)");
-    println!("  CLIP_FACE_MESH_REGION_SCALE Face mesh crop expansion scale (default 1.35)");
-    println!("  CLIP_FACE_MESH_HEADROOM Extra headroom ratio above mesh top (default 0.12)");
-    println!("  CLIP_FACE_MESH_DEBUG    Log face mesh bounds (default false)");
-    println!("  CLIP_POSE               Enable MoveNet pose framing (default true)");
-    println!("  CLIP_POSE_MODEL         MoveNet Thunder ONNX model path");
-    println!("  CLIP_POSE_MODEL_MIN_MB  Min pose model size in MB (default 1)");
-    println!("  CLIP_POSE_MODEL_MAX_MB  Max pose model size in MB (default 64)");
-    println!("  CLIP_POSE_LOAD_TIMEOUT_SECS Max seconds to load pose model (default 60)");
-    println!("  CLIP_POSE_BACKEND       Pose backend: auto (default), ort, or tract");
-    println!("  CLIP_POSE_TRACT_OPT     Enable tract optimizations for pose (default false)");
-    println!("  CLIP_POSE_SCORE         Min keypoint score for pose framing (default 0.30)");
-    println!("  CLIP_POSE_INPUT_SIZE    Fallback pose input size when model is dynamic (default 256)");
-    println!("  CLIP_POSE_INPUT_MAX     Max pose input side length before clamping (default 512)");
-    println!("  CLIP_POSE_INPUT_SCALE   Input scale for pose model (default 1/255)");
-    println!("  CLIP_POSE_HEAD_RATIO    Head-top margin ratio from pose (default 0.60)");
-    println!("  CLIP_POSE_SHOULDER_MARGIN Shoulder width margin multiplier (default 1.10)");
-    println!("  CLIP_POSE_DEBUG         Log pose keypoints and frame spec (default false)");
-    println!("  CLIP_FACE_ID            Enable face-ID matching (default false)");
-    println!("  CLIP_FACE_ID_FILE       Face-ID embedding file (json)");
-    println!("  CLIP_FACE_ID_MODEL      Face-ID ONNX model path");
-    println!("  CLIP_FACE_ID_THRESHOLD  Face-ID cosine threshold (default 0.35)");
-    println!("  CLIP_FACE_ID_REQUIRE_MOTION Require motion for face-ID (default true)");
-    println!("  CLIP_FACE_ID_MOTION     Motion threshold for face-ID (default 0.015)");
-    println!("  CLIP_FACE_ID_BGR        Use BGR input for face-ID model (default true)");
-    println!("  CLIP_FACE_ID_DEBUG      Log face-ID scores (default false)");
-    println!("  CLIP_FACE_DEBUG          Log face detector outputs and best score");
-    println!("  CLIP_FACE_TRACK          Track face across the full clip (default true)");
-    println!("  CLIP_DETECT              Enable auto-detection for stacked layout (default true)");
-    println!("  CLIP_DETECT_SIZE         Reticle detection frame size WxH (default 960x540)");
-    println!("  CLIP_DETECT_SAMPLES      Number of detection frames to sample (default 3)");
-    println!("  CLIP_DETECT_START        Detection sample start time in seconds (default 1.0)");
-    println!("  CLIP_DETECT_STEP         Seconds between detection samples (default 1.5)");
-    println!("  CLIP_DETECT_FULL         Sample detection frames across the full clip (local files only)");
-    println!("  CLIP_DETECT_BUDGET_SECS  Max seconds to spend analyzing detection samples");
-    println!("  CLIP_GAMEPLAY            Enable CLIP model usage (default true)");
-    println!("  CLIP_REGION_DETECT       Enable CLIP region detection (default true)");
-    println!("  CLIP_LIVE_CONFIG         Path to live config file for hot-reload overrides");
-    println!("  CLIP_LIVE_CONFIG_POLL_SECS   Live config poll interval in seconds (default 2)");
-    println!("  CLIP_LIVE_FAST           Skip heavy detection/captions for faster live renders (default true)");
-    println!("  CLIP_LIVE_LAYOUT_TTL_SECS Reuse detected layout hints for N seconds (default 120)");
-    println!("  CLIP_STREAMS_FILE        Path to streams file for multi-stream runs");
-    println!("  CLIP_STREAMS_POLL_SECS   Streams file poll interval in seconds (default 5)");
-    println!("  CLIP_STREAMS_MAX_CONCURRENT Max number of concurrent streams (default 1)");
-    println!("  CLIP_M3U8_REFRESH_SECS   Refresh signed m3u8 URL every N seconds (default 240)");
-    println!("  CLIP_STREAM_OFFLINE_SECS Exit if no new segments for N seconds (default 120)");
-    println!("  CLIP_WAKE_WORDS          Wake phrase list (comma/pipe separated) for clip trigger");
-    println!("  CLIP_PROFILE             Enable timing logs for hotspots (default false)");
-    println!("  CLIP_EMOTION_ENABLE      Enable emotion triggers from audio/face (default false)");
-    println!("  CLIP_EMOTION_WORDS       Emotion keyword list (comma/pipe separated)");
-    println!("  CLIP_EMOTION_THRESHOLD   Emotion score threshold (default 1.5)");
-    println!("  CLIP_EMOTION_AUDIO_RMS   RMS loudness threshold (default 0.08)");
-    println!("  CLIP_EMOTION_AUDIO_PEAK  Peak loudness threshold (default 0.35)");
-    println!("  CLIP_EMOTION_FACE_MOTION Face motion threshold (default 0.035)");
-    println!("  CLIP_GAMEPLAY_LABELS     CLIP gameplay positive labels");
-    println!("  CLIP_GAMEPLAY_NEG_LABELS CLIP gameplay negative labels");
-    println!("  CLIP_GAMEPLAY_SCORE      CLIP gameplay score threshold (default 0.12)");
-    println!("  CLIP_GAMEPLAY_TOPK       CLIP gameplay top-k patches (default 6)");
-    println!("  CLIP_CAM_LABELS          CLIP cam positive labels");
-    println!("  CLIP_CAM_NEG_LABELS      CLIP cam negative labels");
-    println!("  CLIP_CAM_SCORE           CLIP cam score threshold (default CLIP_GAMEPLAY_SCORE)");
-    println!("  CLIP_CAM_TOPK            CLIP cam top-k patches (default CLIP_GAMEPLAY_TOPK)");
-    println!("  CLIP_CAM_REGION_SCALE    Expand CLIP cam region bounds (default 1.6)");
-    println!("  CLIP_TS_REALTIME         When set, read local TS files at realtime speed");
-    println!("  M3U8_URL_OVERRIDE        Skip discovery; use this master URL directly");
-    println!("  COOKIE_HEADER / KICK_COOKIE / TIKTOK_COOKIE / TWITCH_COOKIE   Cookies to send on discovery");
-    println!("  HEADLESS_M3U8_SCRIPT / HEADLESS_M3U8_SCRIPT_TIKTOK   Override Playwright scripts");
-    println!("  WAKE_REFRACTORY_SECS     Cooldown between wake detections (default 12)");
-    println!("  WAKE_BUFFER_HEADROOM_SECS   Extra buffer headroom for wake timing (default 20)");
-    println!("  WAKE_BUFFER_RESTART_SECS    Restart if buffer exceeds seconds (default 500, 0 disables)");
-    println!("  WAKE_NO_WORDS_SECS       Restart if wake worker stalls for seconds (default 300, 0 disables)");
-    println!("  SKIP_CLIP_SAVE           If set to 1/true, skip writing clips");
-    println!("  WHISPER_MODEL            Path to whisper model (default auto)");
-    println!("  WHISPER_GPU              Enable GPU for live wake (default true)");
-    println!("  WHISPER_CLIP_GPU         Enable GPU for clip transcription (default false)");
-    println!("  WHISPER_MIN_FREE_VRAM_MB Min free VRAM before using whisper GPU (default 2048)");
-    println!("  WHISPER_ISOLATE          Run live wake in a helper process (default false)");
-    println!("  WHISPER_WORKER_STATUS_MS Poll interval for wake worker status (default 500ms)");
-    println!("  FFMPEG_ENCODER / FFMPEG_HWACCEL / FFMPEG_HWACCEL_DEVICE   Encoder/accel knobs");
-    println!("  FFMPEG_HWACCEL_FALLBACK  Fallback hwaccel (e.g. d3d11va, cuda, none; default none)");
-    println!("  FFMPEG_MIN_FREE_VRAM_MB  Min free VRAM before using GPU encode (default 512)");
-    println!("  FFMPEG_ENCODE_TIMEOUT_SECS   Hard cap for ffmpeg encode wall time (seconds)");
-    println!("  LOG_M3U8_HEADERS         Log request headers when fetching playlists");
-    println!("  TWITCH_CLIENT_ID         Twitch Client-ID for playback token (default web client)");
-    println!("  TWITCH_OAUTH_TOKEN / TWITCH_AUTH_TOKEN   Twitch OAuth token for gated streams (optional)");
-    println!("");
-    println!("Notes:");
-    println!("  - Main path: page URL -> HLS discovery (TikTok HTTP first, headless fallback) -> wake detection -> clip.");
-    println!("  - Demo modes: buffer-only, HLS buffer demo, or mic wake demo for quick sanity checks.");
-    println!("  - Live config file supports KEY=VALUE, KEY: VALUE, or flag lines like clip-face-debug.");
-}
 
 
 #[cfg(test)]
@@ -7786,7 +5921,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn run_stub_succeeds() {
+    async fn run_without_url_prints_preflight() {
         // Ensure no network-dependent env vars force the main path.
         std::env::remove_var("CLIP_PAGE_URL");
         std::env::remove_var("M3U8_URL_OVERRIDE");
@@ -8043,16 +6178,5 @@ mod tests {
         assert_eq!(truncate_str("0123456789A", 10), "0123456...");
     }
 
-    #[test]
-    fn extract_twitch_login_from_url() {
-        assert_eq!(
-            extract_twitch_login("https://www.twitch.tv/rynn?twitch5=0"),
-            Some("rynn".to_string())
-        );
-        assert_eq!(
-            extract_twitch_login("https://player.twitch.tv/?channel=rynn"),
-            Some("rynn".to_string())
-        );
-        assert_eq!(extract_twitch_login("https://www.twitch.tv/directory"), None);
-    }
+    // `extract_twitch_login` lives in `crate::hls`; the test moved there.
 }

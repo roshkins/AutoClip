@@ -60,3 +60,6 @@ run_result.txt
 error.txt
 pending_face_reframe.patch
 tmp_manifest.json
+
+# Per-developer live config (template is checked in as config.env.example)
+config.env

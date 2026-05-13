@@ -1,49 +1,92 @@
-# Copilot Instructions for AutoClip
+# Copilot / AI Agent Instructions for AutoClip
 
-These notes help AI agents work effectively in this repository. They summarize the current design and expected behaviors; adjust as real code lands.
+These notes orient AI agents working in this repo. Skim before edits.
 
-## Purpose & Flow
-- Goal: voice-activated streamer clipper that saves a vertical, resized video file.
-- Inputs: `kick_url`, `activation_phrase`, `before_buffer_length`, `after_buffer_length`, `resolution`, `vram_allocation`, `save_path`, `file_name_stub`.
-- Outputs: processed clip file (design doc currently says MP3; likely MP4/vertical video—confirm).
-- Pipeline: fetch m3u8 playlist → pick highest-res stream → continuously buffer; CPU-bound Whisper listens for wake phrase; on trigger, wait `after_buffer_length`, deep-copy buffer, enqueue post-process; post-process via FFmpeg to vertical format; save to `save_path` with incrementing filename; free copy; if playlist ends, periodically refresh or detect changed m3u8 URI.
+## What AutoClip is
 
-## Architecture Expectations (Rust)
-- Primary language: Rust. Expect modules for streaming ingest (m3u8/HLS), audio transcription (Whisper CPU), buffering with VRAM-to-RAM spillover, FFmpeg-driven transcode, and storage naming.
-- Concurrency: likely async runtime (Tokio) for streaming/buffering and a worker queue for post-processing tasks.
-- Resource management: use `vram_allocation` to cap GPU buffer; spill to CPU RAM when exceeded.
-- Trigger handling: wake-word detection gates clip creation; ensure `before_buffer_length`/`after_buffer_length` windowing is honored.
+A Rust binary that watches a live stream (Kick / Twitch / TikTok), runs
+Whisper on the audio to detect a wake phrase, and on trigger saves a
+vertical-format MP4 (face cam stacked over gameplay) via FFmpeg.
 
-## Conventions to Follow
-- Configuration surface should mirror the inputs listed above; keep naming consistent across CLI/env/config structs.
-- Filenames: prefix with `file_name_stub`, append incrementing counter; ensure directory exists under `save_path`.
-- Video processing: enforce vertical resize/crop in FFmpeg; keep source highest available resolution; avoid re-encoding audio unless required.
-- Resilience: on playlist end, implement retry/refresh logic before aborting; handle m3u8 URL changes.
+The whole pipeline is end-to-end working today; refactors should preserve
+behavior, not re-invent it. The original "MVP stub" language in the source
+is historical — the binary is the real product.
 
-## External Dependencies (likely)
-- FFmpeg for transcode/resize.
-- Whisper (CPU) for wake-word detection; plan for model asset management and thread pinning.
-- HLS/m3u8 client for stream ingest.
+## Layout (top-level)
 
-## Implementation Hints
-- Buffer design: rolling buffer sized by `before_buffer_length`; deep-copy on trigger to decouple post-processing latency from ingest.
-- Queueing: background worker processes copies sequentially or in bounded concurrency to avoid VRAM spikes.
-- Metrics/logging: log trigger events, playlist refresh attempts, FFmpeg failures, and save destinations.
+- `src/main.rs` — orchestration loop, HLS client, CLI parsing, config
+  writer, ffmpeg invocations. **Currently ~8k LOC and being decomposed.**
+  Pull new logic into a sibling module unless it is genuinely
+  orchestration-glue.
+- `src/clip_detect.rs` — face / mesh / pose / ID detection (Tract + optional
+  ORT). **Currently ~6.8k LOC; deferred deep refactor.** Internal `// =====
+  SECTION ... =====` dividers mark the conceptual chunks (config, env helpers,
+  YuNet, ORT glue, FaceMesh, Pose, FaceID, debug-dump). Future split target:
+  `clip_detect/{config,backend,face,face_ort,mesh,pose,face_id,sweep}.rs`.
+  Until then, jump by section dividers; the module docstring at the top of
+  the file lists them all.
+- `src/clip_gameplay.rs` — CLIP-based gameplay region detection.
+- `src/clip_layout.rs` — FFmpeg filter-graph builders.
+- `src/stream_audio_wake.rs` (+ `_stub.rs`) — Whisper wake detection. The
+  stub mirrors the real public API for `#[cfg(not(feature = "whisper"))]`
+  builds; keep them in lockstep.
+- `src/rolling_buffer.rs` — bounded TS segment buffer.
+- `src/gpu.rs` — `nvidia-smi` queries + GPU lease mutex.
+- `src/loading.rs` / `src/profile.rs` — small support modules.
+- `scripts/` — Playwright m3u8 capture, model download helpers, build/run
+  helpers (PowerShell + .bat).
+- `config.env` — hot-reloaded config; the binary polls it while running.
 
-## Workflow & Testing
-- Keep changes small and incremental; prefer a series of tiny edits over large batches.
-- After each change, run the fastest applicable checks (unit/linters once added); fix issues immediately.
-- Run the integration test suite after every code change to verify no regressions; if commands are not defined yet, ask for or add a canonical `cargo test` (or project-specific) integration target and document it.
-- Keep comments in sync with behavior. When code paths change (e.g., swapping HTML scraping for headless m3u8 capture), update inline docs and module headers in the same PR.
-- When adding or changing flags/flows, update the CLI help output (`-h/--help`) in `src/main.rs` in the same change.
+## Conventions
 
-## Jujutsu (jj) Workflow
-- Working copy is always a commit; each change has a stable change ID and a rewritable commit hash—prefer change IDs in commands.
-- Common commands: `jj status` (or `jj st`), `jj log` (revsets like `@`, `root()`, `bookmarks()`, `@::trunk()`), `jj diff`, `jj describe -m`, `jj new` to start a fresh change, `jj squash`/`jj squash -i` to move edits into parents, `jj rebase -s <rev> -o <dest>` to move a stack.
-- No `git add`: edits auto-amend the working-copy commit; use `.gitignore` plus `jj file untrack <path>` to stop tracking.
-- Conflicts: rebases complete even with conflicts; resolve on a child commit, then `jj squash` into the conflicted one. `jj resolve` or manual markers both work.
-- Operation log: `jj op log` shows history of operations; `jj undo` reverts the last operation (including rebases/squashes) and updates the working copy.
-- Git interop: clone with `jj git clone`; bookmarks map to Git branches. Use `git status`/`git push` as usual; keep `jj` and Git views aligned.
+- Anything settable via env var should also be settable via CLI: lowercase
+  the env name and replace `_` with `-`, e.g. `CLIP_FACE_RATIO` →
+  `--clip-face-ratio=0.45`. Plumb new flags through the existing parser in
+  `src/main.rs`.
+- Filenames are `{file_name_stub}_{NNN}.mp4` with a hidden counter file in
+  `save_path`; use `next_output_path()`.
+- **Never shorten clip duration from internal buffer estimates** — see
+  `docs/clip-length-guardrails.md`. Probe with ffprobe if you must validate.
+- Keep the README, DESIGN_DOC, and `--help` output in sync with code in the
+  same change.
+- Tract and ORT must both compile; gate ORT-only code with
+  `#[cfg(feature = "ort")]` and provide a Tract fallback.
 
-## If Something Is Missing
-- This repo currently only contains the design doc ([DESIGN_DOC.md](../DESIGN_DOC.md)). Ask for details on build/run/test commands, directory layout, and target platforms before proceeding.
+## Build / run
+
+- `cargo check --no-default-features` is the fastest sanity check (skips
+  whisper.cpp + ORT). Use this for refactors.
+- Full CUDA build: `.\scripts\setup_gpu_build.ps1 -CargoProfile debug`.
+- Run prebuilt: `.\run_autoclip_with_cuda.ps1 -NoBuild "<stream-url>"`.
+- See `BUILD_NOTES.md` for the Windows CUDA gauntlet (VS dev env, explicit
+  cl/rc/mt/nvcc paths, Ninja, `target/release/build/whisper-rs-sys-*` cache
+  invalidation).
+
+## Testing
+
+- `cargo test --no-default-features` runs the unit tests under the Tract-only
+  path (fast, no whisper.cpp).
+- Pure-function targets (RollingBuffer, parse helpers, filter-graph builders)
+  should grow tests as logic moves into them.
+- For end-to-end checks use the `reprocess-ts` subcommand against a saved TS
+  file — no live stream required.
+
+## When making changes
+
+1. Make the smallest edit that solves the problem.
+2. Run `cargo check --no-default-features` and (when relevant)
+   `cargo test --no-default-features`. Fix warnings before merging.
+3. If CLI flags change, update `--help` text and README in the same PR.
+4. If detection / framing thresholds change, update `config.env` defaults
+   and note the change near the relevant code.
+
+## Jujutsu (jj) workflow
+
+Optional but supported. Working copy is always a commit; prefer change IDs.
+`jj status`, `jj log`, `jj describe -m`, `jj new`, `jj squash`,
+`jj rebase -s … -o …`. Git interop via `jj git clone` / `git push`.
+
+## When something is missing
+
+Ask. `DESIGN_DOC.md` and `README.md` are the source of truth for intended
+behavior; everything else should match.

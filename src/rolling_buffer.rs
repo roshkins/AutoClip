@@ -168,4 +168,62 @@ mod tests {
         assert_eq!(buf.total_duration(), Duration::from_millis(300));
         assert_eq!(buf.snapshot_bytes(), b"c");
     }
+
+    #[test]
+    fn total_bytes_tracks_pushes_and_evictions() {
+        let mut buf = RollingBuffer::new(Duration::from_millis(500));
+        buf.push(vec![0u8; 100], Duration::from_millis(300));
+        buf.push(vec![0u8; 200], Duration::from_millis(300));
+        // Evicts the 100-byte chunk to fit; only 200 remains.
+        assert_eq!(buf.total_bytes(), 200);
+    }
+
+    #[test]
+    fn snapshot_tail_takes_newest() {
+        let mut buf = RollingBuffer::new(Duration::from_secs(10));
+        buf.push(b"a".to_vec(), Duration::from_millis(400));
+        buf.push(b"b".to_vec(), Duration::from_millis(400));
+        buf.push(b"c".to_vec(), Duration::from_millis(400));
+        let (bytes, dur) = buf.snapshot_tail(Duration::from_millis(500));
+        // 500ms target — newest c (400ms) is below, b adds 400 -> 800ms >= 500, stop.
+        assert_eq!(bytes, b"bc");
+        assert_eq!(dur, Duration::from_millis(800));
+    }
+
+    #[test]
+    fn snapshot_tail_offset_drops_tail() {
+        let mut buf = RollingBuffer::new(Duration::from_secs(10));
+        buf.push(b"a".to_vec(), Duration::from_millis(400));
+        buf.push(b"b".to_vec(), Duration::from_millis(400));
+        buf.push(b"c".to_vec(), Duration::from_millis(400));
+        let (bytes, _dur) = buf.snapshot_tail_offset(
+            Duration::from_millis(500),
+            Duration::from_millis(300), // skip ~newest 300ms
+        );
+        // Skip c (counts 400ms toward the 300ms skip, which exhausts it),
+        // then collect b until acc >= 500ms.
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn set_capacity_evicts_immediately() {
+        let mut buf = RollingBuffer::new(Duration::from_secs(10));
+        buf.push(b"a".to_vec(), Duration::from_millis(400));
+        buf.push(b"b".to_vec(), Duration::from_millis(400));
+        buf.push(b"c".to_vec(), Duration::from_millis(400));
+        assert_eq!(buf.chunk_count(), 3);
+        buf.set_capacity(Duration::from_millis(500));
+        // Should evict a and b; c (400ms) fits in 500ms.
+        assert_eq!(buf.chunk_count(), 1);
+        assert_eq!(buf.snapshot_bytes(), b"c");
+    }
+
+    #[test]
+    fn empty_buffer_snapshots_are_empty() {
+        let buf = RollingBuffer::new(Duration::from_secs(1));
+        assert_eq!(buf.snapshot_bytes(), Vec::<u8>::new());
+        assert_eq!(buf.chunk_count(), 0);
+        assert_eq!(buf.total_bytes(), 0);
+        assert_eq!(buf.total_duration(), Duration::ZERO);
+    }
 }

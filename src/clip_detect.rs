@@ -1,10 +1,37 @@
+//! Per-clip layout detection: face / mesh / pose / face-ID.
+//!
+//! This file is large (~6.7k LOC) because it owns five subsystems that share
+//! a lot of state (sample frames, channel-based inference workers, shared
+//! constants, ORT/Tract backend selection). A future refactor will split it
+//! into a `clip_detect/` subdirectory along these lines:
+//!
+//! - `clip_detect/config.rs`   — `ClipDetectConfig`, env-readers, defaults.
+//! - `clip_detect/backend.rs`  — `FaceBackend` enum, ORT runtime init,
+//!                                `ort_device_id`, GPU lease selection.
+//! - `clip_detect/face.rs`     — YuNet face detector (Tract path).
+//! - `clip_detect/face_ort.rs` — ORT-CUDA face detector + tile search.
+//! - `clip_detect/mesh.rs`     — MediaPipe FaceMesh framing.
+//! - `clip_detect/pose.rs`     — MoveNet Thunder pose framing.
+//! - `clip_detect/face_id.rs`  — ArcFace identity gating.
+//! - `clip_detect/sweep.rs`    — Threshold sweep + face-eval helpers.
+//!
+//! For now, look for `// ===== SECTION =====` dividers below to jump
+//! between conceptual chunks.
+//!
+//! Public entry points (kept stable across the future split):
+//! - `ClipDetectConfig` + `read_clip_detect_config`
+//! - `detect_layout_hints` (the main per-clip detection driver)
+//! - `run_face_threshold_sweep` + `FaceSweepStats` (offline tuning)
+
 use anyhow::{Context, Result};
 use std::cmp::{max, min};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, mpsc};
+#[cfg(feature = "ort")]
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -110,6 +137,8 @@ const POSE_LOAD_TIMEOUT_SECS_DEFAULT: u64 = 60;
 
 #[cfg(feature = "ort")]
 static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+// ===== SECTION: env / backend helpers =====
 
 fn read_env_f32(name: &str, default: f32) -> f32 {
     std::env::var(name)
@@ -544,6 +573,8 @@ fn parse_face_backend(value: &str) -> Option<FaceBackend> {
     }
 }
 
+// ===== SECTION: ClipDetectConfig builder (env -> struct) =====
+
 pub fn read_clip_detect_config() -> ClipDetectConfig {
     let enabled = std::env::var("CLIP_DETECT")
         .ok()
@@ -654,6 +685,8 @@ pub fn read_clip_detect_config() -> ClipDetectConfig {
         analysis_budget,
     }
 }
+
+// ===== SECTION: face threshold sweep + analysis budgeting =====
 
 #[derive(Clone, Copy, Debug)]
 pub struct FaceSweepStats {
@@ -935,6 +968,8 @@ async fn build_face_sweep_inputs(
     );
     Ok(out)
 }
+
+// ===== SECTION: detect_layout_hints — main per-clip entry point =====
 
 pub async fn detect_layout_hints(
     input: &str,
@@ -1573,6 +1608,8 @@ enum FaceSizeStatus {
     TooSmall,
     TooLarge,
 }
+
+// ===== SECTION: face region scanning + tile search =====
 
 fn build_face_scan_regions() -> Vec<FaceScanRegion> {
     let mut regions = Vec::new();
@@ -2293,6 +2330,8 @@ async fn detect_faces_in_region_raw(
     Ok(detector.detect_faces_raw(frame.as_ref()))
 }
 
+// ===== SECTION: face candidate selection + relaxation passes =====
+
 fn face_size_status(rect: NormalizedRect, model_w: u32, model_h: u32) -> FaceSizeStatus {
     let w_px = rect.w * model_w as f32;
     let h_px = rect.h * model_h as f32;
@@ -2556,6 +2595,8 @@ fn candidate_passes(
     true
 }
 
+// ===== SECTION: small parse helpers + sample-time builders =====
+
 fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -2788,6 +2829,8 @@ fn emotion_face_motion_threshold() -> f32 {
 }
 
 #[derive(Clone, Debug)]
+// ===== SECTION: face-ID (ArcFace) identity gating =====
+
 struct FaceIdConfig {
     model_path: PathBuf,
     file_path: PathBuf,
@@ -3124,6 +3167,8 @@ fn filter_face_id_candidates(
     kept
 }
 
+// ===== SECTION: face debug dump + CLIP region (cam) helpers =====
+
 fn face_dump_dir() -> Option<PathBuf> {
     std::env::var("CLIP_FACE_DUMP_DIR")
         .ok()
@@ -3240,6 +3285,8 @@ fn cam_region_scale() -> f32 {
 const YUNET_STRIDES: [usize; 3] = [8, 16, 32];
 
 #[derive(Clone, Copy, Debug, Default)]
+// ===== SECTION: YuNet face detector (Tract + ORT) =====
+
 struct YunetOutputMap {
     cls: [Option<usize>; 3],
     obj: [Option<usize>; 3],
@@ -3968,6 +4015,8 @@ impl YunetDetector {
 }
 
 #[cfg(feature = "ort")]
+// ===== SECTION: ORT session glue + tensor packing =====
+
 fn build_ort_session(model_path: &str, label: &str) -> Result<Session> {
     ensure_ort_runtime_loaded()?;
     let min_free = ort_min_free_vram_mb();
@@ -4133,6 +4182,8 @@ fn rgb_to_rgb_hwc_scaled(
     }
     Some(out)
 }
+
+// ===== SECTION: MoveNet Thunder pose detector =====
 
 enum PoseBackend {
     Tract(TypedRunnableModel<TypedModel>),
@@ -4399,6 +4450,8 @@ impl PoseDetector {
         Some(observation)
     }
 }
+
+// ===== SECTION: MediaPipe FaceMesh detector =====
 
 enum FaceMeshBackend {
     Tract(TypedRunnableModel<TypedModel>),
@@ -4940,6 +4993,8 @@ fn points_center(points: &[NormalizedPoint; 5]) -> NormalizedPoint {
 }
 
 #[derive(Clone, Copy, Debug)]
+// ===== SECTION: face landmark geometry + framing specs =====
+
 struct LandmarkSet {
     left_eye: NormalizedPoint,
     right_eye: NormalizedPoint,

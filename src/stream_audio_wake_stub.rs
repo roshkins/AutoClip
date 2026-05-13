@@ -107,6 +107,7 @@ pub(crate) fn list_system_mics() -> Vec<String> {
     Vec::new()
 }
 
+#[allow(dead_code)]
 pub fn transcribe_words_from_input(
     _input: &str,
     _start_offset_secs: Option<f32>,

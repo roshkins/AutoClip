@@ -1,4 +1,5 @@
 use std::process::Command;
+#[cfg(feature = "whisper")]
 use std::sync::{Mutex, OnceLock};
 
 fn parse_nvidia_smi_entries(stdout: &str) -> Vec<(u32, u64)> {
@@ -93,10 +94,12 @@ pub fn gpu_vram_allows(min_free_mb: u64, device: Option<u32>, label: &str) -> bo
     true
 }
 
+#[cfg(feature = "whisper")]
 pub struct GpuLease {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
+#[cfg(feature = "whisper")]
 pub fn try_acquire_gpu_lease(label: &str) -> Option<GpuLease> {
     static GPU_LEASE: OnceLock<Mutex<()>> = OnceLock::new();
     let lock = GPU_LEASE.get_or_init(|| Mutex::new(()));
