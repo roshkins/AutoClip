@@ -13,8 +13,10 @@ struct in `src/main.rs`). Notable knobs:
 
 - `activation_phrase` / `CLIP_WAKE_WORDS` — wake-word(s) for the Whisper
   trigger.
-- `before_buffer_length` / `after_buffer_length` — seconds of rolling buffer
-  kept before/after the trigger.
+- The live trigger path currently fixes the intended clip window at 50
+  seconds before the trigger and 10 seconds after it. The `Config` fields
+  `before_buffer_length` / `after_buffer_length` are used by other demo
+  paths; they do not currently override that live window.
 - `resolution` — output canvas, default `1080x1920` (vertical 9:16).
 - `save_path` / `file_name_stub` — output directory and filename prefix; the
   binary appends an incrementing index.
@@ -44,8 +46,8 @@ LLM-titler renames the file based on the transcript when
    tailing the HLS stream or a microphone (via FFmpeg). When `WHISPER_ISOLATE=1`
    the worker runs as a separate process talking to the main loop through a
    status file — this isolates crashes from the orchestrator.
-5. **Trigger.** When the wake phrase fires, the main loop waits
-   `after_buffer_length` more seconds of TS, then deep-copies the buffer.
+5. **Trigger.** When the wake phrase fires, the main loop collects the
+   10-second post-trigger tail, then snapshots the relevant buffer contents.
 6. **Detect layout.** `clip_detect.rs` runs face detection (Tract or ORT),
    optional FaceMesh, optional MoveNet pose, and optional ArcFace identity
    gating to pick a face crop and gameplay region.
@@ -73,9 +75,9 @@ LLM-titler renames the file based on the transcript when
 - `gpu::query_nvidia_free_vram_mb` polls `nvidia-smi` before claiming GPU work.
 - Whisper, ORT face/mesh/pose, and FFmpeg NVENC each have a configurable
   minimum free-VRAM threshold; the path falls back to CPU when not met.
-- A singleton `GpuLease` mutex (in `gpu.rs`) serializes whisper GPU use so the
-  worker process doesn't double-book the device when the orchestrator also
-  wants the GPU for ffmpeg.
+- A singleton `GpuLease` mutex (in `gpu.rs`) serializes participating Whisper
+  GPU work within one process. It does not coordinate separate worker
+  processes or provide a global reservation for FFmpeg/ONNX workloads.
 
 ## Out of scope
 
@@ -89,4 +91,5 @@ LLM-titler renames the file based on the transcript when
 - `BUILD_NOTES.md` — CUDA build pitfalls on Windows.
 - `docs/clip-length-guardrails.md` — never shorten output clips from internal
   buffer estimates; always probe TS PTS with ffprobe.
-- `README.md` — build/run command crib sheet.
+- `README.md` — project overview, development disclosure and build/run steps.
+- `docs/code-walkthrough.md` — source reading path and test coverage boundaries.
