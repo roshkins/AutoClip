@@ -1,38 +1,33 @@
 //! Integration test for the `reprocess-ts` subcommand.
 //!
-//! Drop a small TS file at `tests/data/sample.ts` to enable this test. When
-//! the fixture is missing the test prints a skip notice and passes — that
-//! way the CI green path doesn't require a binary fixture committed to the
-//! repo, but a developer who copies a real TS into `tests/data/` gets a
-//! meaningful regression check for free.
+//! Generate a fixture with `scripts/generate_test_fixture.ps1`, then run:
+//! `cargo test --no-default-features --test reprocess_ts -- --ignored`.
+//! The test is explicitly ignored by default. When requested, missing media
+//! or tools are failures instead of a successful test that did no rendering.
 //!
 //! Asserts after a successful run:
 //!   1. `autoclip reprocess-ts <fixture>` exits 0.
 //!   2. The produced .mp4 exists and is non-empty.
 //!   3. Clip duration via `ffprobe` matches the source TS within +/- 0.5s.
 //!
-//! Requires `ffmpeg`/`ffprobe` on PATH and a working build (`cargo build`).
+//! Requires `ffmpeg`/`ffprobe` on PATH. Cargo supplies the matching binary.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 fn fixture_path() -> PathBuf {
-    workspace_root().join("tests").join("data").join("sample.ts")
+    workspace_root()
+        .join("tests")
+        .join("data")
+        .join("sample.ts")
 }
 
 fn binary_path() -> PathBuf {
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root().join("target"));
-    // Tests are typically run via `cargo test`, which builds the `debug` profile.
-    target_dir
-        .join("debug")
-        .join(if cfg!(windows) { "autoclip.exe" } else { "autoclip" })
+    PathBuf::from(env!("CARGO_BIN_EXE_autoclip"))
 }
 
 fn ffprobe_duration_secs(path: &Path) -> Option<f64> {
@@ -56,39 +51,25 @@ fn ffprobe_duration_secs(path: &Path) -> Option<f64> {
 }
 
 #[test]
+#[ignore = "requires a local TS fixture and FFmpeg; see tests/data/README.md"]
 fn reprocess_ts_produces_clip_matching_source_duration() {
     let fixture = fixture_path();
-    if !fixture.exists() {
-        eprintln!(
-            "[skip] reprocess_ts integration test — no fixture at {}.\n       \
-             Drop a small TS (<= 30s) at that path to enable.",
-            fixture.display()
-        );
-        return;
-    }
+    assert!(
+        fixture.exists(),
+        "Generate the fixture first: scripts/generate_test_fixture.ps1"
+    );
 
     let bin = binary_path();
-    if !bin.exists() {
-        eprintln!(
-            "[skip] reprocess_ts integration test — binary not built at {}.\n       \
-             Run `cargo build` first.",
-            bin.display()
-        );
-        return;
-    }
+    assert!(
+        bin.exists(),
+        "Cargo-built autoclip binary is missing: {}",
+        bin.display()
+    );
+    let source_secs = ffprobe_duration_secs(&fixture)
+        .expect("ffprobe must be on PATH and the fixture must contain valid media");
 
-    // ffprobe must be available to validate.
-    if ffprobe_duration_secs(&fixture).is_none() {
-        eprintln!(
-            "[skip] reprocess_ts integration test — ffprobe missing or fixture invalid"
-        );
-        return;
-    }
-
-    let source_secs = ffprobe_duration_secs(&fixture).expect("source duration");
-
-    // Run reprocess-ts. autoclip writes the output next to the input, with the
-    // counter file in the same directory as the TS, so we sandbox via a temp dir.
+    // reprocess-ts writes to ./clips, relative to the process working directory.
+    // Use a temp directory so output and live config cannot touch the checkout.
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -98,21 +79,30 @@ fn reprocess_ts_produces_clip_matching_source_duration() {
 
     let sandboxed_ts = sandbox.join("clip_001.ts");
     std::fs::copy(&fixture, &sandboxed_ts).expect("copy fixture into sandbox");
+    let config = sandbox.join("test-config.env");
+    std::fs::write(
+        &config,
+        concat!(
+            "CLIP_LAYOUT=full\nCLIP_DETECT=0\nCLIP_GAMEPLAY=0\n",
+            "CLIP_FACE_MESH=0\nCLIP_POSE=0\nCLIP_CAPTIONS=0\n",
+            "CLIP_CLOSED_CAPTIONS=0\nCLIP_LLM_ENABLE=0\n",
+            "FFMPEG_HWACCEL=none\nFFMPEG_ENCODER=libx264\n"
+        ),
+    )
+    .expect("write CPU-only test config");
 
     let status = Command::new(&bin)
+        .current_dir(&sandbox)
         .arg("reprocess-ts")
         .arg(&sandboxed_ts)
-        .env("SKIP_CLIP_SAVE", "")
-        // Avoid live-config polling racing with the test.
-        .env("CLIP_LIVE_CONFIG", "")
+        .env("CLIP_LIVE_CONFIG", &config)
         .status()
         .expect("run autoclip reprocess-ts");
     assert!(status.success(), "reprocess-ts exited with {:?}", status);
 
-    // The reprocessed clip lives in the same directory with .mp4 extension and
-    // the same stem; autoclip's renamer may add a suffix but the base is stable.
+    // The application stores new output under the sandbox's clips directory.
     let mut produced = None;
-    if let Ok(entries) = std::fs::read_dir(&sandbox) {
+    if let Ok(entries) = std::fs::read_dir(sandbox.join("clips")) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.extension().and_then(|s| s.to_str()) == Some("mp4") {
@@ -121,12 +111,11 @@ fn reprocess_ts_produces_clip_matching_source_duration() {
             }
         }
     }
-    let produced = produced.expect("expected an mp4 next to the TS fixture");
+    let produced = produced.expect("expected an mp4 in the sandbox clips directory");
     let size = std::fs::metadata(&produced).map(|m| m.len()).unwrap_or(0);
     assert!(size > 0, "produced clip is empty");
 
-    let out_secs = ffprobe_duration_secs(&produced)
-        .expect("ffprobe should read the produced mp4");
+    let out_secs = ffprobe_duration_secs(&produced).expect("ffprobe should read the produced mp4");
     let drift = (out_secs - source_secs).abs();
     assert!(
         drift < 0.5,
@@ -135,5 +124,4 @@ fn reprocess_ts_produces_clip_matching_source_duration() {
 
     // Best-effort cleanup.
     let _ = std::fs::remove_dir_all(&sandbox);
-    let _ = Duration::from_secs(0); // silence unused-import lint if we drop time below
 }

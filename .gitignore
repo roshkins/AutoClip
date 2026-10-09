@@ -63,3 +63,6 @@ tmp_manifest.json
 
 # Per-developer live config (template is checked in as config.env.example)
 config.env
+
+# Locally generated fixture for the opt-in media test
+tests/data/*.ts
